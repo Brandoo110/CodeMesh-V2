@@ -28,6 +28,11 @@ CodeMesh 这里先用「滑动窗口」：保留最近 N 条。System message �
 """
 
 from collections import deque
+from typing import Awaitable, Callable, Optional
+
+
+# 压缩 summarizer 的类型：拿一组消息，返回中文摘要字符串
+Summarizer = Callable[[list[dict]], Awaitable[str]]
 
 
 class ShortTermMemory:
@@ -38,14 +43,27 @@ class ShortTermMemory:
     这是 Python 标准库里实现「固定大小队列」最优雅的方式。
     """
 
-    def __init__(self, max_messages: int = 20):
+    def __init__(
+        self,
+        max_messages: int = 20,
+        compress_threshold: Optional[int] = None,
+        summarizer: Optional[Summarizer] = None,
+    ):
         """
         Args:
             max_messages: 最多保留多少条非 system 消息。超过后最旧的会被自动丢弃。
+            compress_threshold: 触发记忆压缩的阈值（消息数 >= 该值时 maybe_compress 会触发）。
+                                None 表示关闭压缩。
+            summarizer: async 函数，接收一组消息返回压缩摘要文本。
+                        compress_threshold 不为 None 时必传。
         """
         self._system: dict | None = None
         # deque 的 maxlen 参数：满了再 append 会自动 popleft，O(1) 复杂度
         self._messages: deque[dict] = deque(maxlen=max_messages)
+        # ── 记忆压缩相关 ──
+        self._compress_threshold = compress_threshold
+        self._summarizer = summarizer
+        self._summary: str | None = None  # 累积的对话摘要
 
     def set_system(self, content: str) -> None:
         """设置/更新 system message。它不参与窗口淘汰，永远保留。"""
@@ -66,10 +84,18 @@ class ShortTermMemory:
         """
         返回当前完整消息列表（system 在最前）。
         上层调适配器时直接把这个结果传进去即可。
+
+        若已有累积 summary，会以 system 消息形式紧跟在原 system 之后注入，
+        让模型继续看到被压缩掉的早期对话信息。
         """
         result: list[dict] = []
         if self._system:
             result.append(self._system)
+        if self._summary:
+            result.append({
+                "role": "system",
+                "content": f"<previous conversation summary>: {self._summary}",
+            })
         result.extend(self._messages)
         return result
 
@@ -80,3 +106,40 @@ class ShortTermMemory:
     def __len__(self) -> int:
         """当前非 system 消息数量。"""
         return len(self._messages)
+
+    # ─────────────── 记忆压缩 ───────────────
+
+    @property
+    def summary(self) -> str | None:
+        """当前累积的对话摘要（用于调试 / 单测断言）。"""
+        return self._summary
+
+    async def maybe_compress(self) -> bool:
+        """
+        如果当前消息数 >= compress_threshold 且配置了 summarizer，
+        把最旧一半消息交给 summarizer 压缩成 summary，并从 _messages 中移除。
+
+        多次触发时新摘要会与旧摘要合并：保留旧 summary 作为前缀。
+
+        Returns:
+            True  : 触发了一次压缩
+            False : 阈值未到 / 未配置 summarizer / 没有可压缩的消息
+        """
+        if self._compress_threshold is None or self._summarizer is None:
+            return False
+        if len(self._messages) < self._compress_threshold:
+            return False
+        # 至少要有 2 条才值得压缩
+        if len(self._messages) < 2:
+            return False
+
+        half = len(self._messages) // 2
+        # 注意：用 popleft 而不是切片，保持 O(1) 摊销 + 真正缩短队列
+        to_compress = [self._messages.popleft() for _ in range(half)]
+
+        new_summary = await self._summarizer(to_compress)
+        if self._summary:
+            self._summary = f"{self._summary}\n\n{new_summary}"
+        else:
+            self._summary = new_summary
+        return True
