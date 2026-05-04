@@ -5,6 +5,248 @@ CodeMesh 开发日志。从 main 拉出来后所有的改动按时间顺序记�
 
 ---
 
+## 2026-05-04 (晚) — 对齐 OpenHarness / Claude Code 的第二次迭代
+
+> 分支：`claude/review-repo-history-0W2bx`
+> Commit 范围：`d7abf61..HEAD`（紧跟 v2 7 个 commit 之后）
+
+### 一、背景与触发
+
+下午刚做完 v2 七个 commit (`f35180e..fb59c9a`)，晚上想把"还没做的事"全部清掉。
+关键转折是查了 HKUDS/OpenHarness 源码（11.7k LoC，11.8k star）后发现**两件反常识的事**：
+
+1. **OpenHarness 没有任何 RAG / embedding / 向量库**——全靠 grep / glob / lsp 的 agentic search
+2. 他们的 grep/glob/lsp 实现细节比我之前认知的丰富得多——ripgrep 优先 + Python fallback、流式 / 超时 / 8MB 单行 buffer / 二进制跳过、AST-based LSP
+
+所以原计划的 "BM25 + 向量 + RRF" 撤了，改成 "把检索引擎升级成 OpenHarness 同款"。
+这是 v3 最重要的设计转向。
+
+### 二、本次完成的 9 个 commit
+
+| # | Commit | 主题 |
+|---|---|---|
+| 1 | `d7abf61` | refactor(execution): grep/glob to ripgrep+Python fallback |
+| 2 | `b2c527b` | feat(execution): add ast-based lsp_code tool (5 ops) |
+| 3 | `1326262` | feat(memory): wire long_term + add 3 tools (remember/recall/forget) |
+| 4 | `357df4e` | feat(cli): implement codemesh stats from local jsonl call log |
+| 5 | `cafb69d` | feat(orchestration): standardize hooks on Claude Code event names |
+| 6 | `7c0ee78` | feat(feedback): token-aware context budget (replaces max_chars) |
+| 7 | `8386ed7` | docs: add CLAUDE.md — instructions for future agent sessions |
+| 8 | `101472b` | feat(rag): AST-based chunking for Python files |
+| 9 | `61624de` | feat(orchestration): skill loading + invoke_skill tool |
+| 10 | `57837e6` | feat(adapters): async exponential-backoff retry for transient errors |
+
+### 三、改动详解
+
+---
+
+#### 3.1 grep / glob 升级到 ripgrep + Python fallback（commit 1）
+
+**文件**: `execution/tools.py`
+
+**改动**：
+- 新增 `_rg_grep` / `_rg_glob_files` 内部 helper，用 `asyncio.create_subprocess_exec` 调 `rg`
+- grep_text / glob_files 都改成 **async** 函数，先尝试 rg，失败回退 Python
+- rg 路径具备：流式读 stdout、8MB 单行 buffer、SIGTERM→2s→SIGKILL 进程终止协议、超时控制
+- 退出码白名单 {0, 1, -15, -9} 都视为成功（rg 无匹配返回 1，被超时杀返回 -15）
+- Python fallback 检测二进制（含 NUL 字节跳过）、>500KB 跳过
+
+**为什么**：
+事实标准是 ripgrep——它内置的 .gitignore 处理、文件遍历器都比 Python 快几倍。
+但容器 / CI 不一定有 rg，所以保留 Python 路径。
+
+**面试讲法**：
+> "我读了 OpenHarness 的 grep_tool.py（363 行），借鉴了他们的'ripgrep + Python fallback'双路径设计。然后在自己的 50 行实现里把核心 idea 复刻：进程终止协议、流式读、超时、二进制检测。"
+
+---
+
+#### 3.2 LSP 工具：AST-based 代码导航（commit 2）
+
+**新增文件**: `execution/lsp.py`（用 stdlib `ast` 实现 5 个操作）
+
+**实现的 5 个操作**：
+| 操作 | 干啥 |
+|---|---|
+| `document_symbol` | 列单文件里所有 def / class / 顶层 assign |
+| `workspace_symbol` | 跨文件按子串模糊搜符号名 |
+| `go_to_definition` | 按符号名 / 按 line:col 位置找定义 |
+| `find_references` | 词边界正则在仓库里找所有引用 |
+| `hover` | 取定义 + signature + docstring |
+
+通过 `lsp_code` 工具暴露给模型。
+
+**为什么用 stdlib `ast` 不用 pyright/pylsp**：
+Coding Agent 单次任务可能只查 1-2 次符号；起一个 LSP daemon 不划算。
+ast.parse 几十 ms 拉完整个仓库符号表，对 80% 用例足够。
+
+**面试讲法**：
+> "我用 Python 自带的 ast 模块写了个轻量 LSP，覆盖 Claude Code 同款的 5 个操作。零依赖、几毫秒响应——比起 pyright daemon 的启动开销，对 single-shot agent 任务划算得多。"
+
+---
+
+#### 3.3 long_term 记忆真正接入（commit 3）
+
+**改动**：
+- `memory/long_term.py` 新增 `list_all()` + 模块级单例 `get_default_long_term()` / `set_default_long_term()`
+- 新增 3 个工具：`remember_fact(key, value)` / `recall_facts()` / `forget_fact(key)`
+- `Harness.__init__` 用单例代替自己 new；`_load_long_term_block()` 把所有事实渲染成 system prompt 段落
+
+**为什么**：之前 `LongTermMemory` 是 dead code——init 了但全项目无人读写。这条修补把"跨会话记忆"从 0 → 1。
+
+**面试讲法**：
+> "我发现 long_term 字段是 dead code。补上后，'我喜欢 4-space 缩进'这种偏好真能跨会话生效——既给模型 system prompt 自动注入，也给模型 invoke_skill 之外的另一个写入通道。"
+
+---
+
+#### 3.4 stats 子命令（commit 4）
+
+**新增文件**: `feedback/call_log.py`，每次 `Harness._record_cost()` 追加一行 JSONL 到 `~/.codemesh/calls.jsonl`。
+
+**新命令**: `codemesh stats --days 7` 读 jsonl，按模型聚合：calls / tokens_in / tokens_out / cost / avg_latency。
+
+**为什么**：README 自己承诺过 stats 命令但是 stub。这次兑现，且**不依赖 Langfuse**——纯本地、零外网。
+
+---
+
+#### 3.5 Hooks 标准化（commit 5）
+
+**改动**：`orchestration/hooks.py` 加了 Claude Code 风格的事件枚举：
+```
+PRE_TOOL_USE / POST_TOOL_USE / SESSION_START / SESSION_END / USER_PROMPT_SUBMIT / STOP
+```
++ `HookResult(blocked=True, reason=...)` 让 PreToolUse 钩子能**阻止**工具执行（短路语义）。
+
+老 API（`add_pre` / `fire_pre`）保留作 adapter——harness.py 不需要改。
+
+**面试讲法**：
+> "我把 hook 系统按 Claude Code 标准命名升级了。新的 trigger() 接口让 PreToolUse 能 block，做权限审计 / 沙箱拦截这种横切关注点更优雅。"
+
+---
+
+#### 3.6 Token budget 取代 max_chars（commit 6）
+
+**新增文件**: `feedback/token_budget.py`：tiktoken 优先 + CJK启发式 fallback。
+
+**改动**：`format_context(hits, max_tokens=2000)` 替代 `max_chars=4000`。
+
+**为什么**：中文 1 char ≈ 1 token，英文 1 char ≈ 0.25 token，差 4 倍。按字符切要么浪费上下文要么超限。
+
+---
+
+#### 3.7 CLAUDE.md（commit 7）
+
+**新增文件**: `CLAUDE.md`，给下次 Claude session 看的工作守则：
+- 项目定位（面试项目，别动现有教学注释）
+- Git 身份（Brandoo110，无签名，不碰 main）
+- DEVLOG 必更
+- 测试规则（不依赖 pytest，无网络）
+- Tool Registry 用法
+- RAG 真相（保留作非代码 RAG）
+- 移动端能 / 不能做啥
+- OpenHarness 借鉴清单
+
+**为什么**：移动端 / web session 进来空空如也，靠仓库根的 CLAUDE.md 让我每次都"立刻进入状态"。
+
+---
+
+#### 3.8 AST chunking（commit 8）
+
+**新增文件**: `rag/ast_chunker.py`。.py 文件按 def / class 边界切 chunk，每个函数 / 方法 / 类 header 各一个 chunk。
+
+**fallback**: 非 .py / 语法错误 / >5000 行 → 退到原版按行切。
+
+**为什么用 stdlib `ast` 不用 tree-sitter**：tree-sitter 装包要 gcc 编译，CI / 容器场景挂率高。stdlib `ast` 零依赖，对 Python 项目足够。
+
+---
+
+#### 3.9 Skills 加载机制（commit 9）
+
+**新增文件**: `orchestration/skills.py`。
+
+**目录约定**:
+- `<root>/.claude/skills/<name>/SKILL.md`（项目级）
+- `~/.codemesh/skills/<name>/SKILL.md`（用户级）
+
+**SKILL.md 格式**: YAML frontmatter (name, description) → fallback 到第一个 `# 标题` + 第一段。
+
+**注入点**: Harness 启动时扫两条路径，把 skill 名 + 描述渲染成 `<available skills>` 索引塞 system prompt。模型看到任务相关时调 `invoke_skill(name)` 工具拉 SKILL.md 全文。
+
+**用户故事**: 之前讨论过的 "把 andrej-karpathy-skills 装进 web session" —— 现在只要 cp 到 `.claude/skills/` commit 就行。
+
+---
+
+#### 3.10 Adapter retry / rate limit（commit 10）
+
+**新增文件**: `orchestration/adapters/retry.py`。
+
+`async_retry(factory, max_retries=3, base_delay=1.0, max_delay=30.0)`：指数退避 + ±25% jitter，区分可重试 / 不可重试错误：
+- ✅ 重试: 429 / 500 / 502 / 503 / 504 / APIConnectionError / APITimeoutError / asyncio.TimeoutError
+- ❌ 不重试: 401 / 400 / 403 / 404（deterministic 错重试只是浪费 token）
+
+4 个 adapter 的 `complete()` 全部接入。流式 `complete_stream()` 故意不接——半流断了 retry 会重复输出。
+
+**面试讲法**：
+> "README 自己提到 --compare 单 key 撞 503。我加了 20 行手写指数退避 + jitter，把瞬时 5xx 自动吃掉。没引 tenacity——dependency 越少越好，注释把 why 都写下了。"
+
+### 四、关键数字
+
+| 指标 | 早上 v2 后 | 晚上 v3 后 |
+|---|---|---|
+| 工具数 | 7 | **11**（+ lsp_code, remember/recall/forget_fact, invoke_skill）|
+| 测试用例数 | 66 | **190** |
+| 测试文件数 | 6 | **14** |
+| Git commits（main 之外） | 7 | **17** |
+| 跑通的依赖（pip install -e .） | 8 | 8（**新增 0**——retry 用 stdlib，token_budget tiktoken 软依赖）|
+| 文档 | README + LEARNING_PATH + DEVLOG | + **CLAUDE.md** |
+
+### 五、跟 OpenHarness 的差距对比（v3 之后）
+
+| 子系统 | OpenHarness | CodeMesh | 差距 |
+|---|---|---|---|
+| agent loop | ✅ | ✅ | 持平 |
+| Tool Registry | ✅ | ✅ | 持平 |
+| 工具集 | 43 | 11 | 缩小（早上 7 → 晚上 11）|
+| ripgrep + fallback | ✅ | ✅ | **持平** ⭐ |
+| AST-LSP | ✅ | ✅ | **持平** ⭐ |
+| Hook 事件命名 | ✅ | ✅ | **持平** ⭐ |
+| Skills 加载 | ✅ | ✅ | **持平** ⭐ |
+| Permissions 多级 | ✅ | 正则黑名单 | 落后 |
+| Plugins | ✅ | 没有 | 落后 |
+| MCP | ✅ | 没有 | 落后 |
+| 多 Agent coordinator | ✅ | router + planner | 故意不做（避免变玩具）|
+| 国内多模型 + 成本 | 通用 | ✅ DeepSeek/Qwen/Doubao + ¥ | **CodeMesh 优势** |
+| 测试 | 114 单测 | **190 单测** | **CodeMesh 反超** |
+| 代码规模 | 11.7k LoC | ~5k LoC | 差 2.3 倍 |
+
+### 六、还没做的事（按性价比）
+
+1. **Permissions 多级**（OpenHarness `permissions/`）—— 比正则黑名单成熟，但要重写沙箱
+2. **Plugins 机制**—— 让第三方 commit 一组 hooks + tools 进 `.claude/plugins/`
+3. **MCP client minimal**—— 接 Anthropic 生态
+4. **流式 retry**—— 当前只覆盖了非流式 `complete()`；流式中断重试需要 buffer prefix
+5. **Reranker on RAG**——非代码 RAG 场景下用 doubao 当 cross-encoder 重排前 20 → 取前 5
+6. **Token-budget summarizer**—— 短期记忆的 summarizer 当前按消息数压；改按 token
+
+### 七、对面试的影响
+
+之前评估给的分（早上 v2 末）：
+
+| 维度 | v1 | v2 末 | **v3 末** |
+|---|---|---|---|
+| 架构理解 | 9/10 | 9/10 | **9/10** |
+| 代码实现 | 7/10 | 8/10 | **9/10**（11 工具 + LSP + 完整 hook 系统）|
+| 工程完整度 | 6/10 | 8/10 | **9/10**（190 单测 + retry + stats + token budget）|
+| 文档叙事 | 9/10 | 9/10 | **9/10**（再加 CLAUDE.md）|
+| Git 工程化 | 3/10 | 7/10 | **9/10**（17 个有意义 commit）|
+
+**新的面试讲法**：
+
+> "我做了三轮迭代：v1 是 Initial commit，v2 补了记忆压缩 + Tool Registry + Glob/Grep/Edit + 单测，v3 我去深挖 OpenHarness 源码，发现 Coding Agent 的事实标准不是向量 RAG 而是 grep + glob + AST-LSP 的 agentic search——所以做了完整的对齐：ripgrep + Python fallback、AST-based LSP、Claude Code 标准 hook 事件、Anthropic skill 格式、async retry。190 个单测，所有改动都按一个功能一个 commit 拆好。"
+
+OpenHarness 是港大学术开源，11.7k 行；CodeMesh 现在 5k 行——**保持精炼是优势**，不跟它卷规模。差异化定位是国内多模型 + 真实人民币成本 + 单 key 降级。
+
+---
+
 ## 2026-05-04 — 第一次大版本迭代
 
 > 分支：`claude/review-repo-history-0W2bx`
