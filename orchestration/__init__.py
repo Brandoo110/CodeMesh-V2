@@ -9,6 +9,14 @@ from .skills import (
     project_skills_dir,
     user_skills_dir,
 )
+from .permissions import (
+    Permission,
+    PermissionRule,
+    PermissionDecision,
+    PermissionRegistry,
+    make_default_permissions,
+    make_permission_hook,
+)
 
 __all__ = [
     "route",
@@ -25,4 +33,10 @@ __all__ = [
     "load_skill_registry",
     "project_skills_dir",
     "user_skills_dir",
+    "Permission",
+    "PermissionRule",
+    "PermissionDecision",
+    "PermissionRegistry",
+    "make_default_permissions",
+    "make_permission_hook",
 ]

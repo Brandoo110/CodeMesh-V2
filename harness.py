@@ -55,6 +55,9 @@ from orchestration import (
     make_default_logging_hooks,
     load_skill_registry,
     SkillRegistry,
+    PermissionRegistry,
+    make_default_permissions,
+    make_permission_hook,
 )
 from execution import set_skill_registry
 from orchestration.adapters import (
@@ -115,6 +118,12 @@ class Harness:
         self.hooks = HookRegistry()
         if enable_logging_hooks:
             make_default_logging_hooks(self.hooks)
+
+        # 权限层：默认规则集（force-push / pip install / 系统路径写入...），
+        # 通过 PreToolUse hook 在工具执行前检查。用户可以通过 self.permissions
+        # 在 init 之后追加 / 修改规则。
+        self.permissions: PermissionRegistry = make_default_permissions()
+        self.hooks.register(HookEvent.PRE_TOOL_USE, make_permission_hook(self.permissions))
 
         # RAG 开关（需要先跑 `codemesh index` 建索引才有效）
         self.use_rag = use_rag
