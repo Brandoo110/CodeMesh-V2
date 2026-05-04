@@ -3,13 +3,19 @@
 > 国内多模型 Code Agent，基于 **Harness 四层架构** 的实践项目。
 > 定位：**面向国内合规场景**（金融/政务/医疗 —— 不能用 OpenAI/Anthropic）的 Claude Code 类 Agent。
 
-**特性速览**：
+**特性速览（v3）**：
 - 🎯 **智能路由**：PydanticAI 强类型路由到 DeepSeek / Qwen / Doubao
 - 🧠 **Planner-Executor 双 Agent**：复杂任务自动拆步骤，简单任务单轮秒回
 - ⚡ **流式输出**：逐 token 实时吐字
-- 💰 **真实成本追踪**：每次调用算到 0.0001 元，`--compare` 一眼看出哪家性价比高
-- 🔍 **代码库 RAG**：`codemesh index .` 建索引 → `--rag` 语义检索相关代码
-- 📊 **Langfuse 可观测**：trace / token / 成本全链路追踪
+- 💰 **真实成本追踪**：每次调用算到 0.0001 元；`codemesh stats` 聚合本地日志（无需 Langfuse）；`--compare` 一眼看出哪家性价比高
+- 🛠️ **Claude Code 同款工具集**：`bash_exec / read_file / write_file / glob_files / grep_text / edit_file / lsp_code`，ripgrep 优先 + Python fallback
+- 🧭 **AST-based 轻量 LSP**：5 个操作（document/workspace symbol、go-to-definition、find references、hover）—— 代码搜索靠 agentic search，不靠向量
+- 🔁 **跨会话记忆**：`remember_fact` / `recall_facts` 工具 + 自动注入 system prompt（SQLite 本地）
+- 🪝 **标准 Hook 系统**：`PreToolUse / PostToolUse / SessionStart / ... / Stop`，PreToolUse 可 `block(reason)`
+- 📦 **Skills 加载**：`.claude/skills/<name>/SKILL.md`（兼容 Anthropic 格式），自动注入索引
+- 🔍 **代码库 RAG**（保留作非代码场景）：`codemesh index .` → `--rag` 语义检索；AST 切 chunk + token-aware 截断
+- 🛡️ **Adapter retry**：429 / 5xx 指数退避自动重试
+- 📊 **Langfuse 可观测**：trace / token / 成本全链路追踪（可选）
 
 ---
 
@@ -30,26 +36,33 @@ CodeMesh 不是要替代 Claude Code，而是演示：**在境内模型（DeepSe
 ## 2. Harness 四层架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ 编排层 Orchestration                                         │
-│   router.py   —— PydanticAI 强类型路由                      │
-│   hooks.py    —— Pre/Post 工具调用钩子                      │
-│   adapters/   —— DeepSeek / DashScope / VolcEngine          │
-├─────────────────────────────────────────────────────────────┤
-│ 执行层 Execution                                             │
-│   loop.py     —— Agent Loop（模型↔工具循环）                │
-│   tools.py    —— bash_exec / read_file / write_file         │
-│   sandbox.py  —— 危险命令拦截                               │
-├─────────────────────────────────────────────────────────────┤
-│ 反馈层 Feedback                                              │
-│   observer.py —— Langfuse 埋点（trace、token、成本）        │
-│   validator.py —— 输出校验（路径逃逸、密钥泄露）            │
-├─────────────────────────────────────────────────────────────┤
-│ 记忆层 Memory                                                │
-│   short_term.py —— 对话历史 + 滑动窗口                      │
-│   working.py    —— 当前任务结构化状态                       │
-│   long_term.py  —— SQLite 跨会话持久化                      │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ 编排层 Orchestration                                              │
+│   router.py     —— PydanticAI 强类型路由                         │
+│   planner.py    —— 复杂任务拆步骤                                │
+│   hooks.py      —— HookEvent 标准事件 + HookResult.block         │
+│   skills.py     —— SKILL.md 加载（项目级 + 用户级）              │
+│   adapters/     —— DeepSeek / DashScope / VolcEngine / Gemini    │
+│   adapters/retry.py —— async 指数退避重试（429 / 5xx）           │
+├──────────────────────────────────────────────────────────────────┤
+│ 执行层 Execution                                                  │
+│   loop.py       —— Agent Loop（模型↔工具循环）                   │
+│   tools.py      —— Tool Registry + 11 个工具                     │
+│   lsp.py        —— AST-based 5 个代码导航操作                    │
+│   sandbox.py    —— 危险命令拦截                                  │
+├──────────────────────────────────────────────────────────────────┤
+│ 反馈层 Feedback                                                   │
+│   observer.py     —— Langfuse 埋点                               │
+│   validator.py    —— 输出校验（路径逃逸、密钥泄露）              │
+│   cost.py         —— 真实人民币成本计算                          │
+│   call_log.py     —— 本地 jsonl 调用日志（stats 数据源）         │
+│   token_budget.py —— tiktoken + CJK 启发式 token 计数            │
+├──────────────────────────────────────────────────────────────────┤
+│ 记忆层 Memory                                                     │
+│   short_term.py —— 对话历史 + 滑动窗口 + LLM 摘要压缩            │
+│   working.py    —— 当前任务结构化状态                            │
+│   long_term.py  —— SQLite 跨会话持久化（remember_fact 工具）     │
+└──────────────────────────────────────────────────────────────────┘
              ▲
              │ 顶层组装
         harness.py  ——  cli.py
@@ -195,15 +208,26 @@ codemesh run "用一句话解释 Harness 架构" --stream
 
 ---
 
-## 7. 项目状态
+## 7. 项目状态（v3，2026-05-04）
 
 - ✅ 全部四层代码到位，可端到端跑通
 - ✅ 成本追踪 / 流式输出 / Planner-Executor / RAG 四大增强已集成
-- ⚠️ 未覆盖全面的单测（只有关键滑动窗口单测 + 适配器冒烟）
-- ⚠️ Langfuse 统计聚合（`stats` 子命令）未实现，请直接看 Langfuse 控制台
-- 💡 扩展方向：
-  - 记忆压缩（让模型总结老对话再丢）
-  - Docker 沙箱（真正隔离 bash_exec）
-  - Hybrid search（RAG 向量 + BM25 融合）
-  - AST 切 chunk（tree-sitter 代替按行切）
-  - 更多工具（grep / git / diff）
+- ✅ **记忆压缩**：超阈值后用 doubao 摘要老对话（v2 增）
+- ✅ **stats 子命令**：本地 jsonl 聚合 token / 成本 / 延迟，不依赖 Langfuse（v3 增）
+- ✅ **测试覆盖**：14 个测试文件、200 + 用例，全部纯单测无网络（v2/v3 加）
+- ✅ **Tool Registry**：`@registry.register` 模式加新工具（v2 增）
+- ✅ **Glob / Grep / Edit / LSP**：Claude Code 标准检索三件套 + AST-based 代码导航；ripgrep 优先 + Python fallback（v2/v3 增）
+- ✅ **Hooks 标准事件**：`PreToolUse / PostToolUse / SessionStart / SessionEnd / UserPromptSubmit / Stop` + `HookResult.block(reason)` 拦截（v3 增）
+- ✅ **跨会话长期记忆**：`remember_fact / recall_facts / forget_fact` 三个工具 + 自动注入 system prompt（v3 增）
+- ✅ **Token-aware context budget**：tiktoken + CJK 启发式 fallback（v3 增）
+- ✅ **AST chunking**：Python 文件按 def/class 切 chunk（v3 增）
+- ✅ **Skills 加载**：兼容 Anthropic SKILL.md 格式，自动扫 `.claude/skills/` 和 `~/.codemesh/skills/`（v3 增）
+- ✅ **Adapter retry**：所有适配器 `complete()` 加指数退避，处理 429 / 5xx（v3 增）
+- 💡 后续扩展方向（按性价比）：
+  - **Permissions 多级**：从正则黑名单升级到 ALLOW/DENY/ASK + Hook 拦截
+  - **Plugins 机制**：`.claude/plugins/<name>/` 自动加载 hooks + tools
+  - **流式 retry**：buffer 前 N 个 chunk 才能在断流后从头重发
+  - **MCP client**：Anthropic 生态接入（filesystem / github / brave 等）
+  - **Reranker**：非代码 RAG 的 cross-encoder 重排
+  - **Docker 沙箱**：真正隔离 bash_exec
+- 📖 完整改动叙事看 `DEVLOG.md`，工作守则看 `CLAUDE.md`
