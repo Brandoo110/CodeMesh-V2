@@ -17,6 +17,12 @@ from .permissions import (
     make_default_permissions,
     make_permission_hook,
 )
+from .plugins import (
+    LoadedPlugin,
+    load_plugins,
+    project_plugins_dir,
+    user_plugins_dir,
+)
 
 __all__ = [
     "route",
@@ -39,4 +45,8 @@ __all__ = [
     "PermissionRegistry",
     "make_default_permissions",
     "make_permission_hook",
+    "LoadedPlugin",
+    "load_plugins",
+    "project_plugins_dir",
+    "user_plugins_dir",
 ]

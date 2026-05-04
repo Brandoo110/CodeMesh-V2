@@ -58,6 +58,7 @@ from orchestration import (
     PermissionRegistry,
     make_default_permissions,
     make_permission_hook,
+    load_plugins,
 )
 from execution import set_skill_registry
 from orchestration.adapters import (
@@ -132,6 +133,11 @@ class Harness:
         # invoke_skill 工具使用同一个 registry 加载 SKILL.md 全文
         self.skills: SkillRegistry = load_skill_registry(project_root=Path("."))
         set_skill_registry(self.skills)
+
+        # Plugins：扫 .claude/plugins/ + ~/.codemesh/plugins/，import + 调 register(harness)
+        # 让插件能往 hooks / permissions / tools / skills 任一处叠加
+        # （插件失败不阻断启动；warning 已经在 plugins.py 里打了）
+        self.plugins = load_plugins(harness=self, project_root=Path("."))
 
         # 每次 run 累计的成本
         self.last_costs: list[CallCost] = []
