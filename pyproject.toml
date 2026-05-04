@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codemesh"
-version = "0.1.0"
+version = "0.3.0"
 description = "国内多模型 Code Agent（Harness 架构实践）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,9 +21,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# RAG 功能所需。按需装：pip install -e ".[rag]"
+# 向量 RAG（非代码场景）：pip install -e ".[rag]"
 rag = [
     "chromadb>=0.5.0",
+]
+# Skill 加载用 YAML frontmatter：pip install -e ".[skills]"
+# 没装也能用，会回退到 markdown 标题解析
+skills = [
+    "pyyaml>=6.0",
+]
+# Token 计数（与字符数对比更精确）：pip install -e ".[tokens]"
+# 没装也能用，会回退到 CJK 启发式（误差 ±15%）
+tokens = [
+    "tiktoken>=0.7.0",
+]
+# 全部可选项一次装：pip install -e ".[all]"
+all = [
+    "chromadb>=0.5.0",
+    "pyyaml>=6.0",
+    "tiktoken>=0.7.0",
 ]
 
 [project.scripts]
