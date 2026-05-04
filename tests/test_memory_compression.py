@@ -169,6 +169,78 @@ def test_no_summarizer_means_no_compression():
     print("OK no summarizer: compression disabled")
 
 
+# ────────────────────────── token_budget 触发 ──────────────────────────
+
+
+def test_token_budget_triggers_when_messages_long():
+    """
+    消息数低于 compress_threshold 但单条消息很长，token 数过 budget → 也应触发。
+    这是 token-budget 触发器的核心用例。
+    """
+    summarizer, calls = _fake_summarizer_factory()
+    mem = ShortTermMemory(
+        max_messages=20,
+        compress_threshold=100,    # 故意放很高，单凭消息数永不触发
+        token_budget=200,           # 但 token 触发器低
+        summarizer=summarizer,
+    )
+    mem.set_system("sys")
+    # 4 条很长的消息，每条 ~500 字 → ~125 token / 条（CJK 启发式）= ~500 token 总
+    for i in range(4):
+        mem.add("user" if i % 2 == 0 else "assistant", "x" * 500)
+
+    triggered = asyncio.run(mem.maybe_compress())
+    assert triggered is True
+    assert len(calls) == 1
+    # 半数被压缩
+    assert len(mem) == 2
+    print("OK token-budget triggers when messages are long")
+
+
+def test_token_budget_does_not_trigger_for_short_messages():
+    """token_budget 高时短消息不触发。"""
+    summarizer, calls = _fake_summarizer_factory()
+    mem = ShortTermMemory(
+        max_messages=20,
+        compress_threshold=100,
+        token_budget=10000,
+        summarizer=summarizer,
+    )
+    mem.set_system("sys")
+    _fill(mem, 5)   # 短消息
+    triggered = asyncio.run(mem.maybe_compress())
+    assert triggered is False
+    assert calls == []
+    print("OK token-budget: short messages don't trigger")
+
+
+def test_message_count_or_token_budget_either_triggers():
+    """两个触发器任一命中即触发。"""
+    summarizer, calls = _fake_summarizer_factory()
+    mem = ShortTermMemory(
+        max_messages=20,
+        compress_threshold=4,        # 低阈值，消息数容易触发
+        token_budget=1000000,        # token 阈值故意拉爆，永不触发
+        summarizer=summarizer,
+    )
+    mem.set_system("sys")
+    _fill(mem, 4)
+    triggered = asyncio.run(mem.maybe_compress())
+    assert triggered is True
+    assert len(calls) == 1
+    print("OK either trigger fires independently")
+
+
+def test_estimated_tokens_grows_with_messages():
+    """estimated_tokens 是单调的：加消息后总数变多。"""
+    mem = ShortTermMemory(max_messages=20)
+    before = mem.estimated_tokens()
+    mem.add("user", "你好世界" * 50)
+    after = mem.estimated_tokens()
+    assert after > before
+    print("OK estimated_tokens monotonic")
+
+
 # ────────────────────────── runner ──────────────────────────
 
 
@@ -179,4 +251,8 @@ if __name__ == "__main__":
     test_system_never_compressed()
     test_repeated_compression_accumulates()
     test_no_summarizer_means_no_compression()
+    test_token_budget_triggers_when_messages_long()
+    test_token_budget_does_not_trigger_for_short_messages()
+    test_message_count_or_token_budget_either_triggers()
+    test_estimated_tokens_grows_with_messages()
     print("\nAll memory compression tests passed.")

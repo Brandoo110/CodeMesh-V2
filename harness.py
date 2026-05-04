@@ -88,12 +88,16 @@ class Harness:
         enable_memory_compression: bool = True,
     ):
         # 记忆层（可选开启 LLM 摘要压缩，避免长对话直接丢历史）
+        # 触发条件双管齐下：
+        #   消息数 >= 15  或  累计 token 数 >= 6000
+        # 两条都监控是为了应对"少而长"和"多而短"两种用法，不让任何一种悄悄爆 context。
         self.enable_memory_compression = enable_memory_compression
         if enable_memory_compression:
             self.short_term = ShortTermMemory(
                 max_messages=20,
                 compress_threshold=15,
                 summarizer=self._summarize,
+                token_budget=6000,
             )
         else:
             self.short_term = ShortTermMemory(max_messages=20)

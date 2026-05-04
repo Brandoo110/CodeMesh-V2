@@ -48,20 +48,30 @@ class ShortTermMemory:
         max_messages: int = 20,
         compress_threshold: Optional[int] = None,
         summarizer: Optional[Summarizer] = None,
+        token_budget: Optional[int] = None,
     ):
         """
         Args:
             max_messages: 最多保留多少条非 system 消息。超过后最旧的会被自动丢弃。
-            compress_threshold: 触发记忆压缩的阈值（消息数 >= 该值时 maybe_compress 会触发）。
-                                None 表示关闭压缩。
+            compress_threshold: 按"消息数"触发记忆压缩的阈值。
+                                None 表示关闭按消息数触发。
             summarizer: async 函数，接收一组消息返回压缩摘要文本。
-                        compress_threshold 不为 None 时必传。
+                        触发器不为空时必传。
+            token_budget: 按"token 数"触发记忆压缩的阈值（更精确）。
+                          为 None 时关闭 token 触发。
+                          配置后 maybe_compress() 同时检查"消息数 >= compress_threshold"
+                          和 "token 总数 >= token_budget"，任一命中就压缩。
+
+                          为什么再加一个 token 触发：
+                            短消息 20 条不一定占满上下文；长消息 5 条已经爆了。
+                            按 token 算更接近模型真实约束。
         """
         self._system: dict | None = None
         # deque 的 maxlen 参数：满了再 append 会自动 popleft，O(1) 复杂度
         self._messages: deque[dict] = deque(maxlen=max_messages)
         # ── 记忆压缩相关 ──
         self._compress_threshold = compress_threshold
+        self._token_budget = token_budget
         self._summarizer = summarizer
         self._summary: str | None = None  # 累积的对话摘要
 
@@ -114,23 +124,48 @@ class ShortTermMemory:
         """当前累积的对话摘要（用于调试 / 单测断言）。"""
         return self._summary
 
+    def estimated_tokens(self) -> int:
+        """
+        估算当前 _messages 里所有消息的 token 总数。
+        用 feedback.token_budget.count_tokens（tiktoken 优先 / CJK 启发式 fallback）。
+        没装 feedback 也能跑：失败时回退到 chars/4 粗估。
+        """
+        try:
+            from feedback.token_budget import count_tokens
+        except Exception:
+            return sum(len(m.get("content", "")) for m in self._messages) // 4
+        total = 0
+        for m in self._messages:
+            total += count_tokens(m.get("content", ""))
+            total += count_tokens(m.get("role", ""))
+        return total
+
     async def maybe_compress(self) -> bool:
         """
-        如果当前消息数 >= compress_threshold 且配置了 summarizer，
-        把最旧一半消息交给 summarizer 压缩成 summary，并从 _messages 中移除。
+        触发记忆压缩。两种触发器（任一命中即压缩）：
 
+          1. 消息数触发：len(_messages) >= compress_threshold
+          2. Token 数触发：estimated_tokens() >= token_budget
+
+        把最旧一半消息交给 summarizer 压缩成 summary，从 _messages 中移除。
         多次触发时新摘要会与旧摘要合并：保留旧 summary 作为前缀。
 
         Returns:
             True  : 触发了一次压缩
-            False : 阈值未到 / 未配置 summarizer / 没有可压缩的消息
+            False : 没触发器命中 / 未配置 summarizer / 没有可压缩的消息
         """
-        if self._compress_threshold is None or self._summarizer is None:
-            return False
-        if len(self._messages) < self._compress_threshold:
+        if self._summarizer is None:
             return False
         # 至少要有 2 条才值得压缩
         if len(self._messages) < 2:
+            return False
+
+        triggered = False
+        if self._compress_threshold is not None and len(self._messages) >= self._compress_threshold:
+            triggered = True
+        if self._token_budget is not None and self.estimated_tokens() >= self._token_budget:
+            triggered = True
+        if not triggered:
             return False
 
         half = len(self._messages) // 2
