@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .embedder import embed_texts
+from .ast_chunker import chunk_file_with_fallback
 
 
 # 索引存储目录
@@ -73,27 +74,14 @@ def _chunk_file(path: Path) -> list[tuple[str, int, int]]:
     """
     把单个文件切成 chunk。返回 [(text, start_line, end_line), ...]。
     start/end 是 1-based，方便给模型展示。
-    """
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return []
 
-    chunks: list[tuple[str, int, int]] = []
-    step = CHUNK_LINES - CHUNK_OVERLAP
-    i = 0
-    while i < len(lines):
-        block = lines[i : i + CHUNK_LINES]
-        if not any(l.strip() for l in block):
-            # 全空白块跳过，别浪费 embedding 预算
-            i += step
-            continue
-        text = "\n".join(block)
-        chunks.append((text, i + 1, i + len(block)))
-        if i + CHUNK_LINES >= len(lines):
-            break
-        i += step
-    return chunks
+    .py 文件：走 AST chunker（每个 def/class 自成 chunk）
+    其他文件：按行滑窗
+    """
+    code_chunks = chunk_file_with_fallback(
+        path, fallback_chunks=CHUNK_LINES, fallback_overlap=CHUNK_OVERLAP,
+    )
+    return [(c.text, c.start_line, c.end_line) for c in code_chunks]
 
 
 async def build_index(
