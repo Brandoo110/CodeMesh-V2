@@ -25,6 +25,7 @@ from typing import AsyncIterator
 from openai import AsyncOpenAI
 
 from .base import Message, Usage
+from .retry import async_retry
 
 
 class VolcEngineAdapter:
@@ -52,11 +53,13 @@ class VolcEngineAdapter:
 
     async def complete(self, messages: list[Message], system: str = "") -> str:
         full = self._build_messages(messages, system)
-        resp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=full,  # type: ignore[arg-type]
-            temperature=0.3,
-        )
+        async def _call():
+            return await self.client.chat.completions.create(
+                model=self.model,
+                messages=full,  # type: ignore[arg-type]
+                temperature=0.3,
+            )
+        resp = await async_retry(_call)
         if resp.usage:
             self.last_usage = Usage(
                 prompt_tokens=resp.usage.prompt_tokens,

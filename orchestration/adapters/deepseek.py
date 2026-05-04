@@ -28,6 +28,7 @@ from typing import AsyncIterator
 from openai import AsyncOpenAI
 
 from .base import Message, Usage
+from .retry import async_retry
 
 
 class DeepSeekAdapter:
@@ -55,12 +56,20 @@ class DeepSeekAdapter:
         return full
 
     async def complete(self, messages: list[Message], system: str = "") -> str:
+        """
+        非流式调用。包了一层 async_retry：429 / 5xx / 网络错误自动指数退避重试，
+        401 / 400 等 deterministic 错误立刻抛。
+        """
         full = self._build_messages(messages, system)
-        resp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=full,  # type: ignore[arg-type]
-            temperature=0.3,
-        )
+
+        async def _call():
+            return await self.client.chat.completions.create(
+                model=self.model,
+                messages=full,  # type: ignore[arg-type]
+                temperature=0.3,
+            )
+
+        resp = await async_retry(_call)
         # 记录 token 数，方便成本层算账
         if resp.usage:
             self.last_usage = Usage(
