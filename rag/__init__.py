@@ -20,6 +20,7 @@ from .embedder import embed_texts
 from .indexer import build_index, DEFAULT_DB_DIR
 from .retriever import retrieve
 from .ast_chunker import chunk_python_file, chunk_file_with_fallback, CodeChunk
+from .reranker import rerank, Scorer
 
 __all__ = [
     "embed_texts",
@@ -29,4 +30,6 @@ __all__ = [
     "chunk_python_file",
     "chunk_file_with_fallback",
     "CodeChunk",
+    "rerank",
+    "Scorer",
 ]
