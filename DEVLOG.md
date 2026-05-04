@@ -5,6 +5,209 @@ CodeMesh 开发日志。从 main 拉出来后所有的改动按时间顺序记�
 
 ---
 
+## 2026-05-04 (深夜) — v4 收尾批：文档对齐 + 三大遗漏功能
+
+> 分支：`claude/review-repo-history-0W2bx`
+> Commit 范围：`d470454..HEAD`
+
+### 一、背景
+
+v3 晚上把 OpenHarness 的核心子系统补齐后，DEVLOG 顶部还留了一个"还没做的事"
+清单。本批一次性清掉**除大任务（MCP / Web UI）之外**的所有项：5 个工程化
+功能 + 4 项文档 / 测试补漏。
+
+### 二、本次完成的 10 个 commit
+
+| # | Commit | 主题 |
+|---|---|---|
+| 1 | `d470454` | chore(pyproject): 0.3.0 + optional deps groups |
+| 2 | `0e07be4` | docs(readme): refresh feature list / architecture / status to v3 |
+| 3 | `afaa7a6` | docs(learning-path): add v2 / v3 stages |
+| 4 | `a1e3c94` | test(rag): cover indexer / chunker / retriever |
+| 5 | `592a3e4` | test(cli): cover preflight / friendly_error / stats / run --compare |
+| 6 | `4ec7540` | feat(memory): token-budget trigger for short-term compression |
+| 7 | `fc8d104` | feat(orchestration): ALLOW/ASK/DENY permission system + PreToolUse hook |
+| 8 | `4c05170` | feat(adapters): streaming retry with buffer-prefix replay |
+| 9 | `78d36cc` | feat(rag): LLM-as-cross-encoder reranker for non-code retrieval |
+| 10 | `ce59021` | feat(orchestration): plugins loader (.claude/plugins/<name>/plugin.py) |
+
+### 三、改动详解
+
+---
+
+#### 3.1 pyproject.toml 优化（commit 1）
+- 版本 `0.1.0 → 0.3.0` 跟 v3 work 对齐
+- 把 `chromadb` 拆出来当 `[rag]` extras，新增 `[skills]`（pyyaml）、`[tokens]`（tiktoken）、`[all]` 三组
+- 基础 `pip install -e .` 仍是最小依赖
+
+---
+
+#### 3.2 README 更新到 v3（commit 2）
+- 顶部 features 改写：列出 v3 的 11 个新能力
+- 架构 ASCII 图加上：`planner / skills / retry / lsp / call_log / token_budget`
+- §7 项目状态从"测试薄、stats 没做、Hybrid search 待做"改成 v3 完成清单
+- 后续扩展方向裁剪到真正还没做的（permissions / plugins / 流式 retry / MCP）
+
+---
+
+#### 3.3 LEARNING_PATH 加 v2/v3 章节（commit 3）
+- 阶段 6（v2）：30 分钟读完工程化补齐
+- 阶段 7（v3）：45 分钟读完 OpenHarness 对齐，9 个文件按顺序
+- 阶段 8：怎么继续往下做（DEVLOG-driven loop）
+- 关键认知更新："Coding Agent 不用向量 RAG"的 pivot 故事写进了面试讲法
+
+---
+
+#### 3.4 RAG 模块单测（commit 4，16 个用例）
+之前 `rag/` 整个模块 0 单测，**最大死角**。覆盖：
+- `_iter_code_files` 跳 node_modules / __pycache__ / >500KB / 未知后缀
+- `_chunk_file`（已转 AST）正确切函数 + 非 .py fallback
+- `retrieve` 没索引 / 没 chromadb 时优雅返回 `[]`
+- `format_context` max_chars / max_tokens 两条预算路径
+
+---
+
+#### 3.5 CLI 单测（commit 5，12 个用例）
+最后一个 0 单测的模块。用 `typer.testing.CliRunner` 覆盖：
+- `_friendly_error` 4 种错误类型翻译
+- `_preflight` 无 .env / 真 key / 占位 key 三个分支
+- `stats` 命令空日志 / 真数据 / 时间窗口过滤
+- `run` 普通调 + `--compare` 调（mock Harness）
+
+注：`read_calls` 默认参数在 def 时 bind，所以测试用 `_patch_read_calls`
+helper 重定向 `cli_mod.read_calls`。
+
+---
+
+#### 3.6 Token-budget 触发记忆压缩（commit 6）
+v3 里压缩只看消息数（默认 15 条触发）。问题：5 条很长的消息也会爆 context，
+但消息数还没到。
+- `ShortTermMemory.__init__` 加 `token_budget` 可选参数
+- `estimated_tokens()` 用 `feedback.token_budget.count_tokens` 算总数
+- `maybe_compress` 双触发器：消息数 OR token 数任一命中即压
+- Harness 默认配 `token_budget=6000`
+
+**面试讲法**：
+> "记忆压缩不应该单看消息数——5 条 1500 token 的长消息已经接近 8k context 一半。
+>  我加了 token-budget 双触发，让'少而长'和'多而短'两种用法都能稳。"
+
+---
+
+#### 3.7 Permissions ALLOW/ASK/DENY 三级（commit 7，20 个测试）
+之前只有 `execution/sandbox.py` 单层正则黑名单，**写死 + 二元决定**。这层叠加：
+- `Permission` enum：ALLOW / ASK / DENY
+- `PermissionRegistry` 顺序规则；首匹配胜出；默认决定可改
+- 通过 PreToolUse hook 接入 Harness：DENY → block, ASK → block (CLI 模式), ALLOW → ok
+- `make_default_permissions()` 默认覆盖：force-push / branch -d / pip install → ASK；写 /etc / .ssh / .bashrc → DENY
+- 用户 / 插件可在 init 后追加 `harness.permissions.deny(...)`
+
+跟 sandbox 关系：sandbox 是工具内部"硬安全"，permissions 是策略层"软可配置"。**两层防御共存**。
+
+---
+
+#### 3.8 流式 retry (buffer-prefix replay)（commit 8，5 个新测试）
+v3 的 retry 只覆盖非流式 `complete()`，流式因为"半流断了不能简单重试"被故意跳过。
+本次解决：
+
+**算法**：
+```
+attempt 0: 正常跑流，yield 每个 chunk；失败时把已 yield 的所有文本累计进 buffer
+attempt 1+: 模型重新生成（从头），跳过新流前 len(buffer) 个字符再开始 yield
+```
+
+下游消费者看到的输出**完全连续**，不重复也不断裂。代价：模型每次重试重新生成消耗 token——和非流式 retry 同样的取舍。
+
+4 个 adapter 的 `complete_stream()` 全部接入。
+
+---
+
+#### 3.9 RAG reranker（commit 9，11 个测试）
+向量检索拿出来的 top5 通常**精度差**——能进 top5 的语义都接近，但谁更准要靠
+cross-encoder 重排。
+
+不上 BAAI bge-reranker（要 GPU + 600MB 模型），用 **LLM-as-cross-encoder**：
+- 默认 scorer 用 doubao 给候选打 0-10 分
+- `rerank(query, candidates, k=5, scorer=None, min_score=0.0)`
+- 全部低于 min_score 时**回退到原 vector 排序**前 k，不返回空
+- 单条 scorer 抛错时给中性分数排到尾部，不丢候选
+
+**仅用于非代码 RAG 场景**——代码搜索仍走 grep / glob / lsp 这条线。
+
+---
+
+#### 3.10 Plugins 机制（commit 10，9 个测试）
+让第三方 / 用户在不动核心代码的前提下叠加：
+- 新工具（`@registry.register` 在 module-level）
+- 新 hook（`harness.hooks.register` 在 `register(harness)` 里）
+- 新 permission 规则
+- 新 skill
+
+**目录约定**：
+- `<root>/.claude/plugins/<name>/plugin.py` 项目级
+- `~/.codemesh/plugins/<name>/plugin.py` 用户级
+
+**加载机制**：
+- `importlib.util.spec_from_file_location` 直接给路径就 import（不要求合法 Python 包）
+- 失败容错：单个 plugin 语法错 / register 抛错都不阻断启动
+
+**为什么不用 setuptools entry_points**：entry_points 要求 plugin 是 pip 装包；
+本项目目标是"丢一个 .py 进 .claude/plugins/ 就能用"，更接近 Claude Code 的体验。
+
+### 四、关键数字（v3 末 → v4 末）
+
+| 指标 | v3 末 | **v4 末** |
+|---|---|---|
+| 工具数 | 11 | **11**（plugin 机制让第三方加，本身不增加内置）|
+| 测试用例数 | 190 | **267** |
+| 测试文件数 | 14 | **19** |
+| Git commits（main 之外） | 17 | **27** |
+| 已实现的 README §7 v1 扩展项 | 1（记忆压缩）| **3+1**（+ AST chunking、stats、Glob/Grep/Edit／其他大量 v3 项也算了）|
+| 文档 | + CLAUDE.md | **+ 0.3.0 pyproject** + 全文档对齐 v3/v4 |
+
+### 五、跟 OpenHarness 对位（v4 之后）
+
+| 子系统 | OpenHarness | CodeMesh | 状态 |
+|---|---|---|---|
+| agent loop | ✅ | ✅ | 持平 |
+| Tool Registry | ✅ | ✅ | 持平 |
+| ripgrep + fallback | ✅ | ✅ | 持平 |
+| AST-LSP | ✅ | ✅ | 持平 |
+| Hook 标准事件 | ✅ | ✅ | 持平 |
+| Skills 加载 | ✅ | ✅ | 持平 |
+| **Permissions 多级** | ✅ | ✅ | **持平** ⭐（v4 新增）|
+| **Plugins 机制** | ✅ | ✅ | **持平** ⭐（v4 新增）|
+| MCP client | ✅ | ❌ | 仍落后 |
+| 多 Agent coordinator | ✅ | router+planner | 故意不做 |
+| 测试 | 114 | **267** | **CodeMesh 反超 2.3×** |
+| 国内多模型 + ¥ 成本 | 通用 | ✅ | **CodeMesh 优势** |
+
+OpenHarness 还领先的就剩 **MCP** 和 **多 Agent coordinator**——前者后续可加，后者
+我们故意不做（router+planner 已够，再加变玩具）。
+
+### 六、还没做的事（v4 末）
+
+按性价比排序：
+1. **MCP client minimal** — Anthropic 生态接入；工程量大但故事最强
+2. **Web UI / TUI** — Rich-based REPL；体验提升但跟"四层架构"叙事关系不大
+3. **Docker 沙箱** — 替换正则黑名单；有了 Permissions 后优先级更低
+4. **完整 reranker** — BAAI bge-reranker-v2 真模型；目前 LLM 版够用
+
+### 七、面试故事（v4 版）
+
+> "我做了四轮迭代：v1 Initial，v2 工程化补齐（测试 + Tool Registry），v3 对齐 OpenHarness
+>  （ripgrep fallback / AST-LSP / Skills / Hook 事件标准化），v4 收尾把还没做的功能清掉
+>  （permissions ALLOW/ASK/DENY、流式 retry、reranker、plugins）+ 全文档同步。
+>
+>  最终 11 个工具、267 个单测、27 个 commit、跟 OpenHarness 在 8 个核心子系统持平。
+>  保持 ~5k 行规模而不是去追他们的 11.7k，是因为我的差异化定位是'国内多模型 + ¥ 成本 +
+>  单 key 降级'——那是港大那套学术开源不会做的事。
+>
+>  写测试时挖出过 sandbox 一个真 false-positive bug；做 RAG 时读源码发现业界事实标准
+>  不是向量 RAG 而是 agentic search，立刻调整方案 pivot。这俩故事都能讲'我不是闭门造车
+>  / 我会读源码 / 我会改方案'。"
+
+---
+
 ## 2026-05-04 (晚) — 对齐 OpenHarness / Claude Code 的第二次迭代
 
 > 分支：`claude/review-repo-history-0W2bx`
