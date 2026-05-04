@@ -105,3 +105,39 @@ class LongTermMemory:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM kv WHERE key = ?", (key,))
             await db.commit()
+
+    async def list_all(self) -> dict[str, Any]:
+        """
+        把整张 kv 表读出来。Harness 在 run() 前会调一次，把内容拼进 system prompt。
+        条数大时（>200）应该改成分页，但目前作为面试演示，直接全量读。
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT key, value FROM kv ORDER BY key") as cursor:
+                rows = await cursor.fetchall()
+        out: dict[str, Any] = {}
+        for k, v in rows:
+            try:
+                out[k] = json.loads(v)
+            except json.JSONDecodeError:
+                out[k] = v
+        return out
+
+
+# ─────────────── 模块级单例 ───────────────
+# 工具 (remember_fact / recall_facts / forget_fact) 和 Harness 共享同一实例，
+# 保证模型保存的事实下一轮立刻可见。
+
+_default: "LongTermMemory | None" = None
+
+
+def get_default_long_term() -> "LongTermMemory":
+    global _default
+    if _default is None:
+        _default = LongTermMemory()
+    return _default
+
+
+def set_default_long_term(mem: "LongTermMemory") -> None:
+    """测试 / 自定义 db_path 时显式注入。"""
+    global _default
+    _default = mem

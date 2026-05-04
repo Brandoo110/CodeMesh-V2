@@ -604,6 +604,96 @@ async def grep_text(
 
 
 @registry.register(
+    name="remember_fact",
+    description=(
+        "Save a fact to long-term memory (SQLite at ~/.codemesh/memory.db). "
+        "Use this when the user states a stable preference / project fact "
+        "that should persist across sessions, e.g. \"I prefer 4-space indent\", "
+        "\"the test command is uv run pytest\". The key should be short and "
+        "descriptive (e.g. 'indent_pref', 'test_cmd'). Existing keys are "
+        "overwritten."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "key": {
+                "type": "string",
+                "description": "Short snake_case key, e.g. 'indent_pref'",
+            },
+            "value": {
+                "type": "string",
+                "description": "Fact value (JSON-serialisable; usually a short string)",
+            },
+        },
+        "required": ["key", "value"],
+    },
+)
+async def remember_fact(key: str, value: str) -> str:
+    """工具：保存事实到长期记忆。"""
+    try:
+        from memory import get_default_long_term
+        lt = get_default_long_term()
+        await lt.init()
+        await lt.save(key, value)
+        return f"OK: remembered {key!r} = {value!r}"
+    except Exception as e:
+        return f"[ERROR] {type(e).__name__}: {e}"
+
+
+@registry.register(
+    name="recall_facts",
+    description=(
+        "Read all facts from long-term memory. Returns a newline-separated "
+        "'key: value' listing. Useful when the user asks 'what do you remember "
+        "about me'. Note: Harness already auto-injects facts into the system "
+        "prompt at the start of each run, so usually you don't need to call this."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {},
+    },
+)
+async def recall_facts() -> str:
+    """工具：列出所有保存的事实。"""
+    try:
+        from memory import get_default_long_term
+        lt = get_default_long_term()
+        await lt.init()
+        kv = await lt.list_all()
+        if not kv:
+            return "(no facts remembered yet)"
+        return "\n".join(f"{k}: {v}" for k, v in kv.items())
+    except Exception as e:
+        return f"[ERROR] {type(e).__name__}: {e}"
+
+
+@registry.register(
+    name="forget_fact",
+    description=(
+        "Remove a fact from long-term memory by key. Idempotent: forgetting "
+        "an unknown key is fine."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "key": {"type": "string"},
+        },
+        "required": ["key"],
+    },
+)
+async def forget_fact(key: str) -> str:
+    """工具：删除一个事实。"""
+    try:
+        from memory import get_default_long_term
+        lt = get_default_long_term()
+        await lt.init()
+        await lt.delete(key)
+        return f"OK: forgot {key!r}"
+    except Exception as e:
+        return f"[ERROR] {type(e).__name__}: {e}"
+
+
+@registry.register(
     name="lsp_code",
     description=(
         "Lightweight code intelligence for Python source. Five operations: "

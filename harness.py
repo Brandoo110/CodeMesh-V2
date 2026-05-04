@@ -38,7 +38,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from memory import ShortTermMemory, WorkingMemory, LongTermMemory
+from memory import (
+    ShortTermMemory,
+    WorkingMemory,
+    LongTermMemory,
+    get_default_long_term,
+    set_default_long_term,
+)
 from execution import run_agent_loop
 from orchestration import (
     route,
@@ -89,7 +95,10 @@ class Harness:
             self.short_term = ShortTermMemory(max_messages=20)
         self.short_term.set_system(SYSTEM_PROMPT)
         self.working = WorkingMemory()
-        self.long_term = LongTermMemory()
+        # 长期记忆走模块级单例：tools (remember_fact / recall_facts / forget_fact)
+        # 和 Harness 共用同一份 SQLite，避免双写不一致
+        self.long_term = get_default_long_term()
+        set_default_long_term(self.long_term)
 
         # 反馈层
         self.observer = Observer()
@@ -187,15 +196,43 @@ class Harness:
 
     # ─────────────── RAG 前置 ───────────────
 
+    async def _load_long_term_block(self) -> str:
+        """
+        把长期记忆的全部 KV 渲染成一段 system 内容。
+        没有任何事实时返回空串。
+
+        这样设计的好处：模型每次进 run() 自动看到"它过去记下来的事"，
+        不需要主动调 recall_facts。tools 仍然可用（remember_fact / forget_fact）
+        来动态写入。
+        """
+        try:
+            facts = await self.long_term.list_all()
+        except Exception:
+            return ""
+        if not facts:
+            return ""
+        lines = "\n".join(f"  - {k}: {v}" for k, v in facts.items())
+        return (
+            "\n\n<previously remembered facts>\n"
+            f"{lines}\n"
+            "</previously remembered facts>"
+        )
+
     async def _build_system_with_context(self, task: str) -> str:
-        """如果开了 RAG 且有索引，就把相关代码片段拼到 system prompt 里。"""
+        """
+        组装 system prompt：
+          基础 SYSTEM_PROMPT
+            + 长期记忆事实（如果有）
+            + RAG 检索片段（如果开了 --rag 且 query 命中）
+        """
+        system = SYSTEM_PROMPT + await self._load_long_term_block()
         if not self.use_rag:
-            return SYSTEM_PROMPT
+            return system
         hits = await retrieve(task, top_k=5)
         if not hits:
-            return SYSTEM_PROMPT
+            return system
         ctx = format_context(hits, max_chars=4000)
-        return SYSTEM_PROMPT + "\n\n以下是可能相关的代码片段，优先参考:\n" + ctx
+        return system + "\n\n以下是可能相关的代码片段，优先参考:\n" + ctx
 
     # ─────────────── 主入口：自动分流 ───────────────
 
