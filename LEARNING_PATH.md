@@ -343,6 +343,76 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 
 ---
 
+## v2 / v3 进阶（在 v1 全部读完之后）
+
+> v1 是骨架；v2 / v3 把它做成"真能用"的肌肉。这两段大约 60 - 90 分钟读完，
+> 之后你就能讲完整的"我做了三轮迭代"故事，比"我跑通了一个 Agent demo"有信息量得多。
+
+### 阶段 6（v2）—— 工程化补齐（30 分钟）
+
+**目标**：理解为什么"能跑通"和"工程化"之间还差很远。
+
+**读什么**：
+1. `memory/short_term.py` 末尾的 `maybe_compress` —— 滑动窗口之外加一层 LLM 摘要压缩
+2. `execution/tools.py` 的 `ToolRegistry` —— 怎么从 3 个硬编码工具升级到注册表模式
+3. `execution/tools.py` 的 `glob_files / grep_text / edit_file` —— Claude Code 标准三件套
+4. `execution/sandbox.py` 顶部的 rm 正则（commit `9f74e59`）—— 一个写测试时挖出的真 false-positive bug
+
+**面试故事**：
+> "v1 跑通整套四层后，对照评估反馈做 v2：补单测、加 Tool Registry、加 Glob/Grep/Edit。
+>  写测试时挖出一个生产代码里跑了几个月的 sandbox 误伤 bug —— 这就是写测试的价值。"
+
+### 阶段 7（v3）—— 对齐 OpenHarness / Claude Code（45 分钟）
+
+**目标**：理解 Coding Agent 的工业事实标准——**为什么不用向量 RAG**、AST-LSP 怎么做、Skill 是什么。
+
+**读什么**（按顺序）：
+
+1. **`execution/tools.py` 的 `_rg_grep` / `_rg_glob_files`**
+   流式读 stdout、超时控制、SIGTERM→2s→SIGKILL、退出码白名单 {0, 1, -15, -9}。
+   对照原型：`/tmp/openharness/src/openharness/tools/grep_tool.py`（363 行）。
+2. **`execution/lsp.py` 完整通读**
+   stdlib `ast` 替代 pyright daemon。理解为什么单次任务 1-2 次查询不值得起 daemon。
+3. **`memory/long_term.py` 末尾单例 + `execution/tools.py` 的 `remember_fact / recall_facts / forget_fact`**
+   dead code 怎么变成跨会话记忆能力。
+4. **`feedback/call_log.py` + `cli.py` 的 stats 命令**
+   本地 JSONL 替代外网 Langfuse 的兜底设计。
+5. **`orchestration/hooks.py` 的 `HookEvent` 枚举 + `HookResult.block`**
+   Claude Code 标准事件命名 + PreToolUse 短路拦截语义。
+6. **`feedback/token_budget.py`**
+   tiktoken + CJK 启发式 fallback。中英 4 倍 token 差的故事。
+7. **`rag/ast_chunker.py`**
+   为什么 stdlib `ast` 在 Python-only 场景下能替代 tree-sitter。
+8. **`orchestration/skills.py` + `.claude/skills/<name>/SKILL.md`**
+   Anthropic skill 格式怎么注入 Agent system prompt。
+9. **`orchestration/adapters/retry.py`**
+   20 行手写指数退避 + jitter；为什么不引 tenacity。
+
+**关键认知更新**（v3 的核心收获）：
+> "我**之前以为**做 RAG 就要 BM25 + 向量 + RRF（LangChain 那套）。读了 OpenHarness 源码才发现
+>  Coding Agent 业界事实标准不是这个——是 `grep + glob + AST-LSP + read` 的 agentic search，
+>  让模型自己决定查什么。原因：向量会陈旧、对函数名 / 错误码精确匹配差、要花钱建索引。
+>  我把 `rag/` 模块**保留作非代码场景**（文档、知识库），代码搜索完全走 agentic 路径。"
+
+**面试故事（v3 版）**：
+> "三轮迭代：v1 Initial commit；v2 补单测 + 工具集；v3 深挖 OpenHarness 源码做完整对齐：
+>  ripgrep + Python fallback、AST-based LSP、Claude Code 标准 hook 事件、Anthropic skill 格式、
+>  async 重试。结果是 11 个工具、200+ 单测、17 个有意义 commit、跟 OpenHarness 在 5 个核心子系统持平。
+>  保持 5k 行规模而不是去追他们的 11.7k，是因为我的差异化定位是国内多模型 + ¥ 成本追踪——
+>  那是港大那套学术开源不会做的事。"
+
+### 阶段 8 —— 怎么继续往下做
+
+读 `DEVLOG.md` 顶部的"还没做的事"清单，按性价比挑一个动手：
+- Permissions 多级（替换正则黑名单）
+- Plugins 机制
+- 流式 retry（buffer-prefix）
+- MCP client minimal
+
+每做一个，写一段 DEVLOG，commit + push。这个项目的**叙事骨干**是 DEVLOG，不是 README。
+
+---
+
 ## 附：遇到问题怎么办
 
 - 卡在某个文件 → 把这个文件的 docstring 粘给 Claude Code，让它再用另一个角度给你讲一遍
