@@ -31,6 +31,7 @@ from rich.table import Table
 
 from harness import Harness
 from rag import build_index
+from feedback import read_calls, aggregate, LOG_PATH
 
 
 app = typer.Typer(
@@ -238,20 +239,68 @@ async def _index(path: Path) -> None:
     console.print(f"使用方式: [cyan]codemesh run '任务' --rag[/cyan]")
 
 
-# ─────────────── stats（隐藏：尚未实现）───────────────
+# ─────────────── stats（本地 JSONL 聚合）───────────────
 
 
-@app.command(hidden=True)
-def stats():
-    """Langfuse 统计入口（未实现，请直接用 Langfuse 控制台）。"""
-    console.print(
-        Panel(
-            "[yellow]stats 子命令尚未实现（路线图项）。[/yellow]\n"
-            "实时统计请到 [link]https://cloud.langfuse.com[/link] 控制台查看。",
-            title="Stats",
-            border_style="magenta",
+@app.command()
+def stats(
+    days: float = typer.Option(7.0, "--days", "-d", help="窗口大小（天）。0 表示全部历史。"),
+):
+    """显示最近 N 天的本地调用统计：调用数 / token / 成本 / 平均延迟。
+
+    数据源是 ~/.codemesh/calls.jsonl（每次 run 自动追加）。
+    比 Langfuse 简单：不需要外网账号。
+    """
+    since = days if days > 0 else None
+    records = read_calls(since_days=since)
+    if not records:
+        msg = (
+            f"[yellow]最近 {days} 天没有调用记录。[/yellow]"
+            if since
+            else "[yellow]还没有调用记录。先跑几次 codemesh run 再来。[/yellow]"
         )
+        console.print(msg)
+        console.print(f"日志位置: [dim]{LOG_PATH}[/dim]")
+        return
+
+    by_model = aggregate(records)
+
+    table = Table(title=f"CodeMesh stats (last {days}d, {len(records)} calls)" if since else f"CodeMesh stats (all-time, {len(records)} calls)")
+    table.add_column("model", style="cyan")
+    table.add_column("calls", justify="right")
+    table.add_column("tokens_in", justify="right")
+    table.add_column("tokens_out", justify="right")
+    table.add_column("cost", justify="right")
+    table.add_column("avg_latency", justify="right")
+
+    total_calls = total_in = total_out = 0
+    total_cost = 0.0
+    for model in sorted(by_model.keys()):
+        agg = by_model[model]
+        total_calls += agg["calls"]
+        total_in += agg["tokens_in"]
+        total_out += agg["tokens_out"]
+        total_cost += agg["cost_rmb"]
+        lat = agg["avg_latency_ms"]
+        lat_text = f"{lat:.0f}ms" if lat is not None else "-"
+        table.add_row(
+            model,
+            f"{agg['calls']:,}",
+            f"{agg['tokens_in']:,}",
+            f"{agg['tokens_out']:,}",
+            f"¥{agg['cost_rmb']:.4f}",
+            lat_text,
+        )
+    table.add_row(
+        "[bold]— total —[/bold]",
+        f"[bold]{total_calls:,}[/bold]",
+        f"[bold]{total_in:,}[/bold]",
+        f"[bold]{total_out:,}[/bold]",
+        f"[bold]¥{total_cost:.4f}[/bold]",
+        "",
     )
+    console.print(table)
+    console.print(f"[dim]source: {LOG_PATH}[/dim]")
 
 
 if __name__ == "__main__":

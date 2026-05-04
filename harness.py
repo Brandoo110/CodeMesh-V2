@@ -60,7 +60,7 @@ from orchestration.adapters import (
     GeminiAdapter,
     ModelAdapter,
 )
-from feedback import Observer, compute_cost, CallCost
+from feedback import Observer, compute_cost, CallCost, log_call
 from rag import retrieve
 from rag.retriever import format_context
 
@@ -188,10 +188,18 @@ class Harness:
     # ─────────────── 成本记账 ───────────────
 
     def _record_cost(self, adapter: ModelAdapter) -> CallCost:
-        """从 adapter.last_usage 取 token，算成本，加到本轮 last_costs。"""
+        """从 adapter.last_usage 取 token，算成本，加到本轮 last_costs；同时落本地日志。"""
         u = adapter.last_usage
         cost = compute_cost(adapter.name, u.prompt_tokens, u.completion_tokens)
         self.last_costs.append(cost)
+        # 写本地 jsonl 日志，stats 子命令读这个文件聚合
+        log_call(
+            model=adapter.name,
+            tokens_in=cost.tokens_in,
+            tokens_out=cost.tokens_out,
+            cost_rmb=cost.cost_rmb,
+            task=getattr(self, "_current_task", None),
+        )
         return cost
 
     # ─────────────── RAG 前置 ───────────────
@@ -244,6 +252,7 @@ class Harness:
         """
         await self._ensure_long_term()
         self.last_costs = []
+        self._current_task = task   # 让 _record_cost 把它写进 jsonl 日志
         self.observer.start_trace(task)
 
         decision = await route(task)
@@ -342,6 +351,7 @@ class Harness:
         """
         await self._ensure_long_term()
         self.last_costs = []
+        self._current_task = task
         self.observer.start_trace(task)
 
         decision = await route(task)
