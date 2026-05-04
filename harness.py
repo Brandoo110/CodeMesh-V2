@@ -53,7 +53,10 @@ from orchestration import (
     HookRegistry,
     HookEvent,
     make_default_logging_hooks,
+    load_skill_registry,
+    SkillRegistry,
 )
+from execution import set_skill_registry
 from orchestration.adapters import (
     DeepSeekAdapter,
     DashScopeAdapter,
@@ -111,6 +114,11 @@ class Harness:
 
         # RAG 开关（需要先跑 `codemesh index` 建索引才有效）
         self.use_rag = use_rag
+
+        # Skills：扫 .claude/skills/ + ~/.codemesh/skills/，把名字+描述塞进 system prompt
+        # invoke_skill 工具使用同一个 registry 加载 SKILL.md 全文
+        self.skills: SkillRegistry = load_skill_registry(project_root=Path("."))
+        set_skill_registry(self.skills)
 
         # 每次 run 累计的成本
         self.last_costs: list[CallCost] = []
@@ -232,9 +240,13 @@ class Harness:
         组装 system prompt：
           基础 SYSTEM_PROMPT
             + 长期记忆事实（如果有）
+            + 可用 skills 索引（如果有，让模型知道有哪些 SKILL.md 可 invoke_skill）
             + RAG 检索片段（如果开了 --rag 且 query 命中）
         """
         system = SYSTEM_PROMPT + await self._load_long_term_block()
+        skill_index = self.skills.render_index()
+        if skill_index:
+            system += "\n\n" + skill_index
         if not self.use_rag:
             return system
         hits = await retrieve(task, top_k=5)

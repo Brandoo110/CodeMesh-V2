@@ -12,6 +12,8 @@ from .tools import (
     grep_text,
     edit_file,
     lsp_code,
+    invoke_skill,
+    set_skill_registry,
 )
 from .sandbox import check_command, SandboxViolation
 
@@ -28,6 +30,8 @@ __all__ = [
     "grep_text",
     "edit_file",
     "lsp_code",
+    "invoke_skill",
+    "set_skill_registry",
     "check_command",
     "SandboxViolation",
 ]

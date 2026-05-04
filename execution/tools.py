@@ -604,6 +604,53 @@ async def grep_text(
 
 
 @registry.register(
+    name="invoke_skill",
+    description=(
+        "Load the full text of a named skill (a SKILL.md file). The model can "
+        "see a directory of available skills in the system prompt; call this "
+        "tool to actually pull the full guidance text into context only when "
+        "the task matches. Returns '[ERROR] skill not found' if name unknown."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Skill name from the <available skills> index.",
+            },
+        },
+        "required": ["name"],
+    },
+)
+def invoke_skill(name: str) -> str:
+    """
+    工具：拿 skill 的全文内容。
+    通过模块级 _SKILL_REGISTRY 访问；Harness 启动时会调 set_skill_registry()
+    注入。如果没注入，重新扫一次。
+    """
+    try:
+        global _SKILL_REGISTRY
+        if _SKILL_REGISTRY is None:
+            from orchestration.skills import load_skill_registry
+            _SKILL_REGISTRY = load_skill_registry()
+        skill = _SKILL_REGISTRY.get(name)
+        if skill is None:
+            return f"[ERROR] skill not found: {name}"
+        return skill.content
+    except Exception as e:
+        return f"[ERROR] {type(e).__name__}: {e}"
+
+
+# ─── skill registry 注入接口（Harness 启动时调用，使工具能拿到当前的 registry）───
+_SKILL_REGISTRY = None  # type: ignore[var-annotated]
+
+
+def set_skill_registry(reg) -> None:
+    global _SKILL_REGISTRY
+    _SKILL_REGISTRY = reg
+
+
+@registry.register(
     name="remember_fact",
     description=(
         "Save a fact to long-term memory (SQLite at ~/.codemesh/memory.db). "
