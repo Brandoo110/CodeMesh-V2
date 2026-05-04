@@ -39,6 +39,10 @@ def _run(coro):
 def _make_workspace() -> Path:
     """生成一个含若干文件的临时目录，返回其 Path。"""
     base = Path(tempfile.mkdtemp(prefix="codemesh-test-"))
+    # rg 只在认出是 git 仓库时才应用 .gitignore；造一个空 .git 目录当 marker
+    # （Python fallback 自带硬编码 _IGNORED_DIRS，但 rg 路径必须靠 .gitignore）
+    (base / ".git").mkdir()
+    (base / ".gitignore").write_text("node_modules/\n")
     (base / "a.py").write_text("def hello():\n    return 'hi'\n")
     (base / "b.py").write_text("def world():\n    return 'world'\n")
     (base / "data.txt").write_text("apple\nbanana\ncherry\n")
@@ -184,29 +188,31 @@ def test_edit_file_does_not_create_new_file():
 
 def test_glob_finds_python_files():
     base = _make_workspace()
-    out = glob_files("**/*.py", root=str(base))
+    out = _run(glob_files("**/*.py", root=str(base)))
     lines = out.splitlines()
-    assert "a.py" in lines
-    assert "b.py" in lines
-    # sub/c.py 也应该在
-    assert any("c.py" in line for line in lines)
+    # rg / Python fallback 都用相对路径；可能含 ./ 前缀
+    assert any(l.endswith("a.py") for l in lines)
+    assert any(l.endswith("b.py") for l in lines)
+    assert any(l.endswith("c.py") for l in lines)
 
 
 def test_glob_skips_node_modules():
     base = _make_workspace()
-    out = glob_files("**/*.js", root=str(base))
-    # 整个 node_modules 应被跳过
-    assert "(no files matched" in out or "node_modules" not in out
+    out = _run(glob_files("**/*.js", root=str(base)))
+    # rg --files 不进 node_modules（默认 .gitignore 行为，但是临时目录不一定有 .git）
+    # python fallback 走 _IGNORED_DIRS 显式跳过
+    # 两条路径都应该不返回 noise 文件
+    assert "should_be_ignored.js" not in out
 
 
 def test_glob_no_matches():
     base = _make_workspace()
-    out = glob_files("**/*.rs", root=str(base))
+    out = _run(glob_files("**/*.rs", root=str(base)))
     assert "no files matched" in out
 
 
 def test_glob_bad_root():
-    out = glob_files("*.py", root="/nope/__codemesh_no_such_dir")
+    out = _run(glob_files("*.py", root="/nope/__codemesh_no_such_dir"))
     assert "[ERROR]" in out and "root not found" in out
 
 
@@ -215,37 +221,43 @@ def test_glob_bad_root():
 
 def test_grep_finds_function_def():
     base = _make_workspace()
-    out = grep_text(r"def hello", root=str(base))
+    out = _run(grep_text(r"def hello", root=str(base)))
     assert "a.py" in out and "def hello" in out
 
 
 def test_grep_with_file_pattern():
     base = _make_workspace()
     # data.txt 含 banana，但 file_pattern=*.py 应过滤掉
-    out = grep_text(r"banana", root=str(base), file_pattern="*.py")
+    out = _run(grep_text(r"banana", root=str(base), file_pattern="*.py"))
     assert "no matches" in out
 
 
 def test_grep_returns_path_line_format():
     base = _make_workspace()
-    out = grep_text(r"DROP TABLE", root=str(base))
-    # 期望格式：path:line:content
-    assert "sub/c.py:" in out
-    parts = out.split(":", 2)
+    out = _run(grep_text(r"DROP TABLE", root=str(base)))
+    # 期望格式：path:line:content。rg 路径下可能是 sub/c.py:3:DROP TABLE foo
+    # python 路径下也是 sub/c.py:3:DROP TABLE foo
+    assert "c.py" in out
+    parts = out.split(":")
     assert len(parts) >= 3
-    # 第二段应是数字行号
-    line_no = parts[1]
+    line_no = parts[1].strip()
     assert line_no.isdigit()
 
 
 def test_grep_bad_regex():
-    out = grep_text(r"(unbalanced", root=".")
+    """
+    在 Python fallback 路径下 bad regex 会被本地 re.compile 截获并返回 [ERROR]。
+    在 rg 路径下，rg 自己会拒绝并退出码 != 0/1/-15/-9 → 我们返回 None → 落到
+    Python fallback 再次报错。两种路径最终都得到 [ERROR] bad regex。
+    """
+    out = _run(grep_text(r"(unbalanced", root="."))
+    # rg 拒绝时它的退出码不是 0/1，所以会回退到 Python，由 Python re 报错
     assert "[ERROR]" in out and "bad regex" in out
 
 
 def test_grep_no_match():
     base = _make_workspace()
-    out = grep_text(r"this_string_does_not_appear_anywhere_xyz", root=str(base))
+    out = _run(grep_text(r"this_string_does_not_appear_anywhere_xyz", root=str(base)))
     assert "no matches" in out
 
 

@@ -40,6 +40,7 @@ v2 改成 Registry 模式：
 import asyncio
 import fnmatch
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional, Union
 
@@ -250,6 +251,7 @@ _IGNORED_DIRS = {
 def _iter_filtered_files(root: Path, name_filter: Optional[str] = None) -> Iterable[Path]:
     """
     遍历 root 下所有文件，跳过已知噪音目录。可选 fnmatch 名字过滤。
+    Python fallback 使用，rg 路径会自己尊重 .gitignore。
     """
     for p in root.rglob("*"):
         if any(part in _IGNORED_DIRS for part in p.parts):
@@ -261,13 +263,184 @@ def _iter_filtered_files(root: Path, name_filter: Optional[str] = None) -> Itera
         yield p
 
 
+def _looks_like_git_repo(path: Path, max_depth: int = 6) -> bool:
+    """
+    向上找最多 max_depth 层，看有没有 .git。
+    用于 glob：在 git 仓库里搜隐藏目录（.github 等）有意义；在用户家目录搜会爆。
+    """
+    cur = path
+    for _ in range(max_depth):
+        if (cur / ".git").exists():
+            return True
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return False
+
+
+# rg 退出码：0=有匹配，1=无匹配，-15=SIGTERM（我们超时杀的），-9=SIGKILL
+_RG_OK_RETURNCODES = {0, 1, -15, -9}
+# 单行最大缓冲：8MB，避免 minified js 触发 LimitOverrunError
+_RG_LINE_LIMIT = 8 * 1024 * 1024
+
+
+async def _terminate(process: asyncio.subprocess.Process) -> None:
+    """优雅终止子进程：SIGTERM → 等 2s → SIGKILL。"""
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+
+
+async def _rg_grep(
+    *,
+    root: Path,
+    pattern: str,
+    file_glob: Optional[str],
+    case_sensitive: bool,
+    limit: int,
+    timeout_seconds: int,
+) -> Optional[list[str]]:
+    """
+    用 ripgrep 搜内容。
+    返回 None 表示 rg 不可用 / 出错（让上层回退到 Python 实现）。
+    返回 list[str] 表示 rg 成功，每条形如 'path:line:content'。
+    """
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+
+    include_hidden = (root / ".git").exists() or (root / ".gitignore").exists()
+    cmd: list[str] = [rg, "--no-heading", "--line-number", "--color", "never"]
+    if include_hidden:
+        cmd.append("--hidden")
+    if not case_sensitive:
+        cmd.append("-i")
+    if file_glob:
+        cmd.extend(["--glob", file_glob])
+    # `--` 让 pattern 即使以 `-` 开头也不被当成 flag
+    cmd.extend(["--", pattern, "."])
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=_RG_LINE_LIMIT,
+        )
+    except (OSError, ValueError):
+        return None
+
+    matches: list[str] = []
+    timed_out = False
+    try:
+        async def _collect() -> None:
+            assert process.stdout is not None
+            while len(matches) < limit:
+                try:
+                    raw = await process.stdout.readline()
+                except ValueError:
+                    # 单行超过 buffer：跳过该行继续
+                    continue
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                if line:
+                    matches.append(line)
+
+        await asyncio.wait_for(_collect(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        timed_out = True
+    finally:
+        await _terminate(process)
+        if process.returncode is None:
+            await process.wait()
+
+    if not timed_out and process.returncode not in _RG_OK_RETURNCODES:
+        return None
+
+    if timed_out:
+        matches.append(f"[grep timed out after {timeout_seconds}s, partial results above]")
+    return matches
+
+
+async def _rg_glob_files(
+    *,
+    root: Path,
+    pattern: str,
+    limit: int,
+    timeout_seconds: int = 30,
+) -> Optional[list[str]]:
+    """
+    用 ripgrep 的 file walker 列文件（速度比 Path.rglob 快很多 + 自动尊重 .gitignore）。
+    返回 None 表示 rg 不可用 / 出错。
+    """
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+
+    cmd = [rg, "--files"]
+    if _looks_like_git_repo(root):
+        cmd.append("--hidden")
+    cmd.extend(["--glob", pattern, "."])
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=_RG_LINE_LIMIT,
+        )
+    except (OSError, ValueError):
+        return None
+
+    lines: list[str] = []
+    try:
+        async def _collect() -> None:
+            assert process.stdout is not None
+            while len(lines) < limit:
+                try:
+                    raw = await process.stdout.readline()
+                except ValueError:
+                    continue
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line:
+                    lines.append(line)
+
+        await asyncio.wait_for(_collect(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        await _terminate(process)
+        if process.returncode is None:
+            await process.wait()
+
+    if process.returncode not in _RG_OK_RETURNCODES:
+        return None
+    lines.sort()
+    return lines
+
+
 @registry.register(
     name="glob_files",
     description=(
         "List files matching a glob pattern (e.g. '**/*.py', 'src/*.ts'). "
-        "Searches under the given root (default '.'). "
-        "Skips node_modules / .git / venv / __pycache__ etc. "
-        "Returns at most 100 paths, newline-separated."
+        "Uses ripgrep when available (respects .gitignore, fast) with a "
+        "Python fallback. Returns at most 200 paths, newline-separated."
     ),
     parameters={
         "type": "object",
@@ -284,32 +457,42 @@ def _iter_filtered_files(root: Path, name_filter: Optional[str] = None) -> Itera
         "required": ["pattern"],
     },
 )
-def glob_files(pattern: str, root: str = _DEFAULT_ROOT) -> str:
+async def glob_files(pattern: str, root: str = _DEFAULT_ROOT) -> str:
     """
-    按 glob pattern 列文件。返回相对路径，每行一个。
+    列文件。优先 ripgrep（速度 + .gitignore 自动尊重），失败回 Path.rglob。
 
-    设计要点：
-      - 用 Path.rglob 而不是 glob.glob：原生支持 **/ 递归
-      - 命中数上限 100，避免一次性返回几千个把上下文塞爆
-      - 跳过 _IGNORED_DIRS，结果更干净
+    设计参考 HKUDS/OpenHarness glob_tool.py：
+      - rg 路径：`rg --files --glob <p> .`，比 Path.rglob 快几倍且不进入 .gitignore 目录
+      - rg 不可用 / 出错时回退到 Python，跳过 _IGNORED_DIRS
+      - 命中数上限 200（OpenHarness 默认 200，原 Codemesh 是 100，提到 200 一致）
     """
     try:
-        base = Path(root)
+        base = Path(root).resolve() if root else Path(".").resolve()
         if not base.exists():
             return f"[ERROR] root not found: {root}"
 
+        # 优先 ripgrep
+        rg_lines = await _rg_glob_files(root=base, pattern=pattern, limit=200)
+        if rg_lines is not None:
+            if not rg_lines:
+                return f"(no files matched {pattern!r} under {root!r})"
+            return "\n".join(rg_lines)
+
+        # Python fallback
         matches: list[Path] = []
         for p in base.rglob(pattern):
             if any(part in _IGNORED_DIRS for part in p.parts):
                 continue
             if p.is_file():
                 matches.append(p)
-            if len(matches) >= 100:
+            if len(matches) >= 200:
                 break
-
         if not matches:
             return f"(no files matched {pattern!r} under {root!r})"
-        rel = [str(p.relative_to(base)) if p.is_relative_to(base) else str(p) for p in matches]
+        rel = [
+            str(p.relative_to(base)) if p.is_relative_to(base) else str(p)
+            for p in matches
+        ]
         return "\n".join(sorted(rel))
     except Exception as e:
         return f"[ERROR] {type(e).__name__}: {e}"
@@ -319,16 +502,17 @@ def glob_files(pattern: str, root: str = _DEFAULT_ROOT) -> str:
     name="grep_text",
     description=(
         "Search files for a regex pattern. Returns matching lines as "
-        "'path:line:content'. Optional file_pattern filters by filename glob "
-        "(e.g. '*.py'). Skips noisy directories. "
-        "Returns at most 200 hits."
+        "'path:line:content'. Uses ripgrep when available (fast, "
+        "respects .gitignore, streamed) with a Python fallback. "
+        "Optional file_pattern filters by filename glob (e.g. '*.py'). "
+        "Returns at most 200 hits, with timeout."
     ),
     parameters={
         "type": "object",
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "Python regex pattern (use \\b for word boundaries)",
+                "description": "Regex pattern (rg syntax when available, Python re otherwise)",
             },
             "root": {
                 "type": "string",
@@ -336,43 +520,75 @@ def glob_files(pattern: str, root: str = _DEFAULT_ROOT) -> str:
             },
             "file_pattern": {
                 "type": "string",
-                "description": "fnmatch-style filename filter, e.g. '*.py'. Optional.",
+                "description": "Glob filename filter (passed to rg --glob), e.g. '*.py'. Optional.",
+            },
+            "case_sensitive": {
+                "type": "boolean",
+                "description": "Case sensitive. Default true.",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Timeout for ripgrep run. Default 20.",
             },
         },
         "required": ["pattern"],
     },
 )
-def grep_text(
+async def grep_text(
     pattern: str,
     root: str = _DEFAULT_ROOT,
     file_pattern: Optional[str] = None,
+    case_sensitive: bool = True,
+    timeout_seconds: int = 20,
 ) -> str:
     """
-    在文件内容里 grep。返回 path:line:content 行。
+    内容 grep。优先 ripgrep（流式 + 超时 + .gitignore + 二进制跳过），
+    否则回 Python re。
 
-    设计要点：
-      - 用 Python re 而不是调 ripgrep：少一个外部依赖
-      - 命中数上限 200，单行截断到 200 字符（防止一行 minified JS 把窗口塞爆）
-      - 编码问题用 errors='replace'，不让单个二进制混入文件让整次搜索崩
+    设计参考 HKUDS/OpenHarness grep_tool.py：
+      - rg 流式读 stdout，达到 limit 立刻杀进程（不会等全文搜完）
+      - 8MB 单行 buffer 限制，遇到超长 minified 行不崩溃
+      - 进程退出码 0 / 1 / -15 / -9 都视为成功（rg 无匹配返回 1）
+      - rg 不可用：回退到 Python re，自己跳过 binary（含 \\x00）和 >500KB 文件
     """
-    try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        return f"[ERROR] bad regex: {e}"
-
-    base = Path(root)
+    base = Path(root).resolve() if root else Path(".").resolve()
     if not base.exists():
         return f"[ERROR] root not found: {root}"
 
+    # 优先 ripgrep
+    rg_hits = await _rg_grep(
+        root=base,
+        pattern=pattern,
+        file_glob=file_pattern,
+        case_sensitive=case_sensitive,
+        limit=200,
+        timeout_seconds=timeout_seconds,
+    )
+    if rg_hits is not None:
+        if not rg_hits:
+            filt = f" with file_pattern={file_pattern!r}" if file_pattern else ""
+            return f"(no matches for {pattern!r}{filt})"
+        return "\n".join(rg_hits)
+
+    # Python fallback
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        rx = re.compile(pattern, flags)
+    except re.error as e:
+        return f"[ERROR] bad regex: {e}"
+
     hits: list[str] = []
     for f in _iter_filtered_files(base, name_filter=file_pattern):
-        # 跳过明显二进制（>500KB 或非 utf-8）
         try:
             if f.stat().st_size > 500_000:
                 continue
-            text = f.read_text(encoding="utf-8", errors="replace")
+            raw = f.read_bytes()
         except OSError:
             continue
+        if b"\x00" in raw:
+            # 二进制文件跳过
+            continue
+        text = raw.decode("utf-8", errors="replace")
         for i, line in enumerate(text.splitlines(), start=1):
             if rx.search(line):
                 rel = str(f.relative_to(base)) if f.is_relative_to(base) else str(f)
