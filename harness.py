@@ -71,9 +71,22 @@ SYSTEM_PROMPT = """你是 CodeMesh，一个面向中文开发者的代码助手�
 class Harness:
     """Harness 组装类：持有四层实例，暴露 run / compare / run_stream / run_plan 方法。"""
 
-    def __init__(self, enable_logging_hooks: bool = True, use_rag: bool = False):
-        # 记忆层
-        self.short_term = ShortTermMemory(max_messages=20)
+    def __init__(
+        self,
+        enable_logging_hooks: bool = True,
+        use_rag: bool = False,
+        enable_memory_compression: bool = True,
+    ):
+        # 记忆层（可选开启 LLM 摘要压缩，避免长对话直接丢历史）
+        self.enable_memory_compression = enable_memory_compression
+        if enable_memory_compression:
+            self.short_term = ShortTermMemory(
+                max_messages=20,
+                compress_threshold=15,
+                summarizer=self._summarize,
+            )
+        else:
+            self.short_term = ShortTermMemory(max_messages=20)
         self.short_term.set_system(SYSTEM_PROMPT)
         self.working = WorkingMemory()
         self.long_term = LongTermMemory()
@@ -132,6 +145,37 @@ class Harness:
         self._adapters[name] = adapter
         return adapter
 
+    # ─────────────── 记忆压缩 ───────────────
+
+    async def _summarize(self, messages: list[dict]) -> str:
+        """
+        把一批旧消息压缩成中文摘要。用 doubao（最便宜）做这件事。
+        失败时退回一个简陋的字符串摘要，保证记忆链不断。
+        """
+        adapter = self._get_adapter("doubao")
+        # 把消息线性化成可读文本喂给模型
+        joined = "\n".join(
+            f"{m.get('role', '?')}: {m.get('content', '')}" for m in messages
+        )
+        prompt = (
+            "请把下面这段多轮对话压缩成不超过 200 字的中文摘要，"
+            "保留任务关键信息、已确定的事实和未解决的问题。直接输出摘要正文，不要解释。\n\n"
+            f"{joined}"
+        )
+        try:
+            text = await adapter.complete(
+                messages=[{"role": "user", "content": prompt}],
+                system="你是一个对话摘要助手。",
+            )
+            self._record_cost(adapter)
+            return text.strip()
+        except Exception as e:
+            print(f"[memory] summarize failed ({type(e).__name__}); fallback to head/tail")
+            # 兜底：最早 1 句 + 最近 1 句拼起来，至少不丢锚点
+            head = (messages[0].get("content") or "")[:80] if messages else ""
+            tail = (messages[-1].get("content") or "")[:80] if messages else ""
+            return f"早期: {head} ... 近期: {tail}"
+
     # ─────────────── 成本记账 ───────────────
 
     def _record_cost(self, adapter: ModelAdapter) -> CallCost:
@@ -184,6 +228,11 @@ class Harness:
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
         self.short_term.add("assistant", answer)
+        # 长对话压缩：达到阈值时把最旧一半消息交给 doubao 总结成 summary
+        if self.enable_memory_compression:
+            compressed = await self.short_term.maybe_compress()
+            if compressed:
+                print("[memory] compressed older messages into summary")
         self.observer.log_llm_call(
             model=decision.model,
             tokens_in=sum(c.tokens_in for c in self.last_costs),
@@ -277,6 +326,10 @@ class Harness:
         cost = self._record_cost(adapter)
         full = "".join(full_buf)
         self.short_term.add("assistant", full)
+        if self.enable_memory_compression:
+            compressed = await self.short_term.maybe_compress()
+            if compressed:
+                print("[memory] compressed older messages into summary")
         self.observer.log_llm_call(
             model=adapter.name,
             tokens_in=cost.tokens_in,
