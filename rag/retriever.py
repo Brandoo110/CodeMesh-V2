@@ -92,23 +92,52 @@ async def retrieve(
     return hits
 
 
-def format_context(hits: list[Hit], max_chars: int = 4000) -> str:
+def format_context(
+    hits: list[Hit],
+    max_chars: int | None = None,
+    max_tokens: int | None = 2000,
+) -> str:
     """
     把检索结果拼成给模型看的字符串。
-    max_chars 防止 context 爆炸（一个中文字 = 1 char，~4000 char ≈ 2k token）。
+
+    预算控制（择一）：
+      max_tokens : 优先用 token 预算（更精准，cl100k_base via tiktoken；
+                   离线时退到 cjk*1 + other*0.25 启发式）。默认 2000 token。
+      max_chars  : 兼容旧调用方。给了就只用 char 预算。
+
+    截断策略：先按完整 chunk 拼，最后一块允许部分截。
     """
     if not hits:
         return ""
+
+    # 预算选择：max_chars 显式给值时走旧路径，否则走 token 预算
+    use_chars = max_chars is not None
+    if use_chars:
+        budget_remaining = max_chars
+    else:
+        # 延迟 import 避免循环依赖
+        from feedback.token_budget import count_tokens, truncate_to_budget
+        budget_remaining = max_tokens if max_tokens is not None else 2000
+
     buf: list[str] = ["<CODEBASE CONTEXT>"]
-    remaining = max_chars
     for h in hits:
         header = f"=== {h.path}:{h.start_line}-{h.end_line} ==="
         piece = f"{header}\n{h.text}\n"
-        if len(piece) > remaining:
+
+        if use_chars:
+            cost = len(piece)
+        else:
+            cost = count_tokens(piece)
+
+        if cost > budget_remaining:
             # 最后一条允许部分拼上，其余停止
-            buf.append(piece[:remaining])
+            if use_chars:
+                buf.append(piece[:budget_remaining])
+            else:
+                buf.append(truncate_to_budget(piece, budget_remaining))
             break
         buf.append(piece)
-        remaining -= len(piece)
+        budget_remaining -= cost
+
     buf.append("</CODEBASE CONTEXT>")
     return "\n".join(buf)

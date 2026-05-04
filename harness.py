@@ -240,7 +240,8 @@ class Harness:
         hits = await retrieve(task, top_k=5)
         if not hits:
             return system
-        ctx = format_context(hits, max_chars=4000)
+        # 用 token 预算而非字符数：中英混排时更精确，避免超 context 上限
+        ctx = format_context(hits, max_tokens=2000)
         return system + "\n\n以下是可能相关的代码片段，优先参考:\n" + ctx
 
     # ─────────────── 主入口：自动分流 ───────────────
