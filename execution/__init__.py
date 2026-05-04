@@ -11,6 +11,7 @@ from .tools import (
     glob_files,
     grep_text,
     edit_file,
+    lsp_code,
 )
 from .sandbox import check_command, SandboxViolation
 
@@ -26,6 +27,7 @@ __all__ = [
     "glob_files",
     "grep_text",
     "edit_file",
+    "lsp_code",
     "check_command",
     "SandboxViolation",
 ]

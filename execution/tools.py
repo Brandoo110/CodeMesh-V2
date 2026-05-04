@@ -604,6 +604,171 @@ async def grep_text(
 
 
 @registry.register(
+    name="lsp_code",
+    description=(
+        "Lightweight code intelligence for Python source. Five operations: "
+        "'document_symbol' (list defs in one file), "
+        "'workspace_symbol' (fuzzy search names across workspace), "
+        "'go_to_definition' (resolve a symbol name to its def), "
+        "'find_references' (line-grep all references with word boundaries), "
+        "'hover' (best-match def with signature + docstring). "
+        "Pure ast-based, no language server needed. Python files only."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "document_symbol",
+                    "workspace_symbol",
+                    "go_to_definition",
+                    "find_references",
+                    "hover",
+                ],
+            },
+            "file_path": {
+                "type": "string",
+                "description": "Path of the .py file (required for all ops except workspace_symbol).",
+            },
+            "symbol": {
+                "type": "string",
+                "description": "Symbol name to resolve (alt to line/character).",
+            },
+            "line": {
+                "type": "integer",
+                "description": "1-based line number for position-based lookup.",
+            },
+            "character": {
+                "type": "integer",
+                "description": "1-based column for position-based lookup.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Substring query for workspace_symbol.",
+            },
+            "root": {
+                "type": "string",
+                "description": "Workspace root, default '.'.",
+            },
+        },
+        "required": ["operation"],
+    },
+)
+def lsp_code(
+    operation: str,
+    file_path: Optional[str] = None,
+    symbol: Optional[str] = None,
+    line: Optional[int] = None,
+    character: Optional[int] = None,
+    query: Optional[str] = None,
+    root: str = _DEFAULT_ROOT,
+) -> str:
+    """
+    分发到 execution.lsp 模块的具体实现。
+    所有错误以字符串返回（不抛异常），保持模型可读。
+    """
+    from .lsp import (
+        list_document_symbols,
+        workspace_symbol_search,
+        go_to_definition,
+        find_references,
+        hover,
+        SymbolLocation,
+    )
+
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        return f"[ERROR] root not found: {root}"
+
+    def _fmt_loc(s: SymbolLocation) -> str:
+        rel = str(s.path.relative_to(root_path)) if s.path.is_relative_to(root_path) else str(s.path)
+        head = f"{s.kind} {s.name} - {rel}:{s.line}:{s.character}"
+        extras: list[str] = []
+        if s.signature:
+            extras.append(f"  signature: {s.signature}")
+        if s.docstring:
+            doc = s.docstring.strip().splitlines()[0]
+            extras.append(f"  docstring: {doc}")
+        return "\n".join([head, *extras])
+
+    def _need_file() -> Optional[str]:
+        if not file_path:
+            return f"[ERROR] {operation} requires file_path"
+        p = Path(file_path)
+        if not p.is_absolute():
+            p = root_path / p
+        if not p.exists():
+            return f"[ERROR] file not found: {p}"
+        if p.suffix != ".py":
+            return "[ERROR] lsp_code currently supports Python (.py) files only"
+        return None
+
+    if operation == "workspace_symbol":
+        if not query:
+            return "[ERROR] workspace_symbol requires query"
+        results = workspace_symbol_search(root_path, query)
+        if not results:
+            return f"(no symbols matching {query!r})"
+        return "\n".join(_fmt_loc(r) for r in results[:200])
+
+    err = _need_file()
+    if err:
+        return err
+    f = Path(file_path)  # type: ignore[arg-type]
+    if not f.is_absolute():
+        f = root_path / f
+
+    if operation == "document_symbol":
+        results = list_document_symbols(f)
+        if not results:
+            return f"(no symbols in {file_path})"
+        return "\n".join(_fmt_loc(r) for r in results)
+
+    if operation == "go_to_definition":
+        if not symbol and line is None:
+            return "[ERROR] go_to_definition requires symbol or line"
+        results = go_to_definition(
+            root=root_path, file_path=f,
+            symbol=symbol, line=line, character=character,
+        )
+        if not results:
+            target = symbol or f"line {line}"
+            return f"(no definition for {target})"
+        return "\n".join(_fmt_loc(r) for r in results)
+
+    if operation == "find_references":
+        if not symbol and line is None:
+            return "[ERROR] find_references requires symbol or line"
+        results = find_references(
+            root=root_path, file_path=f,
+            symbol=symbol, line=line, character=character,
+        )
+        if not results:
+            target = symbol or f"line {line}"
+            return f"(no references for {target})"
+        out_lines: list[str] = []
+        for path, ln, text in results:
+            rel = str(path.relative_to(root_path)) if path.is_relative_to(root_path) else str(path)
+            out_lines.append(f"{rel}:{ln}:{text}")
+        return "\n".join(out_lines)
+
+    if operation == "hover":
+        if not symbol and line is None:
+            return "[ERROR] hover requires symbol or line"
+        result = hover(
+            root=root_path, file_path=f,
+            symbol=symbol, line=line, character=character,
+        )
+        if result is None:
+            target = symbol or f"line {line}"
+            return f"(no hover info for {target})"
+        return _fmt_loc(result)
+
+    return f"[ERROR] unknown operation: {operation}"
+
+
+@registry.register(
     name="edit_file",
     description=(
         "Edit an existing file by replacing exactly one occurrence of "

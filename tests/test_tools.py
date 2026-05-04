@@ -59,11 +59,12 @@ def _make_workspace() -> Path:
 # ────────────────────────── registry 基础 ──────────────────────────
 
 
-def test_registry_has_six_tools():
-    assert len(registry.names) == 6
+def test_registry_has_seven_tools():
+    assert len(registry.names) == 7
     assert set(registry.names) == {
         "bash_exec", "read_file", "write_file",
         "glob_files", "grep_text", "edit_file",
+        "lsp_code",
     }
 
 
