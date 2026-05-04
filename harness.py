@@ -51,6 +51,7 @@ from orchestration import (
     plan,
     TaskPlan,
     HookRegistry,
+    HookEvent,
     make_default_logging_hooks,
 )
 from orchestration.adapters import (
@@ -254,6 +255,8 @@ class Harness:
         self.last_costs = []
         self._current_task = task   # 让 _record_cost 把它写进 jsonl 日志
         self.observer.start_trace(task)
+        self.hooks.trigger(HookEvent.SESSION_START, task=task)
+        self.hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt=task)
 
         decision = await route(task)
         print(
@@ -287,6 +290,8 @@ class Harness:
             route_reason=decision.reason,
         )
         self.observer.end_trace(success=True, output=answer)
+        self.hooks.trigger(HookEvent.STOP, task=task, output=answer)
+        self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
         return answer
 
     async def _run_single_turn(
@@ -353,6 +358,8 @@ class Harness:
         self.last_costs = []
         self._current_task = task
         self.observer.start_trace(task)
+        self.hooks.trigger(HookEvent.SESSION_START, task=task)
+        self.hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt=task)
 
         decision = await route(task)
         print(
@@ -385,6 +392,8 @@ class Harness:
             route_reason=decision.reason,
         )
         self.observer.end_trace(success=True, output=full)
+        self.hooks.trigger(HookEvent.STOP, task=task, output=full)
+        self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
 
     # ─────────────── 并发对比 ───────────────
 
