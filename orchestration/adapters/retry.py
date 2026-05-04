@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import Awaitable, Callable, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, TypeVar
 
 
 T = TypeVar("T")
@@ -129,8 +129,70 @@ async def async_retry(
     raise last_exc
 
 
+async def async_retry_stream(
+    factory: Callable[[], "AsyncIterator[str]"],
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_BASE_DELAY,
+    max_delay: float = DEFAULT_MAX_DELAY,
+    is_retryable: Callable[[BaseException], bool] = _is_retryable,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+):
+    """
+    流式 retry。难点：半流断了不能简单重新跑（会让用户看到重复内容）。
+    解决方案：**buffer-prefix replay**——
+      1. 失败时把已 yield 的所有 chunk 都记录在 buffer 里
+      2. 重新调 factory() 拿新流，**跳过新流前 buffer 长度的字符**再开始 yield
+      3. 这样下游消费者看到的输出是连续的：旧前缀 + 新尾部
+
+    缺点：模型每次重试会重新生成（消耗 token），但保证用户体验连续。
+    生产可加 partial=True 只发剩余部分给模型，但这要厂商 SDK 支持。
+
+    Args:
+        factory: 无参 async-gen 工厂；每次重试都重新调一次。
+                 调用 factory() 应该返回一个 AsyncIterator[str]。
+        其余参数同 async_retry。
+
+    Yields:
+        chunk 字符串。
+
+    Raises:
+        所有重试都失败时抛最后一个错。
+    """
+    buffer = ""
+    last_exc: BaseException | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            new_text = ""
+            async for chunk in factory():
+                new_text += chunk
+                # 跳过和 buffer 重叠的前缀
+                if len(new_text) <= len(buffer):
+                    continue
+                if attempt > 0 and len(new_text) - len(chunk) < len(buffer):
+                    # chunk 跨越了 buffer 边界：只 yield 越界部分
+                    skip = len(buffer) - (len(new_text) - len(chunk))
+                    yield chunk[skip:]
+                else:
+                    yield chunk
+            return
+        except BaseException as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                break
+            if not is_retryable(exc):
+                raise
+            # 把这次成功 yield 出去的内容全部记进 buffer
+            buffer = new_text   # type: ignore[possibly-undefined]
+            wait = _backoff_seconds(attempt, base_delay, max_delay)
+            await sleep(wait)
+    assert last_exc is not None
+    raise last_exc
+
+
 __all__ = [
     "async_retry",
+    "async_retry_stream",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_BASE_DELAY",
     "DEFAULT_MAX_DELAY",

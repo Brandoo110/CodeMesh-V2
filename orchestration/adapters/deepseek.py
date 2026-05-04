@@ -28,7 +28,7 @@ from typing import AsyncIterator
 from openai import AsyncOpenAI
 
 from .base import Message, Usage
-from .retry import async_retry
+from .retry import async_retry, async_retry_stream
 
 
 class DeepSeekAdapter:
@@ -81,23 +81,30 @@ class DeepSeekAdapter:
     async def complete_stream(
         self, messages: list[Message], system: str = ""
     ) -> AsyncIterator[str]:
+        """
+        流式调用。包了一层 async_retry_stream：半流断后重发，
+        旧前缀 buffer 起来跳过，对下游消费者保持连续体验。
+        """
         full = self._build_messages(messages, system)
-        # stream_options 让流结束时带 usage（否则流式返回里没有 token 统计）
-        stream = await self.client.chat.completions.create(
-            model=self.model,
-            messages=full,  # type: ignore[arg-type]
-            temperature=0.3,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-        async for chunk in stream:
-            # 注意：chunk.choices 可能为空（usage-only 的最后一帧）
-            if chunk.choices:
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    yield delta.content
-            if chunk.usage:
-                self.last_usage = Usage(
-                    prompt_tokens=chunk.usage.prompt_tokens,
-                    completion_tokens=chunk.usage.completion_tokens,
-                )
+
+        async def _factory() -> AsyncIterator[str]:
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=full,  # type: ignore[arg-type]
+                temperature=0.3,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            async for chunk in stream:
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        yield delta.content
+                if chunk.usage:
+                    self.last_usage = Usage(
+                        prompt_tokens=chunk.usage.prompt_tokens,
+                        completion_tokens=chunk.usage.completion_tokens,
+                    )
+
+        async for c in async_retry_stream(_factory):
+            yield c

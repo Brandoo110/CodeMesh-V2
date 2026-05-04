@@ -198,6 +198,112 @@ def test_factory_called_fresh_each_attempt():
     assert factory_calls["n"] == 2  # 真的被调了两次
 
 
+# ────────────────────────── async_retry_stream ──────────────────────────
+
+
+from orchestration.adapters.retry import async_retry_stream
+
+
+def _drain(agen):
+    """把 async generator 同步收完成 list[str]。"""
+    async def _go():
+        out = []
+        async for c in agen:
+            out.append(c)
+        return out
+    return _run(_go())
+
+
+def test_stream_first_attempt_succeeds_no_buffer_replay():
+    sleep = _SleepRecorder()
+
+    async def factory():
+        for c in ("hello ", "world"):
+            yield c
+
+    out = _drain(async_retry_stream(factory, sleep=sleep))
+    assert "".join(out) == "hello world"
+    assert sleep.delays == []
+
+
+def test_stream_recovers_after_mid_stream_error_no_dup():
+    """
+    第一次流 yield 'hello ' 后断了；第二次重新跑（生成 'hello world'）；
+    下游应只看到 'hello world'，不重复 'hello '。
+    """
+    sleep = _SleepRecorder()
+    state = {"attempt": 0}
+
+    async def factory():
+        state["attempt"] += 1
+        attempt = state["attempt"]
+        if attempt == 1:
+            yield "hello "
+            raise _retryable_error()
+        # 第二次：模型重新生成完整流
+        for c in ("hello ", "world"):
+            yield c
+
+    out = _drain(async_retry_stream(factory, max_retries=3, sleep=sleep))
+    # 关键断言：合并起来等于一次完整 'hello world'，不重复
+    assert "".join(out) == "hello world"
+    assert state["attempt"] == 2
+    assert len(sleep.delays) == 1
+
+
+def test_stream_two_failures_then_success():
+    sleep = _SleepRecorder()
+    state = {"attempt": 0}
+
+    async def factory():
+        state["attempt"] += 1
+        a = state["attempt"]
+        if a == 1:
+            yield "ab"
+            raise _retryable_error()
+        if a == 2:
+            yield "abcd"  # 一次性 yield 更多前缀
+            raise _retryable_error()
+        # 第三次：完整流
+        yield "abcdef"
+
+    out = _drain(async_retry_stream(factory, max_retries=3, sleep=sleep))
+    assert "".join(out) == "abcdef"
+    assert state["attempt"] == 3
+
+
+def test_stream_non_retryable_immediately_raises():
+    sleep = _SleepRecorder()
+
+    async def factory():
+        yield "hi"
+        raise ValueError("deterministic")
+
+    try:
+        _drain(async_retry_stream(factory, sleep=sleep))
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")
+
+
+def test_stream_exceeds_max_retries_raises():
+    sleep = _SleepRecorder()
+    state = {"attempt": 0}
+
+    async def factory():
+        state["attempt"] += 1
+        yield "x"
+        raise _retryable_error()
+
+    try:
+        _drain(async_retry_stream(factory, max_retries=2, sleep=sleep))
+    except asyncio.TimeoutError:
+        # 1 次首次 + 2 次重试 = 3 次
+        assert state["attempt"] == 3
+        return
+    raise AssertionError("expected TimeoutError")
+
+
 # ────────────────────────── runner ──────────────────────────
 
 
