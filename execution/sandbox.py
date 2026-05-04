@@ -31,7 +31,9 @@ import re
 # 危险命令模式列表。命中任何一条就认为危险。
 # 用 re.compile 预编译，匹配快。
 DANGEROUS_PATTERNS = [
-    re.compile(r"\brm\s+(-[rRfF]+\s+)*(/|~|\*)"),   # rm -rf /、rm -rf ~、rm -rf *
+    # rm 必须带 -r/-R 才能递归删目录，没有 r 的 rm 只能删单文件，风险低很多。
+    # 所以只在出现 r/R 标志且目标是 / / ~ / * 时才拦截。
+    re.compile(r"\brm\s+-[a-zA-Z]*[rR][a-zA-Z]*\s+(/|~|\*)"),
     re.compile(r"\bsudo\b"),                         # 提权
     re.compile(r"\bmkfs\b"),                         # 格式化磁盘
     re.compile(r"\bdd\s+if="),                        # dd 直接写块设备
