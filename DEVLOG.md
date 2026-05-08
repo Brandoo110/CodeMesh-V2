@@ -5,6 +5,84 @@ CodeMesh 开发日志。从 main 拉出来后所有的改动按时间顺序记�
 
 ---
 
+## 2026-05-08 — Dreaming：会话结束离线复盘 + 下次相似任务召回
+
+> 分支：`feature/dreaming`（基于 `main`）
+
+### 背景
+
+2026-05 初 Anthropic 给 Claude / Claude Code 上线了 **Dreaming**（research preview）：
+agent 每次会话结束后做一次离线"做梦"——回看刚才的工作，提炼可复用记忆写成
+markdown，下次相似任务直接召回。在用户本机 Claude Code 2.1.92 的 `cli.js` 里
+能直接 grep 到 `DreamTask` / `auto_dream` / `tengu_auto_dream_*` 等符号，
+配套 `--auto-dream` CLI flag 与 `autoDreamEnabled` settings 键。
+
+CodeMesh 现状缺的就是这一环：
+- 短期记忆压缩只在本会话有效，进程一关就没
+- 长期 KV 事实库靠模型主动调 `remember_fact`，模型不写就没记忆
+- Hook 体系里 `SessionEnd` 已定义但没人挂 dreamer
+
+本批做一个 **极简复刻**（80 行 dreamer + 集成 + 18 条单测）：
+单进程同步 await + 关键词 grep 检索，零新依赖。
+
+### 改动
+
+1. **新建 `feedback/dreamer.py`**（约 200 行含注释）：
+   - `Dreamer` 类：`dream(task, output)` 写盘，`recall(query, top_k)` 关键词召回，
+     `format_context(hits)` 拼成可塞 system prompt 的文本块
+   - 4 段式 markdown 模板（任务 / 关键决策 / 踩坑 / 可复用经验），强约束 ≤ 100 行
+   - 关键词打分：query 分词 → 每命中 +1，前 30 行命中再 +1（头部加权）
+   - `_slug` / `_extract_keywords` / `_truncate_lines` 等内部工具暴露给单测
+
+2. **`feedback/__init__.py`**：导出 `Dreamer / DreamHit / DEFAULT_DREAMS_DIR`
+
+3. **`harness.py`**：
+   - 新增构造参数 `enable_dreaming=True` + `self.dreamer`
+   - 新增方法 `_dream_summarize(prompt) -> str`（doubao 跑），`_maybe_dream(task, output)`
+   - `_build_system_with_context()` 在长期事实之后插一段 dream 召回
+   - `run()` / `run_stream()` 末尾 `await self._maybe_dream(task, output)`
+
+4. **`tests/test_dreamer.py`**：18 条单测，全用 fake summarizer + tempfile，零网络
+
+### Commit 范围
+
+待 commit。本批只在 `feature/dreaming` 分支，未 push。
+
+### 面试故事
+
+> "Anthropic 2026 年 5 月发了 Dreaming research preview，让 agent
+> 会话结束后离线复盘成 markdown 记忆库，下次相似任务自动召回。我对照
+> Claude Code 的 `cli.js` 反编译看了一眼实现思路（DreamTask / time-gate /
+> session diff），自己做了 80 行 Python 复刻。
+>
+> 实现选择：
+> - **同步 await 而不是后台 fork**：CLI 单进程，asyncio.run 退出会取消
+>   pending task；多花几秒同步等 dream 写完更可靠。Anthropic 的后台 fork
+>   是 daemon 才需要。
+> - **关键词 grep 而不是向量检索**：零依赖，量小够用。进阶版我已经留好
+>   接口，可以直接复用项目里已有的 ChromaDB pipeline。
+> - **结构化模板 + 100 行硬约束**：和 Anthropic 的 memory store 对齐——
+>   每条记忆 ≤ 100 行，4 段式（任务/决策/踩坑/可复用），强迫提炼而非堆历史。
+>
+> 教训：失败时静默 no-op、写盘异常打 warning 不向上抛——dreamer 不应该
+> 影响主任务返回。所有 18 条单测都用 fake summarizer，本地无网络也能跑。"
+
+### 还没做
+
+- **time-gate / 频控**：每次都写一条，dreams 多了会爆。下一步加 mtime
+  比较 + 距上次 < 1h 跳过
+- **去重**：相同任务重复调用会写多份。可以做内容 hash 比较 + 替换最旧
+- **语义检索**：纯关键词召回会漏（用户说"鉴权"但 dream 写"auth"）。
+  v2 可以接 `rag/embedder` 复用 ChromaDB
+- **后台 fork**：当前同步 await 会让用户等 1-3 秒。如果做成长跑 daemon
+  模式，参考 Anthropic 的 PID lock + time-gate
+- **CLI 暴露**：可以加 `codemesh dreams list / show / clear` 子命令
+- **pre-existing 测试问题**：`test_cli::test_preflight_rejects_placeholder_key`
+  在 test_cli.py 内顺序跑会失败（state 泄漏），单跑没问题——这是 v4 留下
+  的，与本次改动无关
+
+---
+
 ## 2026-05-04 (深夜) — v4 收尾批：文档对齐 + 三大遗漏功能
 
 > 分支：`claude/review-repo-history-0W2bx`
