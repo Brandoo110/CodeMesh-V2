@@ -1,52 +1,54 @@
 """
-Dreamer：会话结束后离线复盘（受 Anthropic Dreaming 启发）
-==============================================================
+SessionJournal：会话结束后写一条叙事复盘（CodeMesh 独有的 L5 叙事变体）
+==========================================================================
 
-【这是什么】
-2026-05 Anthropic 给 Claude / Claude Code 上线了 "Dreaming"（research preview）：
-agent 在每次会话结束后做一次"做梦"——回看刚才的工作过程，提炼出可复用的"记忆"
-写成 markdown 存起来，下次相似任务直接召回。
-源码侧能在 `cli.js` 里搜到 `DreamTask` / `auto_dream` / `tengu_auto_dream_*`。
+【为什么改名（2026-05-09 晚）】
+最初这文件叫 `dreamer.py`，受 Anthropic Dreaming research preview 启发。
+但读 troyhua 公众号 + grep cli.js 后发现一个**实现破绽**：
+  CC 的 Dreaming 干的是 **consolidation（回去整理已有记忆）**，不是
+  "per-session 写新复盘" —— 后者其实是 L5 (Auto Memory Extraction) 的活。
 
-CodeMesh 这里做一个**极简复刻**：
-  1. session 结束时调一次便宜的模型（doubao），把这次任务压缩成结构化 markdown
-  2. 写到 `~/.codemesh/dreams/<timestamp>-<slug>.md`，每条 ≤ 100 行
-  3. 下次 `Harness.run(task)` 启动时，关键词 grep 出最相关的 top-K 个 dream，
-     拼到 system prompt 里给模型当"过往经验"看
+所以改名 `session_journal.py`（叙事日志）。
+**真正的 L6 dreaming 在 `feedback/dreamer.py`**——做 4 阶段：
+orientation / gather / consolidate / prune。
 
-为什么这样做：
-  - 写文件而不是塞 SQLite：人能直接 cat 看到，调试 / 演示都直观
-  - 关键词 grep 而不是向量检索：零依赖，量小够用；进阶版可以走 rag/ ChromaDB
-  - 同步 await 而不是后台 task：CLI 单进程，asyncio.run 退出会取消 task；
-    多花几秒给 dream 写完更可靠（Anthropic 的后台 fork 是 daemon 才需要）
+【SessionJournal 干什么】
+  1. session 结束时调便宜模型（doubao），写一条 4 段式 markdown 复盘
+  2. 写到 `~/.codemesh/journal/<timestamp>-<slug>.md`，每条 ≤ 100 行
+  3. 下次 `Harness.run(task)` 启动时，关键词 grep 出最相关的 top-K 条，
+     拼到 system prompt 里当"过往经验"
+  4. **L5 的叙事变体** —— 与 `auto_extract.py`（L5 结构化）并存：
+     - auto_extract = "结构化事实"（4 类型 + Why/How）
+     - session_journal = "叙事复盘"（任务/决策/踩坑/可复用）
+     互补：结构化精确召回，叙事铺垫上下文。
 
-【面试故事】
-  Q: 你的 agent 怎么"越用越聪明"？
-  A: 我看完 Anthropic Dreaming research preview 的发布（2026-05）之后，对照
-     Claude Code 的 cli.js 反编译看了下 DreamTask 的实现思路（time-gate、
-     session diff、压缩成 memory），自己做了 80 行 Python 复刻。会话结束后
-     用 doubao（最便宜）压成 4 段式 markdown：任务 / 关键决策 / 踩坑 /
-     可复用经验。下次任务启动时 grep 出关键词重叠最高的 top-3 经验拼进 system。
-     比 Anthropic 简化的：单进程同步 await + 关键词 grep；保留的：结构化 schema、
-     ≤100 行硬约束、跨会话持久化。
+【为什么不合并到 auto_extract】
+两种召回需求不同：
+  - 模型问"用户偏好" → 看 4 类型 frontmatter 一眼就知
+  - 模型问"上次类似任务怎么做的" → 看叙事更直观
+合并的话 prompt 复杂，frontmatter 索引意义大减。分开更清晰。
 
-【2026-05-09 升级：5 门触发 + 文件锁（对照 troyhua 公众号 + cli.js 实证）】
-最初版每次 session 结束都触发，dream 多了会爆 + 重复浪费 token。
-按 CC 设计加了 5 道门控（按成本递增排序，99% 调用早退出）：
+【设计选择】
+  - 写文件而不是 SQLite：人能 cat 直观看
+  - 关键词 grep 不向量检索：零依赖，量小够用
+  - 同步 await：CLI 单进程，asyncio.run 退出取消 task
+  - 5 门门控避免每会话写一条爆炸（见下）
 
-  Gate 1: Enabled         —— GEMINI/CC settings 里关了就跳过       cost: 1 cache read
-  Gate 2: Time            —— 距上次 dream 不到 24h 不触发           cost: 1 stat() call
-  Gate 3: Scan throttle   —— 距上次 scan 不到 10min 不触发          cost: timestamp 比较
-  Gate 4: Session count   —— 累计 < 5 个 session 不触发             cost: dir listing
-  Gate 5: Lock            —— 已有 .consolidate-lock 不并发跑        cost: stat + read
+【5 门触发（与真 dreamer 共享同一套门控约定）】
+  Gate 1: Enabled         enabled=True 才放行
+  Gate 2: Time            距上次 ≥ min_hours
+  Gate 3: Scan throttle   距上次 scan ≥ min_scan_minutes
+  Gate 4: Session count   pending ≥ min_sessions
+  Gate 5: Lock            `.consolidate-lock` 不被持有
 
-锁文件 `.consolidate-lock` 含 PID + 时间戳，支持崩溃恢复（PID 死了锁可被强夺）。
-这套 5 门 + 锁是 OpenHarness v0.1.2 截至 4-9 还没做的——CodeMesh 这部分领先。
+注：Gate 5 锁文件名 `.consolidate-lock` 与真 dreamer 共享——同时跑只能一个进入
+临界区，避免抢着改 journal/ 和 auto_memory/ 的混乱。session_journal 默认门控
+比 dreamer 宽松（min_hours=0、min_sessions=1）让每会话都能写。
 
-【限制 / 还没做】
-  - 没做语义检索 —— 关键词不匹配就召不回（计划：复用 rag/ ChromaDB pipeline）
-  - 没做后台 daemon —— dreaming 仍同步 await，不像 CC 的 fork agent
-  - stale 检测：仅按 mtime；PID 死活只 best-effort（用 os.kill(pid, 0) 检查）
+【兼容性】
+为不破坏调用方，类名仍是 `Dreamer`、`DreamSummarizer`、`DreamHit`，
+但默认目录从 `~/.codemesh/dreams/` 改到 `~/.codemesh/journal/`。
+新代码请用 `from feedback.session_journal import SessionJournal`（alias 提供）。
 """
 
 from __future__ import annotations
@@ -63,8 +65,10 @@ from typing import Awaitable, Callable
 DreamSummarizer = Callable[[str], Awaitable[str]]
 
 
-# 默认存储位置：和 long_term memory 在同一个 ~/.codemesh/ 下。
-DEFAULT_DREAMS_DIR = Path.home() / ".codemesh" / "dreams"
+# 默认存储位置：~/.codemesh/journal/（原 dreams/，2026-05-09 改名）
+# 老代码用 DEFAULT_DREAMS_DIR 别名仍然指向新路径，兼容性。
+DEFAULT_JOURNAL_DIR = Path.home() / ".codemesh" / "journal"
+DEFAULT_DREAMS_DIR = DEFAULT_JOURNAL_DIR  # 旧名 alias，避免破坏导入
 
 # 单条 dream 最多多少行（超过截断）。对齐 Anthropic 的 100 行约束 —— 这是
 # memory store 里 "一条记忆 ≤ 100 行" 的设计语言。
@@ -452,3 +456,9 @@ def _extract_snippet(text: str, max_lines: int = 40) -> str:
         body = text
     lines = body.strip().splitlines()
     return "\n".join(lines[:max_lines])
+
+
+# ─── 兼容性别名 ───
+# 改名前类叫 Dreamer；为保持向后兼容（harness / tests 旧导入），加 SessionJournal 别名。
+# 新代码请用 SessionJournal；旧代码用 Dreamer 仍可工作。
+SessionJournal = Dreamer

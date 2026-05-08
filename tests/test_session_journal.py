@@ -1,14 +1,16 @@
 """
-Dreamer 单元测试
-====================
+SessionJournal 单元测试（原 test_dreamer.py，2026-05-09 改名）
+=================================================================
 
 跑法：
-    python -m tests.test_dreamer
+    python -m tests.test_session_journal
 或
-    pytest tests/test_dreamer.py
+    pytest tests/test_session_journal.py
 
 不调任何真实 API：summarizer 用注入的 fake async 函数。
-每个测试用 tempfile.TemporaryDirectory 隔离 dreams_dir，避免污染 ~/.codemesh/。
+每个测试用 tempfile.TemporaryDirectory 隔离 journal_dir，避免污染 ~/.codemesh/。
+
+【为什么改名】见 feedback/session_journal.py 顶部说明。
 """
 
 import asyncio
@@ -16,7 +18,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from feedback.dreamer import (
+from feedback.session_journal import (
     Dreamer,
     DreamHit,
     MAX_DREAM_LINES,
