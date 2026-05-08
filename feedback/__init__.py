@@ -4,6 +4,7 @@ from .validator import check_no_secrets, check_path_safe
 from .cost import compute_cost, CallCost, ModelPricing, PRICING
 from .call_log import log_call, read_calls, aggregate, LOG_PATH
 from .token_budget import count_tokens, truncate_to_budget, using_tiktoken
+from .dreamer import Dreamer, DreamHit, DEFAULT_DREAMS_DIR
 
 __all__ = [
     "Observer",
@@ -20,4 +21,7 @@ __all__ = [
     "count_tokens",
     "truncate_to_budget",
     "using_tiktoken",
+    "Dreamer",
+    "DreamHit",
+    "DEFAULT_DREAMS_DIR",
 ]

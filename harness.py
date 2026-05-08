@@ -68,7 +68,7 @@ from orchestration.adapters import (
     GeminiAdapter,
     ModelAdapter,
 )
-from feedback import Observer, compute_cost, CallCost, log_call
+from feedback import Observer, compute_cost, CallCost, log_call, Dreamer
 from rag import retrieve
 from rag.retriever import format_context
 
@@ -90,6 +90,7 @@ class Harness:
         enable_logging_hooks: bool = True,
         use_rag: bool = False,
         enable_memory_compression: bool = True,
+        enable_dreaming: bool = True,
     ):
         # 记忆层（可选开启 LLM 摘要压缩，避免长对话直接丢历史）
         # 触发条件双管齐下：
@@ -143,6 +144,14 @@ class Harness:
         self.last_costs: list[CallCost] = []
 
         self._adapters: dict[str, ModelAdapter] = {}
+
+        # Dreaming：会话结束后离线复盘成 markdown，下次相似任务自动召回。
+        # 灵感来自 Anthropic 2026-05 上线的 Dreaming research preview
+        # （Claude Code cli.js 里的 DreamTask / auto_dream / tengu_auto_dream_*）。
+        # 这里做了极简复刻：单进程同步 await + 关键词 grep 检索，不上后台 fork
+        # 也不上向量检索 —— 学习项目够用就行。
+        self.enable_dreaming = enable_dreaming
+        self.dreamer = Dreamer(summarizer=self._dream_summarize) if enable_dreaming else None
 
     async def _ensure_long_term(self) -> None:
         await self.long_term.init()
@@ -213,6 +222,37 @@ class Harness:
             tail = (messages[-1].get("content") or "")[:80] if messages else ""
             return f"早期: {head} ... 近期: {tail}"
 
+    # ─────────────── Dreaming：会话复盘 ───────────────
+
+    async def _dream_summarize(self, prompt: str) -> str:
+        """
+        Dreamer 用的 summarizer。和 _summarize 的差别：
+          - _summarize    吃 messages 列表（短期记忆压缩用）
+          - _dream_summarize 吃已经构造好的整段 prompt（dream 用，结构化提示）
+        共用 doubao adapter（最便宜，会话末尾这一刀不能贵）。
+        """
+        adapter = self._get_adapter("doubao")
+        text = await adapter.complete(
+            messages=[{"role": "user", "content": prompt}],
+            system="你是一个工程笔记助手。",
+        )
+        self._record_cost(adapter)
+        return text.strip()
+
+    async def _maybe_dream(self, task: str, output: str) -> None:
+        """
+        会话结束钩子：把这次任务复盘成一条 dream 写盘。
+        失败 / 关闭都静默 —— 不影响主回复。
+        """
+        if not self.enable_dreaming or self.dreamer is None:
+            return
+        try:
+            path = await self.dreamer.dream(task=task, output=output)
+            if path:
+                print(f"[dreamer] saved dream → {path.name}")
+        except Exception as e:
+            print(f"[dreamer] dream failed ({type(e).__name__}: {e}); skip")
+
     # ─────────────── 成本记账 ───────────────
 
     def _record_cost(self, adapter: ModelAdapter) -> CallCost:
@@ -259,10 +299,23 @@ class Harness:
         组装 system prompt：
           基础 SYSTEM_PROMPT
             + 长期记忆事实（如果有）
+            + Dream 召回（如果有，过往相似任务的复盘笔记）
             + 可用 skills 索引（如果有，让模型知道有哪些 SKILL.md 可 invoke_skill）
             + RAG 检索片段（如果开了 --rag 且 query 命中）
         """
         system = SYSTEM_PROMPT + await self._load_long_term_block()
+
+        # Dream 前置：从历史 dreams/ 里 grep 出最相关的 top-3，拼到 system。
+        # 这是"agent 越用越聪明"的关键：上次的踩坑、下次自动看到。
+        if self.dreamer is not None:
+            try:
+                hits = self.dreamer.recall(task, top_k=3)
+                ctx = self.dreamer.format_context(hits)
+                if ctx:
+                    system += "\n\n" + ctx
+            except Exception as e:
+                print(f"[dreamer] recall failed ({type(e).__name__}: {e}); skip")
+
         skill_index = self.skills.render_index()
         if skill_index:
             system += "\n\n" + skill_index
@@ -324,6 +377,8 @@ class Harness:
         self.observer.end_trace(success=True, output=answer)
         self.hooks.trigger(HookEvent.STOP, task=task, output=answer)
         self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
+        # 复盘：把刚结束的会话压成结构化 markdown，下次相似任务自动召回
+        await self._maybe_dream(task, answer)
         return answer
 
     async def _run_single_turn(
@@ -426,6 +481,7 @@ class Harness:
         self.observer.end_trace(success=True, output=full)
         self.hooks.trigger(HookEvent.STOP, task=task, output=full)
         self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
+        await self._maybe_dream(task, full)
 
     # ─────────────── 并发对比 ───────────────
 
