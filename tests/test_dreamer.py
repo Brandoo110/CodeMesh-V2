@@ -13,6 +13,7 @@ Dreamer 单元测试
 
 import asyncio
 import tempfile
+import time
 from pathlib import Path
 
 from feedback.dreamer import (
@@ -29,9 +30,9 @@ from feedback.dreamer import (
 # ────────────────────────── helpers ──────────────────────────
 
 
-def _make_dreamer(tmp: Path, summarizer=None) -> Dreamer:
-    """快速构造一个用临时目录的 Dreamer。"""
-    return Dreamer(dreams_dir=tmp / "dreams", summarizer=summarizer)
+def _make_dreamer(tmp: Path, summarizer=None, **kwargs) -> Dreamer:
+    """快速构造一个用临时目录的 Dreamer。kwargs 透传给 Dreamer 构造器。"""
+    return Dreamer(dreams_dir=tmp / "dreams", summarizer=summarizer, **kwargs)
 
 
 def _fake_summarizer(reply: str = "### 任务\nfoo\n### 关键决策\nbar\n### 踩坑 / 教训\n无\n### 可复用经验\nbaz"):
@@ -100,9 +101,8 @@ def test_dream_no_summarizer_returns_none():
     """没配 summarizer → dream 静默 no-op。"""
     with tempfile.TemporaryDirectory() as td:
         d = _make_dreamer(Path(td))
-        path = asyncio.run(d.dream(task="t", output="o"))
+        path = asyncio.run(d.dream(task="t", output="o", force=True))
         assert path is None
-        # 文件夹建了，但没文件
         assert d.dreams_dir.exists()
         assert list(d.dreams_dir.glob("*.md")) == []
     print("OK dream() no summarizer is no-op")
@@ -113,31 +113,29 @@ def test_dream_empty_task_or_output_returns_none():
     summarizer, _ = _fake_summarizer()
     with tempfile.TemporaryDirectory() as td:
         d = _make_dreamer(Path(td), summarizer=summarizer)
-        assert asyncio.run(d.dream(task="", output="x")) is None
-        assert asyncio.run(d.dream(task="x", output="")) is None
+        assert asyncio.run(d.dream(task="", output="x", force=True)) is None
+        assert asyncio.run(d.dream(task="x", output="", force=True)) is None
     print("OK dream() requires task and output")
 
 
 def test_dream_writes_file_with_frontmatter():
-    """正常路径：写一个 .md 文件，含 frontmatter + summarizer 返回的正文。"""
+    """正常路径：force=True 跳过门控，写一个 .md 文件含 frontmatter + 正文。"""
     summarizer, calls = _fake_summarizer()
     with tempfile.TemporaryDirectory() as td:
         d = _make_dreamer(Path(td), summarizer=summarizer)
         path = asyncio.run(d.dream(
             task="重构 auth 模块",
             output="完成，新增了 Token 类",
+            force=True,
         ))
         assert path is not None
         assert path.exists()
         text = path.read_text(encoding="utf-8")
-        # frontmatter
         assert text.startswith("---\n")
         assert "task: 重构 auth 模块" in text
         assert "created:" in text
-        # 4 段式正文
         assert "### 任务" in text
         assert "### 关键决策" in text
-        # summarizer 收到的 prompt 包含原 task 和 output
         assert len(calls) == 1
         assert "重构 auth 模块" in calls[0]
         assert "新增了 Token 类" in calls[0]
@@ -150,12 +148,11 @@ def test_dream_truncates_long_output():
     summarizer, _ = _fake_summarizer(reply=long_md)
     with tempfile.TemporaryDirectory() as td:
         d = _make_dreamer(Path(td), summarizer=summarizer)
-        path = asyncio.run(d.dream(task="t", output="o"))
+        path = asyncio.run(d.dream(task="t", output="o", force=True))
         text = path.read_text(encoding="utf-8")
         body = text.split("---", 2)[2] if text.startswith("---") else text
-        # 正文行数应在 100 左右（含 truncated 提示）
         assert "truncated" in body
-        assert MAX_DREAM_LINES <= 100  # 防止常量被误改
+        assert MAX_DREAM_LINES <= 100
     print("OK dream() truncates long output")
 
 
@@ -166,10 +163,157 @@ def test_dream_summarizer_failure_returns_none():
 
     with tempfile.TemporaryDirectory() as td:
         d = _make_dreamer(Path(td), summarizer=boom)
-        path = asyncio.run(d.dream(task="t", output="o"))
+        path = asyncio.run(d.dream(task="t", output="o", force=True))
         assert path is None
         assert list(d.dreams_dir.glob("*.md")) == []
     print("OK dream() swallows summarizer exception")
+
+
+# ────────────────────────── 5 门触发（v2，2026-05-09）──────────────────────────
+
+
+def test_should_dream_disabled_gate():
+    """Gate 1: enabled=False 应直接 false。"""
+    summarizer, _ = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d = _make_dreamer(Path(td), summarizer=summarizer)
+        d.enabled = False
+        ok, reason = d.should_dream()
+        assert ok is False
+        assert "disabled" in reason
+    print("OK Gate 1 (Enabled) blocks when disabled")
+
+
+def test_should_dream_session_count_gate():
+    """Gate 4: 累计 session 数 < min_sessions 时不触发。"""
+    summarizer, _ = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        # min_scan_minutes=0 关掉 Gate 3 的 rate-limit，否则连续测试会被它挡住
+        d = _make_dreamer(Path(td), summarizer=summarizer, min_scan_minutes=0)
+        d.min_sessions = 5
+        ok, reason = d.should_dream()
+        assert ok is False
+        assert "pending sessions" in reason
+        for _ in range(3):
+            d.should_dream()
+        # 第 5 次：pending=5, ≥ 5 → 通过 Gate 4，进 Gate 5（无锁）→ true
+        ok, _ = d.should_dream()
+        assert ok is True
+    print("OK Gate 4 (Session count) requires ≥ min_sessions")
+
+
+def test_should_dream_time_gate():
+    """Gate 2: 距上次 dream < min_hours 时不触发。"""
+    summarizer, _ = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d = _make_dreamer(Path(td), summarizer=summarizer, min_hours=24, min_sessions=1)
+        # 写入"上次 dream = 1 小时前"
+        (d.dreams_dir / ".last_dream").write_text(
+            str(time.time() - 3600), encoding="utf-8"
+        )
+        ok, reason = d.should_dream()
+        assert ok is False
+        assert "since last dream" in reason
+    print("OK Gate 2 (Time) blocks if too soon")
+
+
+def test_should_dream_scan_throttle_gate():
+    """Gate 3: 距上次 scan < min_scan_minutes 时不触发。"""
+    summarizer, _ = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d = _make_dreamer(Path(td), summarizer=summarizer, min_scan_minutes=10, min_sessions=1)
+        # 上次 scan = 5 分钟前
+        (d.dreams_dir / ".last_scan").write_text(
+            str(time.time() - 300), encoding="utf-8"
+        )
+        ok, reason = d.should_dream()
+        assert ok is False
+        assert "since last scan" in reason
+    print("OK Gate 3 (Scan throttle) blocks if scanned too recently")
+
+
+def test_should_dream_lock_gate():
+    """Gate 5: 锁被活进程持有时不触发。"""
+    summarizer, _ = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d = _make_dreamer(Path(td), summarizer=summarizer, min_sessions=1)
+        # 写自己的 PID 进锁文件 —— 自己活着，所以视为锁被占用
+        import os as _os
+        (d.dreams_dir / ".consolidate-lock").write_text(
+            f"{_os.getpid()}:{time.time()}", encoding="utf-8"
+        )
+        ok, reason = d.should_dream()
+        assert ok is False
+        assert "lock" in reason.lower()
+    print("OK Gate 5 (Lock) blocks when held by alive PID")
+
+
+def test_should_dream_lock_gate_stale_pid():
+    """Gate 5: 锁被死 PID 持有时应可强夺。"""
+    summarizer, _ = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d = _make_dreamer(Path(td), summarizer=summarizer, min_sessions=1)
+        # PID=1 通常在 macOS/Linux 是 launchd/init，但写一个明显不存在的 PID
+        # （非常大的数字）当作 stale
+        (d.dreams_dir / ".consolidate-lock").write_text(
+            f"99999999:{time.time()}", encoding="utf-8"
+        )
+        ok, reason = d.should_dream()
+        # PID 死了，前面 4 门都过 → 应该 true（如果 pending_sessions 也够）
+        # 第一次调 should_dream，pending=1 ≥ 1 → 过
+        assert ok is True
+    print("OK Gate 5 (Lock) allows steal from dead PID")
+
+
+def test_dream_skips_when_gates_block():
+    """无 force 时 dream() 应被 Gate 4（pending=1<5）挡住，不调 summarizer。"""
+    summarizer, calls = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d = _make_dreamer(Path(td), summarizer=summarizer)
+        # 默认 min_sessions=5，第一次调用 pending=1 应被挡
+        path = asyncio.run(d.dream(task="t", output="o"))
+        assert path is None
+        assert calls == []   # summarizer 没被调
+        assert list(d.dreams_dir.glob("*.md")) == []
+    print("OK dream() respects gates when force=False")
+
+
+def test_dream_force_overrides_throttle_and_count_gates():
+    """force=True 跳过 Gate 2-4（time / throttle / count），但仍走 Gate 1（enabled）和 Gate 5（锁）。
+
+    enabled=False 是用户显式关掉，force 不应跨越；锁是并发安全保障，force 也不能破。
+    """
+    summarizer, calls = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d = _make_dreamer(Path(td), summarizer=summarizer)
+        # Gate 4 默认会挡（pending=1<5），但 force 跳过
+        path = asyncio.run(d.dream(task="t", output="o", force=True))
+        assert path is not None
+        assert len(calls) == 1
+
+    # 验证 force 仍尊重 enabled=False
+    summarizer2, calls2 = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d2 = _make_dreamer(Path(td), summarizer=summarizer2)
+        d2.enabled = False
+        path = asyncio.run(d2.dream(task="t", output="o", force=True))
+        assert path is None  # enabled=False 即使 force 也挡
+        assert calls2 == []
+    print("OK force=True overrides Gates 2-4 but not Gate 1 (enabled)")
+
+
+def test_dream_resets_pending_count_on_success():
+    """成功 dream 后 .pending_sessions 应重置为 0。"""
+    summarizer, _ = _fake_summarizer()
+    with tempfile.TemporaryDirectory() as td:
+        d = _make_dreamer(Path(td), summarizer=summarizer)
+        asyncio.run(d.dream(task="t", output="o", force=True))
+        pending_path = d.dreams_dir / ".pending_sessions"
+        if pending_path.exists():
+            assert pending_path.read_text().strip() == "0"
+        # last_dream 也应被更新
+        assert (d.dreams_dir / ".last_dream").exists()
+    print("OK successful dream resets pending_sessions and updates last_dream")
 
 
 # ────────────────────────── recall() ──────────────────────────
@@ -303,5 +447,16 @@ if __name__ == "__main__":
     test_format_context_empty()
     test_format_context_renders_block()
     test_format_context_respects_max_chars()
+
+    # 5 门触发（v2 升级）
+    test_should_dream_disabled_gate()
+    test_should_dream_session_count_gate()
+    test_should_dream_time_gate()
+    test_should_dream_scan_throttle_gate()
+    test_should_dream_lock_gate()
+    test_should_dream_lock_gate_stale_pid()
+    test_dream_skips_when_gates_block()
+    test_dream_force_overrides_throttle_and_count_gates()
+    test_dream_resets_pending_count_on_success()
 
     print("\nAll dreamer tests passed.")
