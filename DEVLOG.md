@@ -5,6 +5,80 @@ CodeMesh 开发日志。从 main 拉出来后所有的改动按时间顺序记�
 
 ---
 
+## 2026-05-09 (晚) — 修正命名：原 dreamer 其实是 session_journal，写真 dreamer 做 4 阶段巩固
+
+> 分支：`feature/dreaming`（继续）
+
+### 一、问题发现
+
+用户问："dreaming 是不是只是回看刚才的工作？CC 是不是有 MEMORY.md 那一套？"
+
+这个问题戳到了一个**实现破绽**：CC 的 dreaming **不是**"per-session 写新记录"——
+那是 L5（Auto Memory Extraction）的活。**dreaming 的真正工作是回去整理已写的记忆**：
+
+- Phase 1 Orientation：扫 memory 目录 + 读 MEMORY.md
+- Phase 2 Gather：grep 历史 session 找信号
+- Phase 3 Consolidate：合并新信号 + 删矛盾 + 相对日期→绝对日期
+- Phase 4 Prune & Index：更新 MEMORY.md + 删过时
+
+而我**今天早些时候**做的 `feedback/dreamer.py` 实际是 per-session 叙事捕捉
+（每个 session 结束写一条 4 段式 markdown 到 `~/.codemesh/dreams/`）——
+这本质是 L5 的"叙事变体"，**不是 CC 意义的 dreaming**。
+
+### 二、修正方向
+
+```
+原:                              修正后:
+feedback/dreamer.py              feedback/session_journal.py     （叙事 L5）
+   写每次 session 的复盘          + 改名 + 改注释定位
+                                 feedback/dreamer.py             （真 L6）
+                                  + 4 阶段巩固
+                                  + 操作 auto_memory/ 已有记忆
+                                  + 5 门门控保留
+```
+
+### 三、为什么改名而不是新加一个
+
+如果我新加一个 `consolidator.py`，会有两个误导：
+1. `dreamer.py` 名字保留 → 面试时讲"我做了 dreaming"，但实际是 per-session 写
+2. CC 源码里 `DreamTask` 类干的就是 consolidation —— 跟着 CC 命名才正确
+
+改名虽然 git history 短期看着乱（两个 commit 拆开看），但**长期对项目 honest**。
+
+### 四、改完后的记忆层文件分布
+
+| 文件 | 干什么 | 写到哪 | CC 7 层 |
+|---|---|---|---|
+| `memory/long_term.py` + 3 个工具 | 用户主动 remember_fact | `~/.codemesh/memory.db` | L5 子集 |
+| `memory/auto_extract.py` | 任务结束自动抽 4 类型结构化事实 | `~/.codemesh/auto_memory/*.md` + MEMORY.md 索引 | L5 主体 |
+| **`feedback/session_journal.py`** ← 改名 | 任务结束写叙事复盘 | `~/.codemesh/journal/*.md` （重命名了目录） | L5 叙事变体（CodeMesh 独有） |
+| **`feedback/dreamer.py`** ← 全新 | 5 门门控 + 4 阶段巩固 | 操作 `auto_memory/` 和 `journal/` | **L6 真 dreaming** |
+
+session_journal 和 dreamer 用同一套 5 门门控（共享 `.consolidate-lock`），
+但门控阈值可能不同——session_journal 每会话末都触发（频繁），
+dreamer 24h 一次（稀疏）。
+
+### 五、面试故事的修正
+
+> "我做了两阶段对齐 OpenHarness 的记忆层。但**晚些时候发现自己的 dreamer.py
+> 其实是叙事 L5 不是真 L6**——CC 的 dreaming 干的是回去整理已有记忆（4 阶段：
+> orientation / gather / consolidate / prune），不是写新条目。所以我把原来的
+> dreamer.py 改名 session_journal.py（叙事日志），新写了个 dreamer.py 做真的
+> consolidation。
+>
+> 这种'实现完了发现命名错了 → 主动改名 + 重新做'的迭代是常态——比假装一开始
+> 就对要诚实。"
+
+### 六、Commits
+
+按顺序：
+1. `docs(devlog): note misnaming of dreamer.py and plan to rename`（本段）
+2. `refactor(feedback): rename dreamer.py → session_journal.py`
+3. `feat(feedback): real dreamer (4-phase consolidation)`
+4. `feat(harness): wire new dreamer alongside session_journal`
+
+---
+
 ## 2026-05-09 — 第二阶段对齐：记忆层 7 层架构（compactor + auto_extract + dreamer 5 门）
 
 > 分支：`feature/dreaming`（基于 `main`）
