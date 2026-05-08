@@ -73,7 +73,8 @@ from feedback import (
     compute_cost,
     CallCost,
     log_call,
-    Dreamer,
+    Dreamer,           # = SessionJournal alias（per-session 叙事 L5 变体）
+    RealDreamer,       # 真 L6 dreaming（4 阶段巩固）
     AutoCompactState,
     auto_compact_if_needed,
 )
@@ -154,12 +155,28 @@ class Harness:
 
         self._adapters: dict[str, ModelAdapter] = {}
 
-        # Dreaming：会话结束后离线复盘成 markdown，下次相似任务自动召回。
-        # 灵感来自 Anthropic 2026-05 上线的 Dreaming research preview。
-        # v2 升级（2026-05-09）：5 道门控（Enabled/Time/Scan throttle/Session count/Lock）
-        # + .consolidate-lock 文件锁。99% 调用在前几门就便宜地早退出，参考 cli.js 设计。
+        # 记忆层第二阶段对齐 OpenHarness（2026-05-09）：分两个互补层
+        #
+        # 1) SessionJournal（旧名 Dreamer）——L5 叙事变体
+        #    每会话末写一条 4 段式 markdown，下次召回拼 system prompt
+        #    默认 min_hours=0、min_sessions=1（让每会话都能写）
+        #
+        # 2) RealDreamer ——真 L6 dreaming（CC 同款 4 阶段 consolidation）
+        #    扫 auto_memory/ → grep 信号 → LLM 给 plan → 机械执行 + 重建索引
+        #    默认 24h / 5 sessions（稀疏触发，避免反复调贵的整理 LLM）
+        #
+        # 两者共享 .consolidate-lock 文件锁，避免同时改记忆库
         self.enable_dreaming = enable_dreaming
-        self.dreamer = Dreamer(summarizer=self._dream_summarize) if enable_dreaming else None
+        self.session_journal = (
+            Dreamer(summarizer=self._dream_summarize, min_hours=0, min_sessions=1)
+            if enable_dreaming else None
+        )
+        self.real_dreamer = (
+            RealDreamer(summarizer=self._dream_summarize)
+            if enable_dreaming else None
+        )
+        # 老代码兼容：harness.dreamer 仍可用，指向 session_journal
+        self.dreamer = self.session_journal
 
         # Auto memory extraction（2026-05-09 新增）：会话结束后 LLM 抽取跨会话事实。
         # 4 类型 user/feedback/project/reference + Why/How 双段模板，对齐 CC source map。
@@ -256,19 +273,35 @@ class Harness:
         self._record_cost(adapter)
         return text.strip()
 
-    async def _maybe_dream(self, task: str, output: str) -> None:
+    async def _maybe_journal(self, task: str, output: str) -> None:
         """
-        会话结束钩子：把这次任务复盘成一条 dream 写盘。
+        会话结束钩子：写一条叙事日志（SessionJournal）。
         失败 / 5 门未通过 / 关闭都静默 —— 不影响主回复。
         """
-        if not self.enable_dreaming or self.dreamer is None:
+        if not self.enable_dreaming or self.session_journal is None:
             return
         try:
-            path = await self.dreamer.dream(task=task, output=output)
+            path = await self.session_journal.dream(task=task, output=output)
             if path:
-                print(f"[dreamer] saved dream → {path.name}")
+                print(f"[journal] saved → {path.name}")
         except Exception as e:
-            print(f"[dreamer] dream failed ({type(e).__name__}: {e}); skip")
+            print(f"[journal] failed ({type(e).__name__}: {e}); skip")
+
+    async def _maybe_real_dream(self) -> None:
+        """
+        真 L6 dreaming：跑 4 阶段 consolidation 整理 auto_memory/。
+        默认 24h / 5 sessions 才触发，所以大部分会话不会动 LLM 成本。
+        """
+        if not self.enable_dreaming or self.real_dreamer is None:
+            return
+        try:
+            await self.real_dreamer.dream()
+        except Exception as e:
+            print(f"[real-dreamer] failed ({type(e).__name__}: {e}); skip")
+
+    # 旧名兼容：harness._maybe_dream 仍然只跑 journal（不破坏外部调用）
+    async def _maybe_dream(self, task: str, output: str) -> None:
+        await self._maybe_journal(task, output)
 
     async def _maybe_extract_memories(self, task: str, output: str) -> None:
         """
@@ -441,10 +474,13 @@ class Harness:
         self.observer.end_trace(success=True, output=answer)
         self.hooks.trigger(HookEvent.STOP, task=task, output=answer)
         self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
-        # 复盘：dream 写经验性 markdown + auto_extract 抽 4 类结构化事实
-        # 两个并存：dream 是叙事版（"上次怎么做的"），auto_extract 是 fact 版（"用户偏好/纠正"）
-        await self._maybe_dream(task, answer)
+        # 三个会话结束钩子：
+        #   1. journal: 写叙事 markdown（高频，每会话）
+        #   2. extract_memories: 抽 4 类结构化事实（高频，每会话）
+        #   3. real_dream: 整理 auto_memory/ 4 阶段巩固（稀疏，~24h 一次）
+        await self._maybe_journal(task, answer)
         await self._maybe_extract_memories(task, answer)
+        await self._maybe_real_dream()
         return answer
 
     async def _run_single_turn(
@@ -549,8 +585,9 @@ class Harness:
         self.observer.end_trace(success=True, output=full)
         self.hooks.trigger(HookEvent.STOP, task=task, output=full)
         self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
-        await self._maybe_dream(task, full)
+        await self._maybe_journal(task, full)
         await self._maybe_extract_memories(task, full)
+        await self._maybe_real_dream()
 
     # ─────────────── 并发对比 ───────────────
 
