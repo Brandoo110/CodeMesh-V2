@@ -42,6 +42,7 @@ from .render_html import (
     rotate_dir,
     model_color,
 )
+from .stats_report import render_stats_dashboard
 
 __all__ = [
     "Observer",
@@ -83,4 +84,5 @@ __all__ = [
     "write_artifact",
     "rotate_dir",
     "model_color",
+    "render_stats_dashboard",
 ]

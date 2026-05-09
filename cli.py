@@ -31,7 +31,7 @@ from rich.table import Table
 
 from harness import Harness
 from rag import build_index
-from feedback import read_calls, aggregate, LOG_PATH
+from feedback import read_calls, aggregate, LOG_PATH, render_stats_dashboard, write_artifact
 
 
 app = typer.Typer(
@@ -245,14 +245,24 @@ async def _index(path: Path) -> None:
 @app.command()
 def stats(
     days: float = typer.Option(7.0, "--days", "-d", help="窗口大小（天）。0 表示全部历史。"),
+    html: bool = typer.Option(False, "--html", help="渲染交互式 dashboard 到 .codemesh/reports/"),
+    output: Path = typer.Option(None, "--output", "-o", help="自定义 HTML 输出路径（仅 --html 时生效）"),
 ):
     """显示最近 N 天的本地调用统计：调用数 / token / 成本 / 平均延迟。
 
     数据源是 ~/.codemesh/calls.jsonl（每次 run 自动追加）。
     比 Langfuse 简单：不需要外网账号。
+
+    `--html` 把同样数据渲染成单文件 dashboard（KPI / bar / pie / sparkline / 表）。
+    数据源、聚合逻辑都是同一套，HTML 只是换个给人看的形态。
     """
     since = days if days > 0 else None
     records = read_calls(since_days=since)
+
+    if html:
+        _stats_html(records, since, output)
+        return
+
     if not records:
         msg = (
             f"[yellow]最近 {days} 天没有调用记录。[/yellow]"
@@ -301,6 +311,35 @@ def stats(
     )
     console.print(table)
     console.print(f"[dim]source: {LOG_PATH}[/dim]")
+
+
+def _stats_html(records, since, output: Path | None) -> None:
+    """渲染 stats dashboard 到 HTML 文件。空数据也写一份"暂无记录"的页面。"""
+    import time
+
+    by_model = aggregate(records) if records else {}
+    html_text = render_stats_dashboard(
+        records=records,
+        by_model=by_model,
+        days_window=since,
+        log_path=str(LOG_PATH),
+    )
+
+    if output is not None:
+        target = Path(output).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(html_text, encoding="utf-8")
+        path = target
+    else:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        path = write_artifact(
+            target_dir=Path.cwd() / ".codemesh" / "reports",
+            filename=f"stats-{ts}.html",
+            html_text=html_text,
+            keep=20,
+        )
+    console.print(f"[green]✓[/green] HTML dashboard 已写入 [cyan]{path}[/cyan]")
+    console.print(f"[dim]浏览器打开：[/dim] file://{path}")
 
 
 if __name__ == "__main__":
