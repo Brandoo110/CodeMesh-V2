@@ -68,7 +68,17 @@ from orchestration.adapters import (
     GeminiAdapter,
     ModelAdapter,
 )
-from feedback import Observer, compute_cost, CallCost, log_call
+from feedback import (
+    Observer,
+    compute_cost,
+    CallCost,
+    log_call,
+    Dreamer,           # = SessionJournal alias（per-session 叙事 L5 变体）
+    RealDreamer,       # 真 L6 dreaming（4 阶段巩固）
+    AutoCompactState,
+    auto_compact_if_needed,
+)
+from memory import extract_and_save, DEFAULT_AUTO_MEMORY_DIR
 from rag import retrieve
 from rag.retriever import format_context
 
@@ -90,6 +100,7 @@ class Harness:
         enable_logging_hooks: bool = True,
         use_rag: bool = False,
         enable_memory_compression: bool = True,
+        enable_dreaming: bool = True,
     ):
         # 记忆层（可选开启 LLM 摘要压缩，避免长对话直接丢历史）
         # 触发条件双管齐下：
@@ -143,6 +154,38 @@ class Harness:
         self.last_costs: list[CallCost] = []
 
         self._adapters: dict[str, ModelAdapter] = {}
+
+        # 记忆层第二阶段对齐 OpenHarness（2026-05-09）：分两个互补层
+        #
+        # 1) SessionJournal（旧名 Dreamer）——L5 叙事变体
+        #    每会话末写一条 4 段式 markdown，下次召回拼 system prompt
+        #    默认 min_hours=0、min_sessions=1（让每会话都能写）
+        #
+        # 2) RealDreamer ——真 L6 dreaming（CC 同款 4 阶段 consolidation）
+        #    扫 auto_memory/ → grep 信号 → LLM 给 plan → 机械执行 + 重建索引
+        #    默认 24h / 5 sessions（稀疏触发，避免反复调贵的整理 LLM）
+        #
+        # 两者共享 .consolidate-lock 文件锁，避免同时改记忆库
+        self.enable_dreaming = enable_dreaming
+        self.session_journal = (
+            Dreamer(summarizer=self._dream_summarize, min_hours=0, min_sessions=1)
+            if enable_dreaming else None
+        )
+        self.real_dreamer = (
+            RealDreamer(summarizer=self._dream_summarize)
+            if enable_dreaming else None
+        )
+        # 老代码兼容：harness.dreamer 仍可用，指向 session_journal
+        self.dreamer = self.session_journal
+
+        # Auto memory extraction（2026-05-09 新增）：会话结束后 LLM 抽取跨会话事实。
+        # 4 类型 user/feedback/project/reference + Why/How 双段模板，对齐 CC source map。
+        self.enable_auto_extract = enable_dreaming  # 复用同一开关
+        self.auto_memory_dir = DEFAULT_AUTO_MEMORY_DIR
+
+        # AutoCompactState：跨 query loop 的压缩状态机（2026-05-09 新增）。
+        # 跟踪 consecutive_failures，连续 3 次失败后停止自动压缩防止坏 LLM 反复浪费钱。
+        self.auto_compact_state = AutoCompactState()
 
     async def _ensure_long_term(self) -> None:
         await self.long_term.init()
@@ -213,6 +256,98 @@ class Harness:
             tail = (messages[-1].get("content") or "")[:80] if messages else ""
             return f"早期: {head} ... 近期: {tail}"
 
+    # ─────────────── Dreaming：会话复盘 ───────────────
+
+    async def _dream_summarize(self, prompt: str) -> str:
+        """
+        Dreamer 用的 summarizer。和 _summarize 的差别：
+          - _summarize    吃 messages 列表（短期记忆压缩用）
+          - _dream_summarize 吃已经构造好的整段 prompt（dream 用，结构化提示）
+        共用 doubao adapter（最便宜，会话末尾这一刀不能贵）。
+        """
+        adapter = self._get_adapter("doubao")
+        text = await adapter.complete(
+            messages=[{"role": "user", "content": prompt}],
+            system="你是一个工程笔记助手。",
+        )
+        self._record_cost(adapter)
+        return text.strip()
+
+    async def _maybe_journal(self, task: str, output: str) -> None:
+        """
+        会话结束钩子：写一条叙事日志（SessionJournal）。
+        失败 / 5 门未通过 / 关闭都静默 —— 不影响主回复。
+        """
+        if not self.enable_dreaming or self.session_journal is None:
+            return
+        try:
+            path = await self.session_journal.dream(task=task, output=output)
+            if path:
+                print(f"[journal] saved → {path.name}")
+        except Exception as e:
+            print(f"[journal] failed ({type(e).__name__}: {e}); skip")
+
+    async def _maybe_real_dream(self) -> None:
+        """
+        真 L6 dreaming：跑 4 阶段 consolidation 整理 auto_memory/。
+        默认 24h / 5 sessions 才触发，所以大部分会话不会动 LLM 成本。
+        """
+        if not self.enable_dreaming or self.real_dreamer is None:
+            return
+        try:
+            await self.real_dreamer.dream()
+        except Exception as e:
+            print(f"[real-dreamer] failed ({type(e).__name__}: {e}); skip")
+
+    # 旧名兼容：harness._maybe_dream 仍然只跑 journal（不破坏外部调用）
+    async def _maybe_dream(self, task: str, output: str) -> None:
+        await self._maybe_journal(task, output)
+
+    async def _maybe_extract_memories(self, task: str, output: str) -> None:
+        """
+        会话结束钩子：调 LLM 抽取跨会话事实，按 4 类型 + Why/How 模板写盘。
+        失败静默 —— 这是"锦上添花"层，不影响主回复。
+        """
+        if not self.enable_auto_extract:
+            return
+        try:
+            paths = await extract_and_save(
+                task=task,
+                output=output,
+                summarizer=self._dream_summarize,   # 复用 doubao 摘要器
+                memory_dir=self.auto_memory_dir,
+            )
+            if paths:
+                print(f"[auto_extract] saved {len(paths)} memory entries")
+        except Exception as e:
+            print(f"[auto_extract] failed ({type(e).__name__}: {e}); skip")
+
+    async def _maybe_autocompact_short_term(self) -> None:
+        """
+        Query loop 前置钩子：检查 short_term 是否需要自动压缩。
+        先 microcompact（cheap）→ 还不够才 full compact（expensive）。
+        """
+        # 拿 short_term 当前完整 messages 列表
+        messages = self.short_term.get_messages()
+        new_messages, was_compacted = await auto_compact_if_needed(
+            messages,
+            summarizer=self._dream_summarize,
+            state=self.auto_compact_state,
+        )
+        if was_compacted:
+            print("[compactor] auto-compact applied")
+            # 把压缩后的 messages 写回 short_term
+            # short_term 没有 set_messages 接口，简化做法：clear + 逐条 add
+            self.short_term.clear()
+            for m in new_messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                if role == "system":
+                    # system 由 set_system 管理；compact 后的 summary 用 user role 已是约定
+                    continue
+                if isinstance(content, str):
+                    self.short_term.add(role, content)
+
     # ─────────────── 成本记账 ───────────────
 
     def _record_cost(self, adapter: ModelAdapter) -> CallCost:
@@ -259,10 +394,23 @@ class Harness:
         组装 system prompt：
           基础 SYSTEM_PROMPT
             + 长期记忆事实（如果有）
+            + Dream 召回（如果有，过往相似任务的复盘笔记）
             + 可用 skills 索引（如果有，让模型知道有哪些 SKILL.md 可 invoke_skill）
             + RAG 检索片段（如果开了 --rag 且 query 命中）
         """
         system = SYSTEM_PROMPT + await self._load_long_term_block()
+
+        # Dream 前置：从历史 dreams/ 里 grep 出最相关的 top-3，拼到 system。
+        # 这是"agent 越用越聪明"的关键：上次的踩坑、下次自动看到。
+        if self.dreamer is not None:
+            try:
+                hits = self.dreamer.recall(task, top_k=3)
+                ctx = self.dreamer.format_context(hits)
+                if ctx:
+                    system += "\n\n" + ctx
+            except Exception as e:
+                print(f"[dreamer] recall failed ({type(e).__name__}: {e}); skip")
+
         skill_index = self.skills.render_index()
         if skill_index:
             system += "\n\n" + skill_index
@@ -298,6 +446,8 @@ class Harness:
 
         self.working.update(task_description=task, step=0)
         self.short_term.add("user", task)
+        # query 前置：检查是否需要自动压缩 short_term（micro/full）
+        await self._maybe_autocompact_short_term()
         system = await self._build_system_with_context(task)
         adapter = self._get_adapter(decision.model)
 
@@ -324,6 +474,13 @@ class Harness:
         self.observer.end_trace(success=True, output=answer)
         self.hooks.trigger(HookEvent.STOP, task=task, output=answer)
         self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
+        # 三个会话结束钩子：
+        #   1. journal: 写叙事 markdown（高频，每会话）
+        #   2. extract_memories: 抽 4 类结构化事实（高频，每会话）
+        #   3. real_dream: 整理 auto_memory/ 4 阶段巩固（稀疏，~24h 一次）
+        await self._maybe_journal(task, answer)
+        await self._maybe_extract_memories(task, answer)
+        await self._maybe_real_dream()
         return answer
 
     async def _run_single_turn(
@@ -401,6 +558,8 @@ class Harness:
         adapter = self._get_adapter(decision.model)
         system = await self._build_system_with_context(task)
         self.short_term.add("user", task)
+        # query 前置：检查是否需要自动压缩 short_term（v2 升级用 compactor 模块）
+        await self._maybe_autocompact_short_term()
 
         full_buf: list[str] = []
         async for chunk in adapter.complete_stream(
@@ -426,6 +585,9 @@ class Harness:
         self.observer.end_trace(success=True, output=full)
         self.hooks.trigger(HookEvent.STOP, task=task, output=full)
         self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
+        await self._maybe_journal(task, full)
+        await self._maybe_extract_memories(task, full)
+        await self._maybe_real_dream()
 
     # ─────────────── 并发对比 ───────────────
 
