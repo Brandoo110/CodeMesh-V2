@@ -43,6 +43,11 @@ from .render_html import (
     model_color,
 )
 from .stats_report import render_stats_dashboard
+from .diff_report import (
+    render_edit_diff,
+    maybe_write_diff,
+    html_diff_enabled,
+)
 
 __all__ = [
     "Observer",
@@ -85,4 +90,7 @@ __all__ = [
     "rotate_dir",
     "model_color",
     "render_stats_dashboard",
+    "render_edit_diff",
+    "maybe_write_diff",
+    "html_diff_enabled",
 ]

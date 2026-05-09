@@ -962,9 +962,22 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
         p.write_text(updated, encoding="utf-8")
     except Exception as e:
         return f"[ERROR] write failed: {type(e).__name__}: {e}"
+
+    # 可选：env CODEMESH_HTML_DIFF=1 时落盘一份 diff HTML 到 .codemesh/diffs/
+    # 默认关，避免反复 edit 累积垃圾。开了就有"agent 改了什么"的可视化产物。
+    # 失败静默——不打断主返回。
+    try:
+        from feedback.diff_report import maybe_write_diff
+        diff_path = maybe_write_diff(path=path, before=original, after=updated)
+    except Exception:
+        diff_path = None
+
     delta = len(new_string) - len(old_string)
     sign = "+" if delta >= 0 else ""
-    return f"OK: edited {path} ({sign}{delta} bytes)"
+    base = f"OK: edited {path} ({sign}{delta} bytes)"
+    if diff_path is not None:
+        base += f"\n[diff html: {diff_path}]"
+    return base
 
 
 # ───────────────── 向后兼容导出 ─────────────────
