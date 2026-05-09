@@ -30,6 +30,18 @@ from .compactor import (
     should_autocompact,
     estimate_messages_tokens,
 )
+# HTML 工件渲染基建（2026-05-10）：把已有数据换个展示形态——给人看的工件。
+from .render_html import (
+    HtmlDoc,
+    BarDatum,
+    PieSlice,
+    horizontal_bar_chart,
+    sparkline,
+    pie_chart,
+    write_artifact,
+    rotate_dir,
+    model_color,
+)
 
 __all__ = [
     "Observer",
@@ -62,4 +74,13 @@ __all__ = [
     "microcompact_messages",
     "should_autocompact",
     "estimate_messages_tokens",
+    "HtmlDoc",
+    "BarDatum",
+    "PieSlice",
+    "horizontal_bar_chart",
+    "sparkline",
+    "pie_chart",
+    "write_artifact",
+    "rotate_dir",
+    "model_color",
 ]
