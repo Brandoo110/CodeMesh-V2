@@ -77,6 +77,8 @@ from feedback import (
     RealDreamer,       # 真 L6 dreaming（4 阶段巩固）
     AutoCompactState,
     auto_compact_if_needed,
+    StepRecord,
+    maybe_write_plan,
 )
 from memory import extract_and_save, DEFAULT_AUTO_MEMORY_DIR
 from rag import retrieve
@@ -504,7 +506,9 @@ class Harness:
             print(f"  step {i}/{len(task_plan.steps)}: [{step.suggested_model}] {step.description}")
 
         # 逐步执行：每一步跑一次 agent loop
+        # 同时收集 timeline 数据，env CODEMESH_HTML_PLAN=1 时落盘成可视化 HTML
         results: list[str] = []
+        step_records: list[StepRecord] = []
         for i, step in enumerate(task_plan.steps, 1):
             adapter = self._get_adapter(step.suggested_model)
 
@@ -513,26 +517,58 @@ class Harness:
                 self.hooks.fire_post(name, result)
                 self.working.update(step=self.working.step + 1)
 
-            if step.needs_tools:
-                # 需要工具 → 跑完整 agent loop
-                text = await run_agent_loop(
-                    adapter=adapter,
-                    messages=[{"role": "user", "content": step.description}],
-                    system=system,
-                    on_tool_call=on_tool_call,
-                )
-            else:
-                # 纯思考 → 单轮 stream 省钱省时
-                buf: list[str] = []
-                async for chunk in adapter.complete_stream(
-                    messages=[{"role": "user", "content": step.description}],
-                    system=system,
-                ):
-                    buf.append(chunk)
-                text = "".join(buf)
+            t0 = time.monotonic()
+            err_msg = ""
+            text = ""
+            try:
+                if step.needs_tools:
+                    # 需要工具 → 跑完整 agent loop
+                    text = await run_agent_loop(
+                        adapter=adapter,
+                        messages=[{"role": "user", "content": step.description}],
+                        system=system,
+                        on_tool_call=on_tool_call,
+                    )
+                else:
+                    # 纯思考 → 单轮 stream 省钱省时
+                    buf: list[str] = []
+                    async for chunk in adapter.complete_stream(
+                        messages=[{"role": "user", "content": step.description}],
+                        system=system,
+                    ):
+                        buf.append(chunk)
+                    text = "".join(buf)
+            except Exception as e:
+                err_msg = f"{type(e).__name__}: {e}"
+                text = f"[ERROR] {err_msg}"
 
-            self._record_cost(adapter)
+            duration_ms = (time.monotonic() - t0) * 1000
+            cost = self._record_cost(adapter)
+            step_records.append(StepRecord(
+                n=i,
+                description=step.description,
+                suggested_model=step.suggested_model,
+                needs_tools=step.needs_tools,
+                status="error" if err_msg else "done",
+                output=text,
+                duration_ms=duration_ms,
+                cost_rmb=cost.cost_rmb,
+                error=err_msg,
+            ))
             results.append(f"【步骤 {i}】{step.description}\n{text}")
+
+        # 可选：env CODEMESH_HTML_PLAN=1 时把 plan timeline 落盘到 .codemesh/plans/
+        # 失败静默——锦上添花层不影响主返回
+        try:
+            plan_path = maybe_write_plan(
+                task=task,
+                summary=task_plan.summary,
+                steps=step_records,
+            )
+            if plan_path is not None:
+                print(f"[plan-html] saved → {plan_path}")
+        except Exception:
+            pass
 
         return "\n\n".join(results)
 

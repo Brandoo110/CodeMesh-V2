@@ -48,6 +48,12 @@ from .diff_report import (
     maybe_write_diff,
     html_diff_enabled,
 )
+from .planner_timeline import (
+    StepRecord,
+    render_planner_timeline,
+    maybe_write_plan,
+    html_plan_enabled,
+)
 
 __all__ = [
     "Observer",
@@ -93,4 +99,8 @@ __all__ = [
     "render_edit_diff",
     "maybe_write_diff",
     "html_diff_enabled",
+    "StepRecord",
+    "render_planner_timeline",
+    "maybe_write_plan",
+    "html_plan_enabled",
 ]
