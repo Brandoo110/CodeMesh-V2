@@ -12,3 +12,5 @@ dist/
 *.db
 ~/.codemesh/
 .codemesh/
+.DS_Store
+.claude/
