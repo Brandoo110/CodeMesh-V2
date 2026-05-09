@@ -3,7 +3,7 @@
 > 国内多模型 Code Agent，基于 **Harness 四层架构** 的实践项目。
 > 定位：**面向国内合规场景**（金融/政务/医疗 —— 不能用 OpenAI/Anthropic）的 Claude Code 类 Agent。
 
-**特性速览（v3）**：
+**特性速览（v4，2026-05-10）**：
 - 🎯 **智能路由**：PydanticAI 强类型路由到 DeepSeek / Qwen / Doubao
 - 🧠 **Planner-Executor 双 Agent**：复杂任务自动拆步骤，简单任务单轮秒回
 - ⚡ **流式输出**：逐 token 实时吐字
@@ -16,6 +16,10 @@
 - 🔍 **代码库 RAG**（保留作非代码场景）：`codemesh index .` → `--rag` 语义检索；AST 切 chunk + token-aware 截断
 - 🛡️ **Adapter retry**：429 / 5xx 指数退避自动重试
 - 📊 **Langfuse 可观测**：trace / token / 成本全链路追踪（可选）
+- 🧩 **Plugins 加载**（v4 增）：`.claude/plugins/<name>/plugin.py` 自动 import + `register(harness)`，可叠加 hooks / tools / skills / permissions
+- 🛡️ **Permissions 多级**（v4 增）：ALLOW / DENY / ASK 三级规则集，PreToolUse hook 拦截危险动作
+- 🔐 **Memory 7 层对齐**（v4 增）：`compactor` 二级压缩（micro + full，9 段模板）+ `auto_extract` 4 类型抽取（user / feedback / project / reference）+ `session_journal` 每会话叙事 L5 + `dreamer` 4 阶段 L6 巩固
+- 🎨 **HTML 工件渲染**（v4 增）：`codemesh stats --html` 可视化 dashboard / `CODEMESH_HTML_DIFF=1` 落盘 edit diff / `CODEMESH_HTML_PLAN=1` 落盘 planner timeline / `docs/architecture.html` 交互式架构图。手写 SVG，零新 PyPI 依赖
 
 ---
 
@@ -42,6 +46,8 @@ CodeMesh 不是要替代 Claude Code，而是演示：**在境内模型（DeepSe
 │   planner.py    —— 复杂任务拆步骤                                │
 │   hooks.py      —— HookEvent 标准事件 + HookResult.block         │
 │   skills.py     —— SKILL.md 加载（项目级 + 用户级）              │
+│   plugins.py    —— v4 增：插件加载 + register(harness)            │
+│   permissions.py—— v4 增：ALLOW/DENY/ASK 三级规则                 │
 │   adapters/     —— DeepSeek / DashScope / VolcEngine / Gemini    │
 │   adapters/retry.py —— async 指数退避重试（429 / 5xx）           │
 ├──────────────────────────────────────────────────────────────────┤
@@ -52,21 +58,32 @@ CodeMesh 不是要替代 Claude Code，而是演示：**在境内模型（DeepSe
 │   sandbox.py    —— 危险命令拦截                                  │
 ├──────────────────────────────────────────────────────────────────┤
 │ 反馈层 Feedback                                                   │
-│   observer.py     —— Langfuse 埋点                               │
-│   validator.py    —— 输出校验（路径逃逸、密钥泄露）              │
-│   cost.py         —— 真实人民币成本计算                          │
-│   call_log.py     —— 本地 jsonl 调用日志（stats 数据源）         │
-│   token_budget.py —— tiktoken + CJK 启发式 token 计数            │
+│   observer.py        —— Langfuse 埋点                            │
+│   validator.py       —— 输出校验（路径逃逸、密钥泄露）           │
+│   cost.py            —— 真实人民币成本计算                       │
+│   call_log.py        —— 本地 jsonl 调用日志（stats 数据源）      │
+│   token_budget.py    —— tiktoken + CJK 启发式 token 计数         │
+│   compactor.py       —— v4 增：micro/full 二级压缩（9 段模板）   │
+│   session_journal.py —— v4 增：每会话叙事 L5（5 门触发）         │
+│   dreamer.py         —— v4 增：4 阶段 L6 巩固（24h / 5 sessions）│
+│   render_html.py     —— v4 增：HTML 工件共享渲染基建（SVG 原语） │
+│   stats_report.py    —— v4 增：stats --html dashboard 渲染       │
+│   diff_report.py     —— v4 增：edit_file 落盘 unified diff HTML  │
+│   planner_timeline.py—— v4 增：planner 时间线 HTML               │
 ├──────────────────────────────────────────────────────────────────┤
 │ 记忆层 Memory                                                     │
 │   short_term.py —— 对话历史 + 滑动窗口 + LLM 摘要压缩            │
 │   working.py    —— 当前任务结构化状态                            │
 │   long_term.py  —— SQLite 跨会话持久化（remember_fact 工具）     │
+│   auto_extract.py —— v4 增：会话末抽取 4 类型事实（user/feedback/│
+│                       project/reference + Why/How 双段）         │
 └──────────────────────────────────────────────────────────────────┘
              ▲
              │ 顶层组装
         harness.py  ——  cli.py
 ```
+
+> 完整交互式架构图见 [`docs/architecture.html`](docs/architecture.html)（v4 新增），点击层标题可展开下属文件，hover 看一句话职责。
 
 **核心思想：关注点分离。** 改模型厂商不影响 Agent Loop；加新工具不影响记忆；
 加 Langfuse 不影响路由。每一层只做一件事。
@@ -84,6 +101,7 @@ Agent 的"大脑海马"。把无状态的 LLM 变成有连续性的助手。
 | `short_term.py` | 存 messages 队列（本次对话） | `deque(maxlen=N)` 自动滑动窗口；system 消息永不淘汰 |
 | `working.py`    | 存当前任务状态（正在改哪个文件、第几步） | dataclass，类型清晰；`snapshot()` 用于日志/调试 |
 | `long_term.py`  | SQLite KV 存储（跨会话） | aiosqlite 异步；JSON 序列化；`~/.codemesh/memory.db` |
+| `auto_extract.py` (v4) | 会话末 LLM 抽取跨会话事实 | 4 类型 user/feedback/project/reference + Why/How 双段；写到 `~/.codemesh/auto_memory/` + MEMORY.md 索引 |
 
 ### 📁 `execution/` — 执行层
 
@@ -104,6 +122,15 @@ Agent 的"后视镜"。没有 observability 的 Agent 等于没有 Agent。
 | `observer.py`  | Langfuse trace 记录 | 未配密钥时静默降级为 no-op；延迟 import |
 | `validator.py` | 输出校验工具 | `check_no_secrets`、`check_path_safe` |
 | `cost.py`      | 人民币成本计算 | 各家价格表 `PRICING`；`compute_cost()` 返回 `CallCost` |
+| `call_log.py`  | 本地 jsonl 调用日志 | `~/.codemesh/calls.jsonl`，append-only；`stats` 子命令的数据源 |
+| `token_budget.py` | tokens 计数 / 截断 | tiktoken + CJK 启发式 fallback |
+| `compactor.py` (v4) | 二级会话压缩 | micro（5 条工具结果合并）+ full（9 段模板，CC 同款）；`AutoCompactState` 跟踪连续失败 |
+| `session_journal.py` (v4) | L5 每会话叙事日志 | 4 段 markdown 写到 `~/.codemesh/journal/`；5 门触发（enabled / time / scan / sessions / lock）；下次相似任务自动召回 |
+| `dreamer.py` (v4) | L6 4 阶段记忆巩固 | orientation / gather / consolidate / prune & index；24h / 5 sessions 触发；与 session_journal 共用 `.consolidate-lock` |
+| `render_html.py` (v4) | HTML 工件共享基建 | `HtmlDoc` wrapper + 暗色主题 CSS + SVG 原语（horizontal_bar / sparkline / pie） + `write_artifact` / `rotate_dir`；零 PyPI 依赖 |
+| `stats_report.py` (v4) | `codemesh stats --html` 渲染器 | KPI / 各模型成本横条 / pie / 按天 sparkline / 详细表 |
+| `diff_report.py` (v4) | edit_file unified diff HTML | env `CODEMESH_HTML_DIFF=1` 触发；写到 `.codemesh/diffs/`；rotate keep 20 |
+| `planner_timeline.py` (v4) | planner 时间线 HTML | env `CODEMESH_HTML_PLAN=1` 触发；按耗时占比横条 + 步骤卡片 |
 
 ### 📁 `orchestration/` — 编排层
 
@@ -114,6 +141,9 @@ Agent 的"调度中枢"。决定任务给谁、在关键点插入逻辑。
 | `router.py`        | PydanticAI 路由 | `RouteDecision` 强类型；`Literal[...]` 限定返回值 |
 | `planner.py`       | 任务拆分 Agent | `TaskPlan(steps=[Step])`；complex 任务才触发 |
 | `hooks.py`         | Pre/Post hook 注册表 | 支持多回调；hook 异常不毁主流程 |
+| `skills.py`        | SKILL.md 加载 | 扫 `.claude/skills/` + `~/.codemesh/skills/`；自动注入索引 |
+| `plugins.py` (v4)  | 插件加载 | `.claude/plugins/<name>/plugin.py` + `register(harness)`；可叠加 hooks/tools/skills/permissions |
+| `permissions.py` (v4) | ALLOW/DENY/ASK 三级 | 默认规则集（force-push / pip install / 系统路径写入...）；通过 PreToolUse hook 拦截 |
 | `adapters/base.py` | 统一接口 Protocol | `ModelAdapter` 协议；暴露 `last_usage` 给成本追踪 |
 | `adapters/deepseek.py`   | DeepSeek（推理强） | OpenAI 兼容；支持 streaming |
 | `adapters/dashscope.py`  | 阿里 Qwen（代码强） | 同上 |
@@ -163,10 +193,17 @@ codemesh run "重构 auth 模块提高可测试性" --rag     # 复杂任务 + R
 codemesh run "一句话解释 Harness" --compare        # 三家对比 + 成本表
 codemesh run "什么是 Protocol" --stream            # 流式输出
 codemesh index .                                   # 建 RAG 索引
+codemesh stats                                     # 终端聚合表
+codemesh stats --html                              # v4 增：HTML dashboard
 
 # 5. 跑测试
 python -m tests.test_short_term      # 单元测试
 python -m tests.test_adapters        # 冒烟测试（消耗少量 API 配额）
+
+# 6. v4 可选环境变量
+# export CODEMESH_HTML_DIFF=1   # edit_file 时落盘 unified diff HTML
+# export CODEMESH_HTML_PLAN=1   # complex 任务跑完落盘 planner timeline HTML
+# 两者都默认关；落到 .codemesh/diffs/ 和 .codemesh/plans/，按 mtime 滚动 20 个
 ```
 
 **单 key happy path（最快上手）**：
@@ -223,11 +260,36 @@ codemesh run "用一句话解释 Harness 架构" --stream
 - ✅ **AST chunking**：Python 文件按 def/class 切 chunk（v3 增）
 - ✅ **Skills 加载**：兼容 Anthropic SKILL.md 格式，自动扫 `.claude/skills/` 和 `~/.codemesh/skills/`（v3 增）
 - ✅ **Adapter retry**：所有适配器 `complete()` 加指数退避，处理 429 / 5xx（v3 增）
-- 💡 后续扩展方向（按性价比）：
-  - **Permissions 多级**：从正则黑名单升级到 ALLOW/DENY/ASK + Hook 拦截
-  - **Plugins 机制**：`.claude/plugins/<name>/` 自动加载 hooks + tools
+- 💡 v3 当时写的"后续扩展方向"——除流式 retry / MCP / Reranker / Docker 沙箱外，**Permissions 多级 / Plugins 机制都已在 v4 兑现**
+
+## 8. 项目状态（v4，2026-05-10）
+
+v3 → v4 一句话总结：**编排 / 记忆 / 反馈三层都补齐了 OpenHarness 已有但本项目缺的能力**，并基于 thariqs 的 thesis 把"给人看"的产物从 markdown 升级为自包含 HTML。
+
+- ✅ **Plugins 机制**：`.claude/plugins/<name>/plugin.py` + `register(harness)` 自动加载，可叠加 hooks / tools / skills / permissions（v3 后续扩展计划兑现）
+- ✅ **Permissions 多级**：ALLOW / DENY / ASK 三级规则集，PreToolUse hook 拦截危险动作（同上）
+- ✅ **Memory 7 层对齐 OpenHarness / Claude Code**：
+  - `compactor.py` —— L2 micro + L4 full 二级压缩，9 段 CC 同款模板，`AutoCompactState` 跟踪连续失败防止反复浪费 token
+  - `auto_extract.py` —— L5 会话末抽取 4 类型（user / feedback / project / reference）+ Why/How 双段，写到 `~/.codemesh/auto_memory/` + MEMORY.md 索引
+  - `session_journal.py` —— L5 叙事变体，每会话末写 4 段 markdown 到 `~/.codemesh/journal/`，5 门触发，下次相似任务自动召回
+  - `dreamer.py` —— L6 真 dreaming，4 阶段巩固（orientation / gather / consolidate / prune & index），24h / 5 sessions 触发（CC `DreamTask` 同款语义）
+  - 关键认知：**L5 ≠ L6**。L5 是"记新事"，L6 是"整理已记的事"，两者不是同一个东西
+- ✅ **HTML 工件渲染**（灵感：[thariqs · The Unreasonable Effectiveness of HTML](https://thariqs.github.io/html-effectiveness/)）：
+  - `feedback/render_html.py` —— 共享基建：暗色主题 CSS + 手写 SVG 原语 + 文件滚动；零新 PyPI 依赖
+  - `codemesh stats --html` —— dashboard：KPI / 各模型成本横条 / pie / 按天 sparkline / 详细表
+  - `CODEMESH_HTML_DIFF=1` —— `edit_file` 后落盘 unified diff HTML（绿/红块、行号、上下文）
+  - `CODEMESH_HTML_PLAN=1` —— complex 任务后落盘 planner timeline（耗时占比横条 + 步骤卡片 + 状态色）
+  - `docs/architecture.html` —— 交互式 4 层架构图（点 ▶ 折叠每层，hover 看一句话职责）
+  - `docs/index.html` —— 工件 showcase 主页
+  - 关键边界：**HTML 给"人"看，不给"agent"吃**。tool returns 仍是字符串，否则会污染 token 经济、模型也消化不了
+- ✅ **测试覆盖**：v4 新增 4 个 HTML 渲染测试模块（render_html / stats_report / diff_report / planner_timeline，60 个 case）+ 4 个记忆层测试模块（compactor / auto_extract / session_journal / dreamer，70+ case），全部走"纯 Python + `if __name__ == '__main__'` runner"，无 pytest 依赖、无网络
+- 💡 后续可做：
+  - **iframe srcdoc 嵌入真实工件预览**：`docs/index.html` 当前用手画 SVG 缩略图，可换成真实生成的工件
+  - **stats sparkline hover tooltip**：当前只有静态轨迹，加 `<title>` / mousemove 能看每天具体调用列表
+  - **planner timeline 实时刷新**：当前是任务结束后渲染，加 long-poll / SSE 能边跑边看
+  - **diff render syntax highlight**：当前纯白文本，可写 100 行纯 Python tokenizer 给 .py 文件染色（保持零依赖）
   - **流式 retry**：buffer 前 N 个 chunk 才能在断流后从头重发
   - **MCP client**：Anthropic 生态接入（filesystem / github / brave 等）
   - **Reranker**：非代码 RAG 的 cross-encoder 重排
   - **Docker 沙箱**：真正隔离 bash_exec
-- 📖 完整改动叙事看 `DEVLOG.md`，工作守则看 `CLAUDE.md`
+- 📖 完整改动叙事看 `DEVLOG.md`（每个 commit 都有"背景 / 改动 / tradeoff / 面试故事"段）；工作守则看 `CLAUDE.md`
