@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CodeMesh · HTML 工件 showcase</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0f1419;
+  --panel: #1a1f2e;
+  --panel-hi: #232a3d;
+  --text: #e6e1cf;
+  --dim: #7f8aa3;
+  --border: #2a3142;
+  --accent: #5b8def;
+  --good: #10b981;
+  --bad: #ef4444;
+  --warn: #f59e0b;
+  --purple: #7c3aed;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+}
+.shell {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 36px 24px 64px;
+}
+header.hero {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 28px;
+  margin-bottom: 32px;
+}
+header.hero h1 {
+  margin: 0 0 8px;
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+header.hero .lede {
+  color: var(--text);
+  font-size: 15px;
+  max-width: 720px;
+  margin: 0 0 12px;
+}
+header.hero .quote {
+  border-left: 3px solid var(--accent);
+  padding: 10px 16px;
+  margin: 18px 0 0;
+  background: var(--panel);
+  border-radius: 0 4px 4px 0;
+  font-size: 13px;
+  color: var(--text);
+}
+header.hero .quote cite {
+  color: var(--dim);
+  font-style: normal;
+  font-size: 12px;
+  display: block;
+  margin-top: 6px;
+}
+header.hero .quote cite a { color: var(--accent); text-decoration: none; }
+header.hero .quote cite a:hover { text-decoration: underline; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 18px;
+  margin-bottom: 32px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  transition: transform 0.08s ease, border-color 0.08s ease;
+  display: flex;
+  flex-direction: column;
+}
+.card:hover { transform: translateY(-2px); border-color: var(--accent); }
+.card .preview {
+  aspect-ratio: 16 / 9;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+  overflow: hidden;
+}
+.card .preview svg { display: block; width: 100%; height: 100%; }
+.card .body { padding: 14px 16px 16px; flex: 1; display: flex; flex-direction: column; }
+.card .body .badge {
+  display: inline-block;
+  padding: 1px 7px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-radius: 3px;
+  margin-right: 4px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+.b-report { background: rgba(16,185,129,0.18); color: #d1fae5; }
+.b-tool { background: rgba(245,158,11,0.18); color: #fed7aa; }
+.b-plan { background: rgba(124,58,237,0.18); color: #ddd6fe; }
+.b-static { background: rgba(91,141,239,0.18); color: #93b8ff; }
+
+.card h3 {
+  margin: 8px 0 4px;
+  font-size: 16px;
+  font-weight: 600;
+}
+.card p {
+  margin: 0 0 10px;
+  color: var(--dim);
+  font-size: 13px;
+}
+.card .how {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--text);
+}
+.card .how code {
+  background: var(--bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+.card .open {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--accent);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  text-decoration: none;
+}
+.card .open:hover { text-decoration: underline; }
+.card .open.dim {
+  color: var(--dim);
+}
+
+footer {
+  margin-top: 32px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 12px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+footer a { color: var(--accent); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+
+.principles {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 22px;
+  margin-bottom: 32px;
+}
+.principles h2 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 500;
+}
+.principles ul { margin: 0; padding-left: 20px; }
+.principles li { margin: 6px 0; color: var(--text); font-size: 13px; }
+.principles li code {
+  background: var(--bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<header class="hero">
+  <h1>CodeMesh · HTML 工件 showcase</h1>
+  <p class="lede">
+    CodeMesh 是国内多模型 Code Agent（学习 / 面试项目）。本页陈列项目里所有
+    "给人看"的 HTML 工件——dashboard、edit diff、planner timeline、架构图。
+    都是单文件自包含、零外链 / 零 JS 框架，可以直接发简历或贴公众号文章。
+  </p>
+  <blockquote class="quote">
+    "Diff、调用图、并排比较都是空间信息，markdown 是线性的——会丢一个维度。
+    Agent 应该输出自包含的 HTML 文件而不是大段 markdown。"
+    <cite>— <a href="https://thariqs.github.io/html-effectiveness/">thariqs · The Unreasonable Effectiveness of HTML</a></cite>
+  </blockquote>
+</header>
+
+<div class="grid">
+
+  <!-- 1. Stats Dashboard -->
+  <div class="card">
+    <div class="preview">
+      <svg viewBox="0 0 400 225" xmlns="http://www.w3.org/2000/svg">
+        <rect width="400" height="225" fill="#0f1419"/>
+        <!-- KPI row -->
+        <rect x="16" y="16" width="84" height="40" rx="4" fill="#1a1f2e" stroke="#2a3142"/>
+        <rect x="108" y="16" width="84" height="40" rx="4" fill="#1a1f2e" stroke="#2a3142"/>
+        <rect x="200" y="16" width="84" height="40" rx="4" fill="#1a1f2e" stroke="#2a3142"/>
+        <rect x="292" y="16" width="92" height="40" rx="4" fill="#1a1f2e" stroke="#2a3142"/>
+        <text x="22" y="32" font-family="monospace" font-size="8" fill="#7f8aa3">CALLS</text>
+        <text x="22" y="48" font-family="monospace" font-size="14" fill="#e6e1cf">128</text>
+        <text x="114" y="32" font-family="monospace" font-size="8" fill="#7f8aa3">TOKENS IN</text>
+        <text x="114" y="48" font-family="monospace" font-size="14" fill="#e6e1cf">42,180</text>
+        <text x="206" y="32" font-family="monospace" font-size="8" fill="#7f8aa3">TOKENS OUT</text>
+        <text x="206" y="48" font-family="monospace" font-size="14" fill="#e6e1cf">8,430</text>
+        <text x="298" y="32" font-family="monospace" font-size="8" fill="#7f8aa3">COST</text>
+        <text x="298" y="48" font-family="monospace" font-size="14" fill="#10b981">¥0.0892</text>
+        <!-- Bar chart -->
+        <rect x="16" y="76" width="232" height="133" rx="4" fill="#1a1f2e" stroke="#2a3142"/>
+        <text x="24" y="92" font-family="sans-serif" font-size="9" fill="#e6e1cf">cost by model</text>
+        <text x="24" y="116" font-family="monospace" font-size="9" fill="#e6e1cf">deepseek</text>
+        <rect x="92" y="108" width="140" height="11" fill="#5b8def" rx="1"/>
+        <text x="24" y="138" font-family="monospace" font-size="9" fill="#e6e1cf">qwen</text>
+        <rect x="92" y="130" width="80" height="11" fill="#7c3aed" rx="1"/>
+        <text x="24" y="160" font-family="monospace" font-size="9" fill="#e6e1cf">doubao</text>
+        <rect x="92" y="152" width="48" height="11" fill="#ef4444" rx="1"/>
+        <text x="24" y="182" font-family="monospace" font-size="9" fill="#e6e1cf">gemini</text>
+        <rect x="92" y="174" width="22" height="11" fill="#10b981" rx="1"/>
+        <!-- Pie -->
+        <rect x="256" y="76" width="128" height="133" rx="4" fill="#1a1f2e" stroke="#2a3142"/>
+        <text x="264" y="92" font-family="sans-serif" font-size="9" fill="#e6e1cf">calls share</text>
+        <circle cx="320" cy="148" r="36" fill="#5b8def"/>
+        <path d="M320,148 L320,112 A36,36 0 0,1 351,166 Z" fill="#7c3aed"/>
+        <path d="M320,148 L351,166 A36,36 0 0,1 304,180 Z" fill="#ef4444"/>
+      </svg>
+    </div>
+    <div class="body">
+      <div><span class="badge b-report">report</span></div>
+      <h3>Stats dashboard</h3>
+      <p>本地调用统计的可视化版：KPI 卡片、模型成本横条、调用占比 pie、按天 sparkline、详细表格。</p>
+      <div class="how">
+        <code>codemesh stats --html</code><br/>
+        默认写到 <code>.codemesh/reports/stats-&lt;ts&gt;.html</code>，<code>--output</code> 自定义路径。
+        数据源跟 <code>codemesh stats</code> 同一份 <code>~/.codemesh/calls.jsonl</code>。
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Edit diff -->
+  <div class="card">
+    <div class="preview">
+      <svg viewBox="0 0 400 225" xmlns="http://www.w3.org/2000/svg">
+        <rect width="400" height="225" fill="#0f1419"/>
+        <rect x="16" y="16" width="368" height="193" rx="4" fill="#1a1f2e" stroke="#2a3142"/>
+        <text x="24" y="34" font-family="sans-serif" font-size="11" fill="#e6e1cf">diff: src/auth.py</text>
+        <text x="24" y="50" font-family="monospace" font-size="9" fill="#10b981">+12 additions</text>
+        <text x="120" y="50" font-family="monospace" font-size="9" fill="#ef4444">-5 deletions</text>
+        <line x1="24" y1="58" x2="376" y2="58" stroke="#2a3142"/>
+        <!-- diff rows -->
+        <rect x="24" y="64" width="44" height="14" fill="rgba(255,255,255,0.02)"/>
+        <text x="60" y="74" text-anchor="end" font-family="monospace" font-size="8" fill="#7f8aa3">10</text>
+        <text x="76" y="74" font-family="monospace" font-size="9" fill="#e6e1cf">  def authenticate(token):</text>
+        <rect x="24" y="80" width="352" height="14" fill="rgba(239,68,68,0.12)"/>
+        <text x="60" y="90" text-anchor="end" font-family="monospace" font-size="8" fill="#7f8aa3">11</text>
+        <text x="76" y="90" font-family="monospace" font-size="9" fill="#fee2e2">- if token == "admin":</text>
+        <rect x="24" y="96" width="352" height="14" fill="rgba(16,185,129,0.12)"/>
+        <text x="60" y="106" text-anchor="end" font-family="monospace" font-size="8" fill="#7f8aa3">11</text>
+        <text x="76" y="106" font-family="monospace" font-size="9" fill="#d1fae5">+ session = verify_jwt(token)</text>
+        <rect x="24" y="112" width="352" height="14" fill="rgba(16,185,129,0.12)"/>
+        <text x="60" y="122" text-anchor="end" font-family="monospace" font-size="8" fill="#7f8aa3">12</text>
+        <text x="76" y="122" font-family="monospace" font-size="9" fill="#d1fae5">+ if not session:</text>
+        <rect x="24" y="128" width="352" height="14" fill="rgba(16,185,129,0.12)"/>
+        <text x="60" y="138" text-anchor="end" font-family="monospace" font-size="8" fill="#7f8aa3">13</text>
+        <text x="76" y="138" font-family="monospace" font-size="9" fill="#d1fae5">+     return None</text>
+        <rect x="24" y="144" width="352" height="14" fill="rgba(255,255,255,0.02)"/>
+        <text x="60" y="154" text-anchor="end" font-family="monospace" font-size="8" fill="#7f8aa3">14</text>
+        <text x="76" y="154" font-family="monospace" font-size="9" fill="#e6e1cf">      return session</text>
+      </svg>
+    </div>
+    <div class="body">
+      <div><span class="badge b-tool">tool</span></div>
+      <h3>Edit diff</h3>
+      <p>每次模型调 <code>edit_file</code> 改文件后，顺手把 unified diff 渲染成单页 HTML。绿/红块、行号、上下文。</p>
+      <div class="how">
+        <code>export CODEMESH_HTML_DIFF=1</code><br/>
+        启用后每次 edit 自动写到 <code>.codemesh/diffs/</code>。默认关，避免无意义垃圾。
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. Planner timeline -->
+  <div class="card">
+    <div class="preview">
+      <svg viewBox="0 0 400 225" xmlns="http://www.w3.org/2000/svg">
+        <rect width="400" height="225" fill="#0f1419"/>
+        <rect x="16" y="16" width="368" height="193" rx="4" fill="#1a1f2e" stroke="#2a3142"/>
+        <text x="24" y="34" font-family="sans-serif" font-size="11" fill="#e6e1cf">plan: 重构 auth 模块</text>
+        <!-- proportion bar -->
+        <rect x="24" y="44" width="80" height="16" fill="#5b8def"/>
+        <rect x="104" y="44" width="170" height="16" fill="#7c3aed"/>
+        <rect x="274" y="44" width="100" height="16" fill="#ef4444"/>
+        <text x="64" y="56" text-anchor="middle" font-family="monospace" font-size="8" fill="white">step 1 · 0.8s</text>
+        <text x="189" y="56" text-anchor="middle" font-family="monospace" font-size="8" fill="white">step 2 · 2.1s</text>
+        <text x="324" y="56" text-anchor="middle" font-family="monospace" font-size="8" fill="white">step 3 · 1.5s</text>
+        <!-- step cards -->
+        <rect x="24" y="74" width="352" height="38" fill="#1a1f2e" stroke="#2a3142"/>
+        <rect x="24" y="74" width="3" height="38" fill="#10b981"/>
+        <text x="34" y="86" font-family="monospace" font-size="8" fill="#7f8aa3">step 1</text>
+        <text x="74" y="86" font-family="sans-serif" font-size="9" fill="#e6e1cf">读 auth.py 现有用法</text>
+        <text x="350" y="86" text-anchor="end" font-family="monospace" font-size="8" fill="#d1fae5">done</text>
+        <text x="34" y="103" font-family="monospace" font-size="8" fill="#5b8def">deepseek</text>
+        <text x="100" y="103" font-family="monospace" font-size="8" fill="#7f8aa3">tools · 0.82s · ¥0.0008</text>
+        <rect x="24" y="118" width="352" height="38" fill="#1a1f2e" stroke="#2a3142"/>
+        <rect x="24" y="118" width="3" height="38" fill="#10b981"/>
+        <text x="34" y="130" font-family="monospace" font-size="8" fill="#7f8aa3">step 2</text>
+        <text x="74" y="130" font-family="sans-serif" font-size="9" fill="#e6e1cf">重写 auth.py</text>
+        <text x="350" y="130" text-anchor="end" font-family="monospace" font-size="8" fill="#d1fae5">done</text>
+        <text x="34" y="147" font-family="monospace" font-size="8" fill="#7c3aed">qwen</text>
+        <text x="100" y="147" font-family="monospace" font-size="8" fill="#7f8aa3">tools · 2.10s · ¥0.0042</text>
+        <rect x="24" y="162" width="352" height="38" fill="#1a1f2e" stroke="#2a3142"/>
+        <rect x="24" y="162" width="3" height="38" fill="#ef4444"/>
+        <text x="34" y="174" font-family="monospace" font-size="8" fill="#7f8aa3">step 3</text>
+        <text x="74" y="174" font-family="sans-serif" font-size="9" fill="#e6e1cf">跑测试</text>
+        <text x="350" y="174" text-anchor="end" font-family="monospace" font-size="8" fill="#fee2e2">error</text>
+        <text x="34" y="191" font-family="monospace" font-size="8" fill="#ef4444">doubao</text>
+        <text x="100" y="191" font-family="monospace" font-size="8" fill="#7f8aa3">tools · 1.50s · err: AssertionError</text>
+      </svg>
+    </div>
+    <div class="body">
+      <div><span class="badge b-plan">plan</span></div>
+      <h3>Planner timeline</h3>
+      <p>complex 任务走 planner-executor 时，渲染每步的执行情况：拓扑、模型分配、状态、耗时占比、成本。</p>
+      <div class="how">
+        <code>export CODEMESH_HTML_PLAN=1</code><br/>
+        启用后跑 complex 任务自动写到 <code>.codemesh/plans/</code>。simple 任务不会触发。
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. Architecture diagram -->
+  <div class="card">
+    <div class="preview">
+      <svg viewBox="0 0 400 225" xmlns="http://www.w3.org/2000/svg">
+        <rect width="400" height="225" fill="#0f1419"/>
+        <!-- 4 layers -->
+        <rect x="16" y="16" width="368" height="40" rx="4" fill="#1a1f2e" stroke="#5b8def" stroke-width="2"/>
+        <text x="24" y="40" font-family="sans-serif" font-size="11" fill="#e6e1cf">编排层 · orchestration/</text>
+        <text x="380" y="40" text-anchor="end" font-family="monospace" font-size="9" fill="#7f8aa3">router · planner · hooks</text>
+        <text x="200" y="69" text-anchor="middle" font-family="monospace" font-size="10" fill="#7f8aa3">↓</text>
+        <rect x="16" y="74" width="368" height="40" rx="4" fill="#1a1f2e" stroke="#f59e0b" stroke-width="2"/>
+        <text x="24" y="98" font-family="sans-serif" font-size="11" fill="#e6e1cf">执行层 · execution/</text>
+        <text x="380" y="98" text-anchor="end" font-family="monospace" font-size="9" fill="#7f8aa3">loop · tools · sandbox</text>
+        <text x="200" y="127" text-anchor="middle" font-family="monospace" font-size="10" fill="#7f8aa3">↓</text>
+        <rect x="16" y="132" width="368" height="40" rx="4" fill="#1a1f2e" stroke="#7c3aed" stroke-width="2"/>
+        <text x="24" y="156" font-family="sans-serif" font-size="11" fill="#e6e1cf">记忆层 · memory/</text>
+        <text x="380" y="156" text-anchor="end" font-family="monospace" font-size="9" fill="#7f8aa3">short / working / long</text>
+        <text x="200" y="185" text-anchor="middle" font-family="monospace" font-size="10" fill="#7f8aa3">↓</text>
+        <rect x="16" y="190" width="368" height="20" rx="4" fill="#1a1f2e" stroke="#10b981" stroke-width="2"/>
+        <text x="24" y="204" font-family="sans-serif" font-size="11" fill="#e6e1cf">反馈层 · feedback/</text>
+      </svg>
+    </div>
+    <div class="body">
+      <div><span class="badge b-static">static</span></div>
+      <h3>Architecture diagram</h3>
+      <p>手写交互式架构图：四层 + RAG 横向插入。点 ▶ 展开看每层下属模块；hover 文件 tile 看一句话职责。</p>
+      <div class="how">
+        一次性产物，已 commit 到 <code>docs/architecture.html</code>。<br/>
+        <a class="open" href="architecture.html">→ open architecture.html</a>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="principles">
+  <h2>设计原则（不踩 thesis 的坑）</h2>
+  <ul>
+    <li><strong>HTML 工件给人看，不给 agent 吃</strong>：tool returns 仍然是字符串。把 <code>read_file</code> / <code>grep_text</code> 改 HTML 会污染 token 经济，模型也消化不了。</li>
+    <li><strong>单文件自包含 / 零外链</strong>：CSS 全 inline、SVG 手画、零 JS 框架。可以直接发简历 / 贴公众号 / 离线归档。</li>
+    <li><strong>零新 PyPI 依赖</strong>：所有渲染走 Python 标准库（<code>difflib</code>、字符串模板）。<code>requirements.txt</code> 没新增一行。</li>
+    <li><strong>opt-in 默认安静</strong>：env <code>CODEMESH_HTML_DIFF=1</code> / <code>CODEMESH_HTML_PLAN=1</code> 控制；不开就完全跟以前一样。</li>
+    <li><strong>滚动保留</strong>：<code>.codemesh/diffs/</code>、<code>.codemesh/plans/</code>、<code>.codemesh/reports/</code> 都按 mtime 自动滚动 20 个，不会无限堆积。</li>
+    <li><strong>不动叙事产物</strong>：README / DEVLOG / LEARNING_PATH 一行不改（CLAUDE.md 红线）。HTML 工件全部走 <code>docs/</code> 或运行时目录。</li>
+  </ul>
+</div>
+
+<footer>
+  <span>CodeMesh · 国内多模型 Code Agent · 学习/面试项目</span>
+  <span>
+    <a href="../README.md">README</a> ·
+    <a href="../DEVLOG.md">DEVLOG</a> ·
+    <a href="../LEARNING_PATH.md">LEARNING_PATH</a> ·
+    <a href="architecture.html">Architecture</a>
+  </span>
+</footer>
+
+</div>
+</body>
+</html>
