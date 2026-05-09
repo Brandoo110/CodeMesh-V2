@@ -11,3 +11,6 @@ dist/
 .ruff_cache/
 *.db
 ~/.codemesh/
+.codemesh/
+.DS_Store
+.claude/

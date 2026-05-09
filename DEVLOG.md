@@ -5,6 +5,113 @@ CodeMesh 开发日志。从 main 拉出来后所有的改动按时间顺序记�
 
 ---
 
+## 2026-05-10 — HTML 工件渲染：把"给人看"的产物从 markdown 升级到自包含 HTML
+
+> 分支：`feature/html-artifacts`（新开）
+> 灵感来源：[thariqs · The Unreasonable Effectiveness of HTML](https://thariqs.github.io/html-effectiveness/)
+
+### 一、背景
+
+之前 CodeMesh 全栈纯文本：执行层流字符串、tools 全 string return、planner 行号 print、stats 是 Rich Table、文档全 markdown。问题是——**diff / 调用图 / 并排比较都是空间信息**，markdown 是线性的会丢一个维度。给面试官 / 公众号文章看一张终端表格远远不够。
+
+但 thesis 有一条很容易被搞混的红线：**HTML 工件是给"人"看的，不是给"agent"吃的**。把 `read_file` / `grep_text` 改 HTML 会污染 token 经济，模型也消化不了。所以这一轮只动"最终给人看"的产物：stats / edit diff / planner timeline / 架构图 / showcase。
+
+### 二、改动
+
+1. **`feedback/render_html.py`（新，~340 行）**：共享渲染基建。
+   - 暗色主题（emerald/red、等宽字体、sticky 表头）+ 模型品牌色板
+   - `HtmlDoc` wrapper：自包含 HTML 模板（DOCTYPE + inline CSS + 标题 + 时间戳）
+   - SVG 原语：`horizontal_bar_chart` / `sparkline`（带 fill 选项）/ `pie_chart`，**零 PyPI 依赖**
+   - `write_artifact` + `rotate_dir`：按 mtime 自动滚动保留最近 N 个
+
+2. **`feedback/stats_report.py`（新）+ `cli.py stats --html`**：dashboard 渲染。
+   - KPI 行（calls / tokens in / tokens out / cost）
+   - 各模型成本横条 + token 横条 + calls share pie
+   - 按天 sparkline trend（最近 30 天）
+   - 详细 per-model 表（带 model 品牌色 dot）
+   - 默认写到 `.codemesh/reports/stats-<ts>.html`，`-o` 自定义路径
+
+3. **`feedback/diff_report.py`（新）+ `execution/tools.py edit_file()` 钩子**：edit diff 落盘。
+   - 用 `difflib.unified_diff` + 自渲染 side-by-side 表（不用 `HtmlDiff` 默认 1990s 样式）
+   - 行号 / 增删颜色块 / hunk 头 / `+N -M` 总结
+   - env `CODEMESH_HTML_DIFF=1` 控制（默认关，避免反复 edit 累积垃圾）
+   - 二进制 / >200KB 自动跳过；文件名 sanitize；写到 `.codemesh/diffs/`
+
+4. **`feedback/planner_timeline.py`（新）+ `harness.py _run_planned` 钩子**：planner 时间线。
+   - `StepRecord` dataclass 收集每步的 status / duration / cost / output / error
+   - 顶部 task / summary / 总耗时 / 总成本 KPI
+   - 按耗时占比的横条（每段一个步骤，按 model 品牌色）
+   - 步骤卡片：左 border 颜色 = status（done/error/pending），output 折叠预览
+   - env `CODEMESH_HTML_PLAN=1` 控制；simple 任务不会触发
+
+5. **`docs/architecture.html`（新，手写一次性产物）**：交互式 4 层架构图。
+   - `<details>` 元素做层折叠（点 ▶ 展开/收起）
+   - 每层 tile 显示文件名 + hover tooltip 显示一句话职责
+   - 顶部 SVG dataflow（user task → router/planner → agent loop → cost/observer → answer）
+   - 标记新增 HTML 模块（绿色 NEW 徽章）
+   - 不动 README，红线遵守
+
+6. **`docs/index.html`（新）**：showcase 主页，仿 thariqs 风格。
+   - Hero 引用 thesis 原句
+   - 4 张工件卡片（stats / edit diff / plan timeline / architecture），每张带手画 SVG 缩略图
+   - 设计原则区：6 条红线（不污染 agent 中间态、零 PyPI、env opt-in、滚动保留、不动叙事产物）
+
+### 三、关键 tradeoff
+
+- **为什么不上 matplotlib / plotly**：单文件自包含（HTML 工件能直接发简历 / 公众号 / 离线归档），零 PyPI 依赖（`requirements.txt` 没新增一行），数据量小（几十条 calls）杀鸡用牛刀。SVG 原生支持 CSS 主题，导出时不会因缺 PIL 跑不出图。
+- **为什么不复用 `difflib.HtmlDiff`**：默认样式是浅蓝表 + 紫色字（1990s nostalgia），跟 CodeMesh 暗色 + emerald/red 主题完全打架。换 CSS 不如自渲染 unified diff 来得可控。
+- **为什么 #3 / #2 默认关**：edit_file 调用频率高，每次写盘累积垃圾；planner 同理虽然低频但默认关也保持"安静"原则。stats --html 是 CLI 显式调用，所以总是开。
+- **关于 CLAUDE.md 红线**：README / DEVLOG / LEARNING_PATH 一行不改。新增工件全部走 `docs/`（静态产物）或 `.codemesh/` 运行时目录（已加进 .gitignore）。
+
+### 四、测试覆盖
+
+新增 4 个测试模块共 60 个 case，全部走 CodeMesh 约定的"纯 Python + `if __name__ == '__main__'` runner"：
+
+| 文件 | case 数 | 覆盖 |
+|---|---|---|
+| `tests/test_render_html.py` | 19 | doc/escape/3 SVG 原语/rotate/write_artifact |
+| `tests/test_stats_report.py` | 12 | 空数据/4 panels/title/escape/边界 |
+| `tests/test_diff_report.py` | 16 | 渲染各类行/safe filename/env/二进制/超大/滚动 |
+| `tests/test_planner_timeline.py` | 13 | status 类/品牌色/totals/escape/env |
+
+跑法：
+```
+for t in test_render_html test_stats_report test_diff_report test_planner_timeline; do
+  python -m tests.$t
+done
+```
+
+### 五、面试故事
+
+> "我看到 X 上一篇 'The Unreasonable Effectiveness of HTML' 后，意识到我项目所有产物都是终端文本——但 diff、调用图、成本对比本质都是空间信息。
+>
+> 我做了三件事：(1) 写了一个 `feedback/render_html.py` 共享基建，把 SVG 原语、CSS 主题、文件滚动管理集中——下次加新工件不用各处重复；(2) 把项目 5 个最该可视化的产物 HTML 化——stats dashboard、edit diff、planner timeline、架构图、showcase 页；(3) **明确了不该 HTML 化的边界**——agent 自己吃的 tool returns 必须保持纯字符串，不然 token 经济污染 + 模型消化不了。
+>
+> tradeoff 是测试薄（HTML 渲染只能测'非空 / 关键字段在 / 路径不逃逸'）和零新依赖（手写 SVG 比 matplotlib 累但简历没多一行 requirements）。所有可选钩子默认关、env opt-in，跟之前的运行行为完全不变——这是我从 thesis 学到的最重要一条：'空间信息要 HTML，但要 opt-in；中间态保持文本'。"
+
+### 六、Commit 范围
+
+```
+git log --oneline c09351e..HEAD
+```
+
+预计 6 个 commit（一个 feature 一个 commit，CLAUDE.md 约束）：
+1. feat(feedback): render_html shared infrastructure
+2. feat(feedback,cli): stats --html dashboard
+3. feat(feedback,execution): edit_file → HTML diff (CODEMESH_HTML_DIFF)
+4. feat(feedback,harness): planner timeline HTML (CODEMESH_HTML_PLAN)
+5. docs: architecture.html + index.html showcase
+6. docs(devlog): record HTML artifacts work
+
+### 七、还没做
+
+- **#5 进阶**：用 iframe `srcdoc` 嵌入真实工件预览（而不是手画 SVG 缩略图）。代价是单文件大几十 KB，需要先生成代表性 sample。
+- **stats 加 hover tooltip**：sparkline 上 hover 看那一天的具体调用列表（用 `<title>` 最简，`<g>` + JS 听 mouseover 才精确）。
+- **planner timeline 实时**：当前是任务结束后渲染。如果加成"边跑边更新"，需要一个 long-poll / SSE 端点，或者写到 `latest.html` 让用户开浏览器刷新。投入产出不一定划算，演示场景一次性渲染足够。
+- **diff render 加 syntax highlight**：当前是纯白文本块。Prism.js / Pygments 都行但任一都引入依赖。可以考虑写 100 行的纯 Python tokenizer for Python（项目里大部分编辑都是 .py），这个保持零依赖。
+
+---
+
 ## 2026-05-09 (晚) — 修正命名：原 dreamer 其实是 session_journal，写真 dreamer 做 4 阶段巩固
 
 > 分支：`feature/dreaming`（继续）
