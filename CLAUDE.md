@@ -144,3 +144,37 @@ async def my_tool(...) -> str:        # 或 def，registry 都支持
 **继续借鉴的方向**：plugins/、permissions/、mcp/、coordinator/。
 
 **不要借的**：他们的工具数量（43+）—— 我们走"少而精"。
+
+---
+
+## v4 状态（2026-05-10）
+
+**功能层冻结**。v4 已完成的四大块——别再加新功能：
+
+| 模块 | 文件 | 关键边界 |
+|------|------|---------|
+| Memory 7 层 | `feedback/auto_extract.py`、`memory/session_journal.py` 等 | L5 = "记新事"、L6 = "整理已记的事"，不要混 |
+| Dreaming 4 阶段巩固循环 | `feedback/dreamer.py` | 异步后台跑、24h + 5 sessions 双门控；**开发期实际很难真触发**，被问"跑过几次"要诚实 |
+| HTML 工件 | `feedback/render_html.py`、`stats_report.py`、`diff_report.py`、`planner_timeline.py` + `docs/architecture.html`、`docs/index.html` | **HTML 给人看，不给 agent 吃**——agent 工具返回必须保持字符串。详见 [`docs/decisions/`](docs/decisions/) |
+| Plugins / Permissions | `plugins.py`、`permissions.py` | 复刻 Claude Code 内部机制 |
+
+**下一阶段是讲述层，不是功能层**：
+
+- 录 5min demo 视频
+- 写 walkthrough 文章
+- README 头部加 architecture.html 截图
+- 拿 LEARNING_PATH 做 mock 面试
+
+**判断"该不该改"的标准**：是不是为了让我"讲得更顺"或"代码更准"。是就做，不是就别动。
+
+## 架构决策记录（ADR）
+
+重要架构选择写在 `docs/decisions/` 下，每份一个 markdown：
+
+- `0001-agentic-search-over-rag.md` — 代码检索为什么不用 RAG（v1→v2 最大 pivot）
+- `0002-html-for-humans-not-agents.md` — HTML 给人看不给 agent 吃（v4 关键边界）
+- `0003-dreaming-4-stage-consolidation.md` — Dreaming 4 阶段巩固循环
+- `0004-memory-7-layer-architecture.md` — Memory 7 层架构（复刻 Claude Code 内部）
+- `0005-domestic-multi-model.md` — 国内多模型差异化策略（v1 起持续）
+
+新写决策按 `NNNN-短描述.md` 命名，标准结构：Status / Context / Decision / Consequences / 参考。**ADR 是讲述层最直接的素材**。
