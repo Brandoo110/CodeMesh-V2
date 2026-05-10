@@ -3,7 +3,10 @@
 > 把你从"听说过 Agent"带到"在面试中能讲清 Harness 架构"的循序渐进指南。
 > 每个阶段给你：**要读的文件**、**要搞懂的概念**、**能回答的面试题**。
 
-预计总学习时长：**8–12 小时**。按阶段来，不要跳。
+预计总学习时长：**12–16 小时**（v4 末，含 dreaming / HTML 工件 / Memory 7 层进阶）。按阶段来，不要跳。
+
+> 路线总览：v1 主体（阶段 0-9，~8h）→ 进阶（阶段 10 + 末尾"v2/v3/v4 进阶"，~4-8h）。
+> 想拿这个项目去面试，**v1 主体 + 至少一段 v3 或 v4 进阶**是最低门槛。
 
 ---
 
@@ -311,27 +314,38 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 - Q: 代码文件怎么 chunk？按行切和按 AST 切的取舍？
 - Q: 为什么选 ChromaDB？和 FAISS / Qdrant 区别？
 - Q: topK 选多少？怎么动态调？
-- Q: Hybrid search 是什么？怎么做？（向量 + BM25 融合，RRF 加权）
 - Q: 如果代码库改了怎么更新索引？（增量 vs 全量重建的取舍）
+
+> **v3 后的关键修订（必看）**：读了 OpenHarness 源码后发现 Coding Agent 业界事实标准
+> **不是**向量 RAG（BM25+向量+RRF 那套），而是 `grep + glob + AST-LSP + read` 的 agentic search。
+> `rag/` 模块在 v3 后**保留作非代码场景**（文档库、知识库），代码搜索完全走 agentic 路径。
+> 这是面试里很值得讲的"读源码后调整方向"故事——见末尾"进阶 B"。
 
 ---
 
-## 阶段 10 · 延伸与扩展（可选）
+## 阶段 10 · 延伸与扩展（v1 设想 vs 实际去向）
 
-学到这里你已经能应对绝大多数 Agent 面试。想更深可以：
+> 这段原本是 v1 末写的"还能做什么"清单。v2-v4 把其中 5 项做掉了，下面用对照表保留——
+> 看自己的扩展直觉是不是和后续迭代方向对得上，比再写一遍 todo 有信息量。
 
-1. **加一个工具**：`grep_file(pattern, path)` —— 只改 `tools.py`
-2. **加一个模型**：接入智谱 GLM 或月之暗面 Kimi
-3. **换成 LangGraph 重写 Planner**，亲身感受状态图的威力
-4. **实现 `stats` 命令**：查询 Langfuse API 统计今日 token 消耗
-5. **容器化沙箱**：把 `bash_exec` 放到 Docker 里跑
-6. **记忆压缩**：`short_term.py` 快满时让 DeepSeek 先总结再继续
-7. **Hybrid RAG**：在 retriever 里加 BM25 过滤再用 RRF 融合
-8. **AST 切 chunk**：用 tree-sitter 替换按行切
+| 项 | v1 时设想 | 实际去向 |
+|---|---|---|
+| 加一个工具（grep_file） | 只改 tools.py | ✅ v2: glob_files / grep_text / edit_file / lsp_code 全都加了 |
+| 加一个模型 | 智谱 GLM / Kimi | ✅ v3: 加 Gemini fallback（单 key 跑通四层）|
+| 换 LangGraph 重写 Planner | 体验状态图 | ⬜ 没做。YAGNI 渐进引入；当前 PydanticAI 单轮决策够用 |
+| 实现 stats 命令 | 查 Langfuse API | ✅ v3: 改本地 jsonl，不依赖外网；v4 追加 `--html` dashboard |
+| 容器化沙箱 | bash_exec 放 Docker | ⬜ 没做。v4 加了 Permissions 多级缓解，Docker 仍是更硬的方案 |
+| 记忆压缩 | short_term 快满时摘要 | ✅ v2: ShortTermMemory.maybe_compress（doubao 摘要器）；v4 进阶到 compactor 二级压缩 + AutoCompactState |
+| Hybrid RAG | BM25 + 向量 + RRF | ⬜ **故意不做**。v3 调研后定位 `rag/` 为非代码场景；代码搜索走 agentic search |
+| AST 切 chunk | tree-sitter 替换按行切 | ✅ v3: rag/ast_chunker.py（stdlib `ast`，Python-only 场景够用）|
+
+读完这张表你已经隐约感觉到"读源码 → 调整方向"是这个项目的工作模式。**真正还想动手做的事**看末尾"进阶 D"末段的清单。
 
 ---
 
 ## 学完你会什么
+
+**v1 主体**：
 
 ✅ 能在白板上画出 Harness 四层架构图
 ✅ 能讲清 PydanticAI vs LangGraph 的选型 tradeoff
@@ -341,14 +355,24 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 ✅ 理解国内模型生态：DeepSeek / Qwen / Doubao 各自的定位
 ✅ 面试时能信手拿代码举例，而不是空谈概念
 
+**v2-v4 进阶（看完末尾进阶段后追加）**：
+
+✅ 能讲"代码搜索为啥不靠向量 RAG，靠 agentic search"（v3）
+✅ 能讲 OpenHarness 8 个核心子系统跟 CodeMesh 的对位（v3-v4）
+✅ 能讲 Memory 7 层架构 + L5 / L6 边界（v4）
+✅ 能讲 HTML 工件的"给人看 vs 给 agent 吃"边界（v4）
+✅ 能讲"thesis-driven 迭代"和"用户痛点驱动"的差异（v4 自我反思）
+
 ---
 
-## v2 / v3 进阶（在 v1 全部读完之后）
+## v2 / v3 / v4 进阶（在 v1 全部读完之后）
 
-> v1 是骨架；v2 / v3 把它做成"真能用"的肌肉。这两段大约 60 - 90 分钟读完，
-> 之后你就能讲完整的"我做了三轮迭代"故事，比"我跑通了一个 Agent demo"有信息量得多。
+> v1 是骨架；v2-v4 把它做成"真能用"的肌肉。整体 90-150 分钟。
+> 读完你能讲完整的"我做了四轮迭代 + 一次自我修正"故事，比"我跑通了一个 Agent demo"信息量大 10 倍。
+>
+> 子标题用"进阶 A/B/C/D"避免和阶段 0-9 编号冲突——它们和阶段 0-9 是平行段，不是延续。
 
-### 阶段 6（v2）—— 工程化补齐（30 分钟）
+### 进阶 A · v2 工程化补齐（30 分钟）
 
 **目标**：理解为什么"能跑通"和"工程化"之间还差很远。
 
@@ -359,10 +383,10 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 4. `execution/sandbox.py` 顶部的 rm 正则（commit `9f74e59`）—— 一个写测试时挖出的真 false-positive bug
 
 **面试故事**：
-> "v1 跑通整套四层后，对照评估反馈做 v2：补单测、加 Tool Registry、加 Glob/Grep/Edit。
+> "v1 跑通整套四层后做 v2：补单测、加 Tool Registry、加 Glob/Grep/Edit。
 >  写测试时挖出一个生产代码里跑了几个月的 sandbox 误伤 bug —— 这就是写测试的价值。"
 
-### 阶段 7（v3）—— 对齐 OpenHarness / Claude Code（45 分钟）
+### 进阶 B · v3 对齐 OpenHarness / Claude Code（45 分钟）
 
 **目标**：理解 Coding Agent 的工业事实标准——**为什么不用向量 RAG**、AST-LSP 怎么做、Skill 是什么。
 
@@ -370,7 +394,7 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 
 1. **`execution/tools.py` 的 `_rg_grep` / `_rg_glob_files`**
    流式读 stdout、超时控制、SIGTERM→2s→SIGKILL、退出码白名单 {0, 1, -15, -9}。
-   对照原型：`/tmp/openharness/src/openharness/tools/grep_tool.py`（363 行）。
+   对照原型：HKUDS/OpenHarness `src/openharness/tools/grep_tool.py`（363 行）。
 2. **`execution/lsp.py` 完整通读**
    stdlib `ast` 替代 pyright daemon。理解为什么单次任务 1-2 次查询不值得起 daemon。
 3. **`memory/long_term.py` 末尾单例 + `execution/tools.py` 的 `remember_fact / recall_facts / forget_fact`**
@@ -379,37 +403,112 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
    本地 JSONL 替代外网 Langfuse 的兜底设计。
 5. **`orchestration/hooks.py` 的 `HookEvent` 枚举 + `HookResult.block`**
    Claude Code 标准事件命名 + PreToolUse 短路拦截语义。
-6. **`feedback/token_budget.py`**
-   tiktoken + CJK 启发式 fallback。中英 4 倍 token 差的故事。
-7. **`rag/ast_chunker.py`**
-   为什么 stdlib `ast` 在 Python-only 场景下能替代 tree-sitter。
-8. **`orchestration/skills.py` + `.claude/skills/<name>/SKILL.md`**
-   Anthropic skill 格式怎么注入 Agent system prompt。
-9. **`orchestration/adapters/retry.py`**
-   20 行手写指数退避 + jitter；为什么不引 tenacity。
+6. **`feedback/token_budget.py`** —— tiktoken + CJK 启发式 fallback。中英 4 倍 token 差的故事。
+7. **`rag/ast_chunker.py`** —— 为什么 stdlib `ast` 在 Python-only 场景下能替代 tree-sitter。
+8. **`orchestration/skills.py` + `.claude/skills/<name>/SKILL.md`** —— Anthropic skill 格式怎么注入 Agent system prompt。
+9. **`orchestration/adapters/retry.py`** —— 20 行手写指数退避 + jitter；为什么不引 tenacity。
 
-**关键认知更新**（v3 的核心收获）：
+**关键认知（v3 必背）**：
 > "我**之前以为**做 RAG 就要 BM25 + 向量 + RRF（LangChain 那套）。读了 OpenHarness 源码才发现
 >  Coding Agent 业界事实标准不是这个——是 `grep + glob + AST-LSP + read` 的 agentic search，
 >  让模型自己决定查什么。原因：向量会陈旧、对函数名 / 错误码精确匹配差、要花钱建索引。
 >  我把 `rag/` 模块**保留作非代码场景**（文档、知识库），代码搜索完全走 agentic 路径。"
 
-**面试故事（v3 版）**：
-> "三轮迭代：v1 Initial commit；v2 补单测 + 工具集；v3 深挖 OpenHarness 源码做完整对齐：
->  ripgrep + Python fallback、AST-based LSP、Claude Code 标准 hook 事件、Anthropic skill 格式、
->  async 重试。结果是 11 个工具、200+ 单测、17 个有意义 commit、跟 OpenHarness 在 5 个核心子系统持平。
->  保持 5k 行规模而不是去追他们的 11.7k，是因为我的差异化定位是国内多模型 + ¥ 成本追踪——
->  那是港大那套学术开源不会做的事。"
+### 进阶 C · v4 收尾批 - 编排层完结（30 分钟）
 
-### 阶段 8 —— 怎么继续往下做
+**目标**：理解为什么 Plugins / Permissions / Reranker LLM 版 / 流式 retry 是"补完整套 Coding Agent"的必经之路。
 
-读 `DEVLOG.md` 顶部的"还没做的事"清单，按性价比挑一个动手：
-- Permissions 多级（替换正则黑名单）
-- Plugins 机制
-- 流式 retry（buffer-prefix）
-- MCP client minimal
+**读什么**：
 
-每做一个，写一段 DEVLOG，commit + push。这个项目的**叙事骨干**是 DEVLOG，不是 README。
+1. **`orchestration/permissions.py`** —— ALLOW / DENY / ASK 三级规则集 + 默认拦截 force-push / pip install / 系统路径写入
+2. **`orchestration/plugins.py`** —— `.claude/plugins/<name>/plugin.py` + `register(harness)`，可叠加 hooks/tools/skills/permissions
+3. **`orchestration/adapters/`** 流式 retry 的 buffer-prefix 思路
+4. **`rag/reranker.py`** —— 用 LLM 当 reranker 的 0 依赖方案
+5. **`tests/test_permissions.py` / `tests/test_plugins.py`** —— 看怎么测插件加载和权限拦截
+
+**关键认知（v4 中段）**：
+> "v3 末我列了'后续扩展方向'，包括 Permissions 和 Plugins。v4 把它们做了——这两块都是
+>  '把项目从单人工具变成可被插件扩展的 framework'的必经之路。Plugins 让用户能往项目里
+>  注入自定义逻辑而不改源码，是开源项目的标配。"
+
+### 进阶 D · v4 末段 - Memory 7 层 + dreaming + HTML 工件（60 分钟）
+
+**目标**：理解 Claude Code 7 层记忆架构、弄清 **L5 ≠ L6** 的边界，以及"thesis-driven 迭代"和"用户痛点驱动"的差异。
+
+**读什么**（按顺序）：
+
+1. **`feedback/compactor.py`** —— L2 microcompact + L4 full compaction
+   - 9 段模板 verbatim 抄自 Claude Code source map（2026-03-31 npm 误打包暴露）
+   - `AutoCompactState.consecutive_failures=3` 状态机：连续失败防止坏 LLM 反复浪费钱
+   - 字面常量对齐 OH / CC：`AUTOCOMPACT_BUFFER_TOKENS=13_000` 等
+
+2. **`memory/auto_extract.py`** —— L5 自动事实抽取
+   - 4 种类型：user / feedback / project / reference
+   - **Why / How 双段**强迫模型记因果 + 应用场景，不只是结论
+   - MEMORY.md 索引硬约束（s56=200 行 / j58=25000 字节，CC 同款）
+
+3. **`feedback/session_journal.py`** —— L5 叙事变体（旧名 dreamer）
+   - **5 门触发**：Enabled → Time(24h) → Scan(10min) → Sessions(≥5) → Lock；按成本递增 99% 调用早退出
+   - `.consolidate-lock` 文件 PID:timestamp 崩溃恢复
+
+4. **`feedback/dreamer.py`** —— L6 真 dreaming（重要：和 session_journal 不是同一回事）
+   - **4 阶段**：orientation → gather → consolidate → prune & index
+   - **L5 是"记新事"，L6 是"整理已记的事"** —— 这是 2026-05-09 晚发现命名错误后修正的 self-correction 故事
+
+5. **`feedback/render_html.py`** —— HTML 工件共享基建
+   - HtmlDoc wrapper + 暗色 CSS + 手写 SVG 原语（horizontal_bar / sparkline / pie）+ 文件滚动
+   - 零新 PyPI 依赖（全靠字符串模板和 inline SVG）
+
+6. **`feedback/stats_report.py` + `cli.py` 的 `--html` 分支** —— stats dashboard
+   - 跑 `codemesh stats --html` 看实际效果，比读代码直观
+
+7. **`feedback/diff_report.py` / `feedback/planner_timeline.py`**（选学）
+   - env 控制的可选钩子（`CODEMESH_HTML_DIFF` / `CODEMESH_HTML_PLAN`），默认关
+
+8. **`docs/architecture.html` + `docs/index.html`** —— 在浏览器里打开看
+   - 作为 README ASCII 架构图的对照——结构是不是真长这样
+
+**关键认知（v4 末必背）**：
+
+> **L5 ≠ L6**：L5（auto_extract / session_journal）是"记新事"——会话末把这次的事抽成结构化条目；
+> L6（dreamer）是"整理已记的事"——稀疏触发，4 阶段 consolidation 把零散记忆合并去重重建索引。
+> 我做这块时第一版把 L5 当成 dreaming 做了，发现错了之后改名 + 写真 L6——这个 self-correction
+> 故事比单纯说"我做了 dreaming"更可信。
+
+> **HTML 给"人"看，不给"agent"吃**：tool returns 必须保持字符串，否则会污染 token 经济、模型也消化不了。
+> 这是 thariqs 的 thesis 最容易被搞混的一条边界。
+
+**面试题自测（v4 版）**：
+
+- Q: 你说做了 dreaming，跑过几次实际生效？（陷阱题：诚实答"24h / 5 sessions 触发条件下，开发期没真触发；测试覆盖了所有路径，但生产数据缺失"）
+- Q: L5 和 L6 区别？为什么需要分两层？（背：记新事 vs 整理已记的事；分两层是为了不在每次 session 都跑昂贵的 consolidation）
+- Q: HTML 工件这块有什么是不能 HTML 化的？（agent 自己吃的 tool returns）
+- Q: AutoCompactState 的 `consecutive_failures=3` 是为啥？（坏 LLM 反复浪费钱；CC 同款值）
+- Q: 你怎么知道 9 段模板是 CC 同款？（2026-03-31 source map 泄漏后的 ground truth）
+
+### 进阶 E · v4 末段，怎么继续（且看且做）
+
+**v4 末没做的事**（按 ROI 排）：
+
+| 项 | 工程量 | 故事价值 | 建议 |
+|---|---|---|---|
+| MCP client minimal | 大 | 强 | 想做 demo / 上简历可加 |
+| Docker 沙箱 | 中 | 中（替代 Permissions 短板） | 有时间再做 |
+| 真正端到端 E2E 测试 | 中 | 中 | 推荐——补单元测试缺口 |
+| iframe srcdoc 嵌入真工件预览 | 小 | 小 | 可不做 |
+| LangGraph 重写 planner | 大 | 高（对照体验值） | 时间多再做 |
+
+**比加代码更重要的非代码项**（v4 末以后真正该做的）：
+
+- 录 5 分钟 demo 视频
+- 写公众号 / 知乎 walkthrough
+- README 头部加 `docs/architecture.html` 截图
+- 拿这份 LEARNING_PATH 做 mock 面试，把每个"为啥这么做"练熟
+
+每做一个，DEVLOG 顶部加一段，commit + push。**这个项目的叙事骨干是 DEVLOG，不是 README。**
+
+> ⚠ 重要：v4 后再加技术 feature 的边际收益已接近零——讲述能力（5 分钟讲清）才是当前真正的瓶颈。
+> 看到这条还想"再加一个 feature 让项目更牛"的话，停一下，去录视频。
 
 ---
 
