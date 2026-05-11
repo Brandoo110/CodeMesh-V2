@@ -3,10 +3,10 @@
 > 把你从"听说过 Agent"带到"在面试中能讲清 Harness 架构"的循序渐进指南。
 > 每个阶段给你：**要读的文件**、**要搞懂的概念**、**能回答的面试题**。
 
-预计总学习时长：**12–16 小时**（v4 末，含 dreaming / HTML 工件 / Memory 7 层进阶）。按阶段来，不要跳。
+预计总学习时长：**12.5–16.5 小时**（v4 末，含 dreaming / HTML 工件 / Memory 7 层 / ADR 讲述层进阶）。按阶段来，不要跳。
 
-> 路线总览：v1 主体（阶段 0-9，~8h）→ 进阶（阶段 10 + 末尾"v2/v3/v4 进阶"，~4-8h）。
-> 想拿这个项目去面试，**v1 主体 + 至少一段 v3 或 v4 进阶**是最低门槛。
+> 路线总览：v1 主体（阶段 0-9，~8h）→ 进阶（阶段 10 + 末尾"v2/v3/v4 进阶"，~4.5-8.5h，含 ADR 讲述层 30min）。
+> 想拿这个项目去面试，**v1 主体 + 至少一段 v3 或 v4 进阶 + 进阶 F（ADR 讲述层）**是最低门槛。
 
 ---
 
@@ -338,6 +338,7 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 | 记忆压缩 | short_term 快满时摘要 | ✅ v2: ShortTermMemory.maybe_compress（doubao 摘要器）；v4 进阶到 compactor 二级压缩 + AutoCompactState |
 | Hybrid RAG | BM25 + 向量 + RRF | ⬜ **故意不做**。v3 调研后定位 `rag/` 为非代码场景；代码搜索走 agentic search |
 | AST 切 chunk | tree-sitter 替换按行切 | ✅ v3: rag/ast_chunker.py（stdlib `ast`，Python-only 场景够用）|
+| 架构决策档案化 | v1 没规划 | ✅ v4 末: `docs/decisions/` 5 份 ADR；讲述层第一手素材（详见进阶 F）|
 
 读完这张表你已经隐约感觉到"读源码 → 调整方向"是这个项目的工作模式。**真正还想动手做的事**看末尾"进阶 D"末段的清单。
 
@@ -362,6 +363,7 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 ✅ 能讲 Memory 7 层架构 + L5 / L6 边界（v4）
 ✅ 能讲 HTML 工件的"给人看 vs 给 agent 吃"边界（v4）
 ✅ 能讲"thesis-driven 迭代"和"用户痛点驱动"的差异（v4 自我反思）
+✅ 能用 5 份 ADR 系统化讲述每个架构决策 + "诚实坏处"模板主动 disarm 面试反问（v4 末）
 
 ---
 
@@ -488,6 +490,9 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 
 ### 进阶 E · v4 末段，怎么继续（且看且做）
 
+> **第一手素材已经在手**：5 份 ADR（`docs/decisions/0001-0005`）覆盖了项目所有重大架构决策——
+> Mock 面试时不要硬背阶段题，而是按 ADR 的 Context / Decision / Consequences 顺序讲故事。详见 **进阶 F**。
+
 **v4 末没做的事**（按 ROI 排）：
 
 | 项 | 工程量 | 故事价值 | 建议 |
@@ -509,6 +514,73 @@ CodeMesh 路由是"输入任务 → 输出决策"的单轮强结构化，Pydanti
 
 > ⚠ 重要：v4 后再加技术 feature 的边际收益已接近零——讲述能力（5 分钟讲清）才是当前真正的瓶颈。
 > 看到这条还想"再加一个 feature 让项目更牛"的话，停一下，去录视频。
+
+### 进阶 F · ADR 作为讲述层引擎（30 分钟）
+
+**目标**：把 5 份 ADR（Architecture Decision Records，`docs/decisions/`）当作讲述层第一手素材。Mock 面试时不要硬背阶段题，按 ADR 模板讲故事。
+
+**为什么 ADR 是讲述层引擎**：
+
+ADR 不是文档，是**项目的化石层**——每一份记录一个"为什么这样选"的决策时刻，按时间编号永不修改。
+DEVLOG 是流水账（5000 行），ADR 是脉络（5 份各 100-150 行）。
+面试时翻 DEVLOG 找重点 vs 直接打开 ADR 讲故事，差距巨大。
+
+**读什么**（按讲述价值降序）：
+
+1. **`docs/decisions/0001-agentic-search-over-rag.md`** —— v1→v2 最大架构 pivot
+   - Context 段把"为什么 v1 想用 RAG"写活
+   - Decision 段说清楚行业事实标准（OpenHarness / Cursor / Claude Code）
+   - Consequences 列了 **5 类向量 RAG 在代码场景的失败模式**——可背
+2. **`docs/decisions/0003-dreaming-4-stage-consolidation.md`** —— **诚实段的标杆**
+   - 主动写"开发期没真触发 / 18 单测全 mock / 生产价值未验证"
+   - 主动 disarm "你跑过几次"这道陷阱题
+3. **`docs/decisions/0005-domestic-multi-model.md`** —— **诚实段标杆 2**
+   - 主动写"不是合规方案，是个人开发者便利封装；境外公网调境内服务器，非私有部署"
+   - 主动 disarm "如何合规"这道追问题
+4. **`docs/decisions/0002-html-for-humans-not-agents.md`** —— v4 边界设计
+   - "tool returns 必须保持字符串" 这条铁律的完整论证
+5. **`docs/decisions/0004-memory-7-layer-architecture.md`** —— L5/L6 分离写在代码强约束里
+
+**ADR 模板 5 个 section（必背）**：
+
+| Section | 干啥 |
+|---|---|
+| Status | Proposed / Accepted / Deprecated / Superseded by NNNN |
+| Context | 当时面临什么情况——不讲技术讲约束 |
+| Decision | 最终选了什么 |
+| Consequences | 好处 + **坏处（必须有）** + Mitigation |
+| 参考 | 链接 / 相关 ADR / 源码位置 |
+
+**"诚实坏处"是 ADR 的灵魂**——marketing 文档只列好处，ADR 必须写坏处 + mitigation。这是面试时"主动 disarm 反问"的关键技术。
+
+**怎么用 ADR 做 mock 面试**（5 套 talking points）：
+
+| 面试问题 | 对应 ADR | 讲法 |
+|---|---|---|
+| "为什么不用 RAG？" | 0001 | Context → Decision → Consequences 一气呵成 |
+| "dreaming 跑过几次？" | 0003 | 直接念"诚实坏处"段；"开发期没真触发，逻辑用 mock 验证" |
+| "国内多模型合规吗？" | 0005 | 念"不是合规方案，是便利封装"诚实段 |
+| "HTML 工件不会污染 agent 吗？" | 0002 | 念"tool returns 永远是字符串"铁律 |
+| "Memory 为什么 7 层？" | 0004 | 念 L5/L6 分离 + 复刻 Claude Code 内部 |
+
+**关键认知（必背）**：
+
+> "ADR 是讲述层引擎——每份是一个独立故事的脚本。面试官问 X，我打开 docs/decisions/NNNN 念。
+>  特别是 0003 / 0005 我主动写了'诚实坏处'段——把面试官最可能挖的坑自己挖了埋了。
+>  这是工程纪律：marketing 文档堆好处，ADR 必须有坏处 + mitigation。"
+
+**面试题自测（ADR 版）**：
+
+- Q: 你这个项目有架构决策记录吗？（答"5 份在 `docs/decisions/`"，比说"在 DEVLOG 里"专业 10 倍）
+- Q: ADR 和普通文档区别？（ADR 不修改，反悔写新的 Superseded 旧的；编号永不重用）
+- Q: 选 ADR 体系是出于什么考虑？（项目跑久了"为什么这样选"会忘——ADR 把决策时刻凝固成档案）
+- Q: 给我讲个你最得意的架构决策？（直接打开 0001 念 Context 段）
+
+**下一步可做的 ADR**（按讲述价值排，**讲述层先做完再考虑**）：
+
+- ADR-0006 候选：edit_file 工具的"字符串替换 over diff"选择
+- ADR-0007 候选：测试不依赖 pytest 用裸 Python `if __name__ == "__main__"` 跑法
+- ADR-0008 候选：commit author override 而不是改全局 .gitconfig
 
 ---
 
