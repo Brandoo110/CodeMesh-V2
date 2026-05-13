@@ -108,16 +108,139 @@ eabd304 feat(web): Phase 1 - backend API skeleton (models / chat / sessions)
 > 关键设计权衡：Harness.run 接受 `task: str` 不是 messages 数组，所以请求 payload 简化成 task + session_id。
 > 这是边写边发现 vs 设计阶段拍头的差异——设计文档写完后实际 surface 出来，及时收窄 scope。"
 
-### 十、还没做
+### 十、还没做（Phase 0-1 节点）
+
+> Phase 2 已完成，见下面的"十一、Phase 2 追加段"。
 
 | 项 | Phase | 说明 |
 |---|---|---|
-| 前端 UI 主页 + 消息组件 | 2 | shadcn/ui 初始化 + ChatView + MessageBubble + ToolCallCard |
+| ~~前端 UI 主页 + 消息组件~~ | 2 | ✅ 已完成 |
 | SSE 流式输出 | 3 | `/api/chat/stream` 接 `harness.run_stream` + EventSourceResponse |
 | Stats dashboard 嵌入 | 4 | iframe 嵌入 `stats_report.render_stats_dashboard` HTML |
 | 历史会话 Sidebar | 5 | SQLite 持久化 + Sidebar 历史列表 + only-read 详情视图 |
 
-下一步立刻做 **Phase 2 前端主页**（3-4h），它是 MVP 最后能产出可视化 demo 的关键。
+### 十一、Phase 2 追加段 — 前端对话 UI（commit `bf29f68`）
+
+#### 11.1 设计目标 "Claude 简洁风"
+
+参考 claude.ai：极简留白 / 暗色优先 / Anthropic 橙做点缀 / 等宽代码字体 / 键盘优先。
+
+#### 11.2 三个关键决策（karpathy 视角）
+
+1. **不装 shadcn/ui**（方案 §5.1 写了，实际放弃）—— Phase 2 只需要 6 个简单组件，shadcn 30+ 文件用不到 90%；且 Tailwind 4 + Next 16 + React 19 兼容性还在演进。**简洁 ≠ 自己造轮子；装库 ≠ 必然简洁**
+2. **messages 不入全局 Zustand store**，留在 ChatView 本地 `useState` —— Phase 3 流式输出每秒 30-50 token 会引爆全局重渲染，本地 state + React 自动 batching 解决
+3. **Pending → Replace 模式** —— 用户发消息先 push pending placeholder，await 结果后 replace 真实内容；错误时 replace 为 error variant。同一套代码 Phase 3 流式输出复用（pending=true 时 content 逐 token 追加）
+
+#### 11.3 视觉设计（对照方案 §2.1）
+
+```css
+/* 三档背景层级 */
+--color-canvas:         #1a1a1a   /* 主背景 */
+--color-surface:        #232323   /* 侧栏 / 气泡 */
+--color-surface-hover:  #2d2d2d   /* hover / focus */
+
+/* 三档文字层级 */
+--color-fg:             #ececec
+--color-fg-muted:       #a0a0a0
+--color-fg-subtle:      #6e6e6e
+
+/* 品牌色 */
+--color-accent:         #cc785c   /* Anthropic 橙 */
+--color-error:          #f87171
+
+/* 模型品牌色（对齐 feedback/render_html.py MODEL_COLORS）*/
+--color-model-deepseek: #5b8def
+--color-model-qwen:     #7c3aed
+--color-model-doubao:   #ef4444
+--color-model-gemini:   #10b981
+```
+
+Tailwind 4 用 `@theme inline` 注册自定义颜色 token：`bg-canvas / text-fg / border-border` 自动生成。
+
+#### 11.4 文件清单（Phase 2 新增）
+
+```
+frontend/components/        6 个 client components
+├── Sidebar.tsx              55 行 (240px / "Phase 5 启用" 占位)
+├── TopBar.tsx               43 行 (56px / Cmd+\\ toggle)
+├── ModelSelector.tsx        99 行 (自写 dropdown + configured 状态)
+├── ChatView.tsx            128 行 (Pending → Replace + auto scroll)
+├── MessageBubble.tsx        97 行 (4 种 role + react-markdown + GFM + meta 行)
+└── InputBar.tsx             74 行 (auto-grow textarea + Cmd+Enter)
+
+frontend/lib/               3 个 utility
+├── types.ts                 60 行 (前后端类型对齐)
+├── api.ts                   73 行 (fetch wrapper + ApiError class)
+└── store.ts                 37 行 (Zustand: models/selectedModel/sidebarOpen)
+```
+
+修改 `frontend/app/globals.css`（默认 27 行 → 106 行）+ `layout.tsx` + `page.tsx`。
+
+#### 11.5 验证
+
+- `pnpm tsc --noEmit` 类型零错误 ✅
+- `pnpm dev` Next.js 16 Turbopack 329ms 启动 ✅
+- `GET / 200 in 272ms` ✅
+
+#### 11.6 数据流（一次发消息完整链）
+
+```
+InputBar 输入 + Cmd+Enter
+    │
+    ▼ onSend(trimmed)
+ChatView.handleSend:
+  - push userMsg + pendingMsg (id: pendingId, pending: true)
+  - setSending(true)
+  - await sendChat({ task, model })
+    │
+    ▼ POST /api/chat
+FastAPI chat.py:
+  - Pydantic 验证 ChatRequest
+  - Depends(get_harness)
+  - await harness.run(task)
+    │
+    ▼ harness.run:
+  - router decide → adapter.complete (LLM)
+  - return answer
+    │
+    ▼ ChatResponse + duration_ms + cost_rmb
+ChatView.handleSend continue:
+  - setMessages(map: replace pendingId with real content)
+  - setSending(false)
+    │
+    ▼
+MessageBubble re-render:
+  - pending=false → react-markdown
+  - meta 行: "0.85s · ¥0.0034 · DeepSeek V4 Pro"
+    │
+    ▼
+useEffect → scrollTo bottom
+```
+
+错误路径：catch ApiError → replace pendingId with `role: "error"`, content = msg → MessageBubble error variant（红边卡片）。
+
+#### 11.7 commit
+
+```
+bf29f68 feat(web): Phase 2 - frontend chat UI (Claude-style dark theme)
+```
+
+14 files / +1711 / -77。
+
+#### 11.8 还没做（Phase 3-5）
+
+| Phase | 前端要加 |
+|---|---|
+| 3 | EventSource / SSE 消费 + token 追加 / ToolCallCard / PlannerTimeline / Shiki 代码高亮 |
+| 4 | StatsView iframe + 日期范围选择器 |
+| 5 | 历史 sidebar 真接 / TanStack Query 加缓存 |
+
+完成 Phase 5 = MVP 关闭，merge `feature/web-ui` 到 main。
+
+#### 11.9 详细学习笔记
+
+- Backend 笔记：`~/obsidian/Brain/Projects/CodeMesh/web-ui-backend-notes.md`（≈600 行）
+- Frontend 笔记：`~/obsidian/Brain/Projects/CodeMesh/web-ui-frontend-notes.md`（≈700 行）
 
 ---
 
