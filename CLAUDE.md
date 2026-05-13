@@ -31,29 +31,19 @@ CodeMesh 是 **面试 / 学习项目**，不是上线产品。这条决定了所
 
 ## Devlog 必更
 
-每完成一个**带 commit 的实质改动**（不是 typo），就在 `DEVLOG.md` **顶部**插入新段：
+**开发日志写到 Obsidian**（2026-05-14 起，项目仓库内 `DEVLOG.md` 已删除，避免双写）：
 
-```
-## YYYY-MM-DD — 一句话标题
+- 路径：`~/obsidian/Brain/Projects/CodeMesh/devlog.md`
+- 最新日期在顶部
+- 每完成一个**带 commit 的实质改动**就插入新段
 
-### 背景
-为什么改？解决什么？
+格式保留四块：背景 / 改动 / Commit 范围 / 还没做（面试故事可选）。
 
-### 改动
-1. 文件 X：做了 Y
-2. 文件 Z：做了 W
+详细技术笔记按主题拆到独立文件：
 
-### Commit 范围
-git log --oneline <prev>..HEAD
-
-### 面试故事
-"我做了什么、tradeoff 是什么、参考了哪些开源项目"
-
-### 还没做
-列下一步可做的事
-```
-
-格式不强求，但**这四块得有**。
+- `Projects/CodeMesh/web-ui-backend-notes.md`
+- `Projects/CodeMesh/web-ui-frontend-notes.md`
+- 未来加新主题时新建独立 md，不堆 devlog
 
 ---
 
