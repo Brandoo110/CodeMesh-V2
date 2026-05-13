@@ -11,7 +11,7 @@
 
 ## 0. 技术栈（已拍板）
 
-经 review，技术栈拍板：**方案 A — FastAPI + Next.js 15 + shadcn/ui + Tailwind**。
+经 review，技术栈拍板：**方案 A — FastAPI + Next.js 15+ + shadcn/ui + Tailwind**。
 
 ```
 浏览器（Next.js + shadcn/ui）
@@ -471,7 +471,7 @@ async def chat_stream(req: ChatRequest):
 
 | | 选型 | 理由 |
 |---|---|---|
-| 框架 | Next.js 15 (app router) | 文件路由 + RSC + 内置 dev server |
+| 框架 | Next.js 15+ (app router，实际装 16.x) | 文件路由 + RSC + 内置 dev server |
 | UI 库 | shadcn/ui | Claude 风格的等价开源；复制即用，可改样式 |
 | CSS | Tailwind CSS | shadcn/ui 默认依赖 |
 | 状态 | Zustand | 比 Redux 轻 100 倍，对话级状态足够 |
@@ -600,14 +600,24 @@ async def chat_stream(req: ChatRequest):
 
 > 每个 Phase 有可验证 demo。完成才进下一个。**MVP = Phase 0-5（已拍板范围）**。Phase 6-8 为可选扩展。
 
-### Phase 0：环境准备（30 min）
+### Phase 0：环境准备（30 min） ✅ 2026-05-14 完成
 
-- [ ] 创建 `web/` Python 目录 + `frontend/` Next.js 项目
-- [ ] 安装依赖：`fastapi[all]` `sse-starlette` `uvicorn` / `next` `react` `tailwindcss` `shadcn-ui`
-- [ ] 配置 `pyproject.toml` 加 `web` extras：`pip install -e .[web]`
-- [ ] frontend `pnpm install` + 初始化 shadcn/ui
+- [x] 创建 `web/` Python 包（`__init__.py` / `server.py` / `routes/health.py`）
+- [x] 创建 `frontend/` Next.js 16.2.6 项目（TypeScript + Tailwind + App Router）
+- [x] pyproject.toml 加 `[web]` extras：fastapi / uvicorn / sse-starlette
+- [x] 装好依赖：`pip install -e ".[web]"` ✅
+- [x] FastAPI `/api/health` smoke test 通过（200 + 正确 JSON）
+- [ ] shadcn/ui 初始化（推迟到 Phase 2 用到时再装）
 
-**Demo**：`pnpm dev` + `uvicorn codemesh.web.server:app` 双起来，浏览器看到 Next.js 默认页 + curl 后端 200。
+**Python interpreter 注意事项**：
+用户机器 `python3 = /usr/local/bin/python3`（系统）但 `pip = miniconda`。
+后端命令一律用 **miniconda python**：
+```bash
+/Users/junjieli/miniconda3/bin/python3 -m uvicorn web.server:app --reload --port 8000
+```
+或在 shell 里 `alias py=/Users/junjieli/miniconda3/bin/python3`。
+
+**Demo**：`pnpm dev` + `uvicorn web.server:app` 双起来 → 浏览器看 Next.js 默认页 + curl 后端 `/api/health` 返回 `{"status": "ok"}`。
 
 ### Phase 1：后端 API 骨架（2-3h）
 
@@ -745,7 +755,7 @@ async def chat_stream(req: ChatRequest):
 | 工具调用 output 巨大（read_file 一个 10000 行文件） | 浏览器卡 | 后端截断 + 加"完整文件下载"链接 |
 | 历史对话越攒越大 SQLite 慢 | 后期搜索慢 | MVP 不做搜索；后期加 FTS5 |
 | Streaming 中关闭浏览器 tab，模型还在跑 | 浪费 API 调用 | 后端绑定 session_id，cancel 路由 `DELETE /api/chat/{session_id}` |
-| Next.js 15 RSC 和 SSE 配合的坑 | 学习曲线 | SSE 用 client component；RSC 只做静态 layout |
+| Next.js 15+ RSC 和 SSE 配合的坑 | 学习曲线 | SSE 用 client component；RSC 只做静态 layout |
 | 单人项目维护 frontend deps 太重 | npm audit / dependabot 噪音 | 锁定 Next.js / shadcn 主版本，季度更新 |
 
 ---
