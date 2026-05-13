@@ -34,7 +34,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from web import __version__
-from web.routes import chat, health, models, sessions
+from web.routes import chat, health, models, sessions, stats
 
 
 def create_app() -> FastAPI:
@@ -68,6 +68,7 @@ def create_app() -> FastAPI:
     app.include_router(models.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
     app.include_router(sessions.router, prefix="/api")
+    app.include_router(stats.router, prefix="/api")
 
     return app
 

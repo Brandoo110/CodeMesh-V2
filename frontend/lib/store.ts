@@ -14,6 +14,8 @@
 import { create } from "zustand";
 import type { ModelInfo } from "./types";
 
+export type View = "chat" | "stats";
+
 interface StoreState {
   // 模型
   models: ModelInfo[];
@@ -24,6 +26,10 @@ interface StoreState {
   // UI
   sidebarOpen: boolean;
   toggleSidebar: () => void;
+
+  // View 切换（Phase 4）
+  view: View;
+  setView: (v: View) => void;
 }
 
 export const useStore = create<StoreState>((set) => ({
@@ -34,4 +40,7 @@ export const useStore = create<StoreState>((set) => ({
 
   sidebarOpen: true,
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
+
+  view: "chat",
+  setView: (v) => set({ view: v }),
 }));
