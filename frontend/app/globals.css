@@ -1,26 +1,106 @@
 @import "tailwindcss";
 
+/*
+ * CodeMesh Web UI — 暗色主题 token
+ *
+ * 设计语言对照 docs/ui-design-plan.md §2.1：
+ * - 暗色优先（更适合阅读代码）
+ * - Anthropic 橙色 #cc785c 做点缀
+ * - 模型品牌色对齐 feedback/render_html.py MODEL_COLORS
+ *
+ * Tailwind 4 用 @theme inline + --color-<name> 注册自定义色
+ * 类名规则：--color-foo → bg-foo / text-foo / border-foo
+ */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* 主体背景层级 */
+  --color-canvas:         #1a1a1a;
+  --color-surface:        #232323;
+  --color-surface-hover:  #2d2d2d;
+  --color-border:         #333333;
+
+  /* 文字层级 */
+  --color-fg:             #ececec;
+  --color-fg-muted:       #a0a0a0;
+  --color-fg-subtle:      #6e6e6e;
+
+  /* 品牌色 + 状态色 */
+  --color-accent:         #cc785c;
+  --color-accent-hover:   #d68b73;
+  --color-success:        #4ade80;
+  --color-error:          #f87171;
+  --color-warning:        #fbbf24;
+
+  /* 模型品牌色（对齐 feedback/render_html.py MODEL_COLORS） */
+  --color-model-deepseek: #5b8def;
+  --color-model-qwen:     #7c3aed;
+  --color-model-doubao:   #ef4444;
+  --color-model-gemini:   #10b981;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  /* 暴露给 Tailwind 让 bg-canvas / text-fg 等类名生效 */
+  --color-canvas:         var(--color-canvas);
+  --color-surface:        var(--color-surface);
+  --color-surface-hover:  var(--color-surface-hover);
+  --color-border:         var(--color-border);
+  --color-fg:             var(--color-fg);
+  --color-fg-muted:       var(--color-fg-muted);
+  --color-fg-subtle:      var(--color-fg-subtle);
+  --color-accent:         var(--color-accent);
+  --color-accent-hover:   var(--color-accent-hover);
+  --color-success:        var(--color-success);
+  --color-error:          var(--color-error);
+  --color-warning:        var(--color-warning);
+  --color-model-deepseek: var(--color-model-deepseek);
+  --color-model-qwen:     var(--color-model-qwen);
+  --color-model-doubao:   var(--color-model-doubao);
+  --color-model-gemini:   var(--color-model-gemini);
+
+  /* 字体（Next.js next/font 注入的 CSS var） */
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+body {
+  background: var(--color-canvas);
+  color: var(--color-fg);
+  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 8px grid 基准 */
+  font-size: 15px;
+  line-height: 1.6;
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* 选中文字颜色 */
+::selection {
+  background: var(--color-accent);
+  color: var(--color-canvas);
 }
+
+/* 滚动条暗色（仅 webkit） */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-surface-hover); }
+
+/* Markdown 内的代码块基础样式（Phase 3 加 Shiki 高亮） */
+.prose-msg pre {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 12px;
+  overflow-x: auto;
+  font-family: var(--font-mono), "JetBrains Mono", Consolas, monospace;
+  font-size: 13px;
+}
+.prose-msg code:not(pre code) {
+  background: var(--color-surface);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--font-mono), "JetBrains Mono", Consolas, monospace;
+  font-size: 13px;
+}
+.prose-msg p { margin: 0.5em 0; }
+.prose-msg ul, .prose-msg ol { margin: 0.5em 0; padding-left: 1.5em; }
+.prose-msg h1, .prose-msg h2, .prose-msg h3 { margin: 0.8em 0 0.4em; font-weight: 600; }
+.prose-msg a { color: var(--color-accent); text-decoration: underline; }
