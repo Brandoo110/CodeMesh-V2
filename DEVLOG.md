@@ -5,6 +5,122 @@ CodeMesh 开发日志。从 main 拉出来后所有的改动按时间顺序记�
 
 ---
 
+## 2026-05-14 — Web UI Phase 0-1：FastAPI + Next.js 骨架 + 后端 API（3 endpoints）
+
+> 分支：`feature/web-ui`（新开）
+> 灵感与边界：CLI 已经覆盖全部能力，UI 比 CLI 强的就 3 处——**流式可视化 / 历史浏览 / Stats dashboard 嵌入**。
+> 关联 ADR：**ADR-0006**（FastAPI + Next.js 拒 NestJS）
+
+### 一、背景
+
+v4 末项目反思后定下"功能层冻结，启动讲述层"。但 CLI demo 不够直观——录视频时一片黑白终端文字。需要一个 Web UI 把流式输出 / 工具调用 timeline / planner 步骤可视化。
+
+用户初问"技术用 NestJS"——但 NestJS 是 Node 后端框架不能直接做 UI；按 karpathy "Think Before Coding"surface 歧义 + 给 3 个栈方案对比（A: FastAPI+Next.js / B: NestJS+FastAPI+Next.js / C: NestJS spawn Python）后用户确认是 Next.js 口误，拍板方案 A。
+
+### 二、设计文档与 ADR
+
+1. `docs/ui-design-plan.md`（≈800 行 / 12 章节）：完整设计——视觉（暗/亮 hex / 字体 / 8px grid）/ 布局（Sidebar 240px + Top bar + Chat/Stats/History 三视图）/ 后端 API spec / 前端架构 / 9 个 Phase 实施计划 / 7 个风险 mitigation
+2. `docs/decisions/0006-web-ui-stack-fastapi-nextjs.md`：完整 ADR——3 个栈方案评估 + 4 条诚实坏处 + Mitigation
+3. CLAUDE.md ADR 列表加 0006
+
+### 三、技术栈
+
+| 层 | 选型 | 版本 |
+|---|---|---|
+| Python 环境 | 项目专属 venv（PEP 405） | Python 3.14.3 |
+| 后端 | FastAPI + sse-starlette + uvicorn[standard] | fastapi 0.136 |
+| 前端 | Next.js + TypeScript + Tailwind + App Router | Next.js 16.2.6 |
+| 包管理（前） | pnpm | 10.33 |
+| 构建脚本 | Makefile（6 个 targets） | — |
+
+**为什么 venv 不 conda**：CodeMesh 是纯 Python，不需要 conda 的 CUDA/GPU/多版本能力。conda env 留给学校 ML 课作业。
+
+### 四、Phase 0 — 环境准备（commit `05a9afc` + `c74d07f`）
+
+- `pyproject.toml` 加 `[web]` extras（fastapi / sse-starlette / uvicorn[standard]）
+- `web/` Python 包骨架：`__init__.py` / `server.py`（FastAPI factory + CORS for localhost:3000）/ `routes/health.py`
+- `frontend/` Next.js 创建（TypeScript / Tailwind / App Router / pnpm）
+- 项目专属 `.venv/` 创建（`/usr/local/bin/python3` = Python 3.14.3）
+- 清理 miniconda base 误装的 codemesh + sse-starlette
+- 新 `Makefile`：`venv` / `install` / `ui-backend` / `ui-frontend` / `test` / `clean` + help
+- **Demo 通过**：`make ui-backend` + `curl http://localhost:8000/api/health` → 200 + 正确 JSON；浏览器看到 Next.js 默认页
+
+### 五、Phase 1 — 后端 API 骨架（commit `eabd304`）
+
+3 个端点 + Harness DI + 15 个测试：
+
+**Routes**：
+
+- `GET /api/models` — 列 4 个模型 + configured-key 检测 + 品牌色（颜色对齐 `feedback/render_html.py` MODEL_COLORS）
+- `POST /api/chat` — **非流式**：`req.task: str` → `await harness.run(task)` → 聚合 `harness.last_costs` 推断模型 + 总成本。Phase 3 会加 `/api/chat/stream` SSE
+- `POST/GET/DELETE /api/sessions[/{id}]` — CRUD **内存占位**（_SESSIONS dict）。Phase 5 改 SQLite 复用 `memory/long_term.py`
+
+**Infrastructure**：
+
+- `web/schemas.py` — Pydantic ChatRequest/Response / ModelInfo / SessionInfo（自动 OpenAPI doc at `/docs`）
+- `web/deps.py` — `get_harness()` lru_cache 单例 + `is_configured()` env var 校验（长度 >= 20，和 `harness._get_adapter._valid()` 同源）
+- `web/server.py` — 4 个 router include 注册
+
+**Tests**（15/15 pass，跑 < 20ms）：
+
+- `tests/test_web/test_models.py` — 3 tests（4 个模型 / 字段完整 / hex color + bool configured）
+- `tests/test_web/test_chat.py` — 6 tests（mock harness via `app.dependency_overrides`）
+- `tests/test_web/test_sessions.py` — 6 tests（完整 CRUD + 404 路径）
+
+**铁律遵守**：所有测试用 AsyncMock + dep override，零真实 API 调用（CodeMesh CLAUDE.md 测试规则）。
+
+### 六、关键设计决策（边走边补）
+
+| 决策 | 原因 |
+|------|------|
+| `ChatRequest` 是 `task: str` 而非 `messages: []` | Harness.run 接受单个 task；short_term 内部维护历史。方案 §4.2 初稿写的 messages 数组改成 task |
+| Harness 全局单例（lru_cache） | localhost 单用户场景（ADR-0006），共享 memory 7 层。多用户需要 Phase 5 重构 |
+| Sessions Phase 1 内存占位 | 让前端能马上接入 sidebar 不卡在持久化设计 |
+| 测试用 `dependency_overrides` 而非 monkeypatch | FastAPI 官方推荐；每个测试 tearDown 自动清理，无污染 |
+
+### 七、踩坑
+
+1. **Python 多版本混乱**：用户机器 `python3 --version` = 3.11.2 但 `/usr/local/bin/python3 -m venv` 实际是 3.14.3——同一 mac 有 framework 3.11 / brew 3.14 共存。**用 `.venv` 后无所谓 PATH 怎么变**
+2. **miniconda base 被污染**：第一次 `pip install -e .[web]` 装到了 miniconda base（pip 在 miniconda 但 python3 在系统）。已清理 + 切到 `.venv`
+3. **Next.js 装 latest 是 16 不是 15**：`pnpm create next-app --yes` 默认装 latest。方案文档把 `Next.js 15` 改成 `15+`
+4. **logfire-plugin import warning**：pydantic plugin 加载失败但不影响功能。已确认是 opentelemetry 版本不兼容，不影响 CodeMesh 主流程
+5. **pydantic-ai 0.0.14 → 1.95.0 隐式升级**：`pyproject.toml` 上界没锁。harness import 居然没 break，但这是 pip resolve 副作用。**候选 ADR-0007：依赖版本上界 pinning 策略**
+
+### 八、Commit 范围
+
+```
+67dec83 docs(web): finalize web UI design plan v1 and add ADR-0006
+05a9afc feat(web): Phase 0 - scaffold FastAPI backend and Next.js 16
+c74d07f chore(web): switch to project-local .venv (Python 3.14) and add Makefile
+eabd304 feat(web): Phase 1 - backend API skeleton (models / chat / sessions)
+```
+
+### 九、面试故事
+
+> "v4 末做完后我意识到讲述层是瓶颈，决定加 Web UI 但限定 MVP 范围 Phase 0-5（约 11.5h）。
+> 用户初问 NestJS——但 NestJS 是 Node 后端不能做 UI，我列了 3 个栈方案对比，包括完整诚实段，
+> 最后选 FastAPI（同进程复用 harness）+ Next.js + shadcn/ui，写成 ADR-0006。
+>
+> 工程纪律部分：项目专属 venv 隔离 / Makefile 命令统一 / Phase 1 后端 15 个测试全 mock 零真实 API。
+> 测试用 FastAPI 的 `dependency_overrides` 比 monkeypatch 干净——这是 v4 末又一个'读官方文档而非凭经验
+> 写'的小迭代。
+>
+> 关键设计权衡：Harness.run 接受 `task: str` 不是 messages 数组，所以请求 payload 简化成 task + session_id。
+> 这是边写边发现 vs 设计阶段拍头的差异——设计文档写完后实际 surface 出来，及时收窄 scope。"
+
+### 十、还没做
+
+| 项 | Phase | 说明 |
+|---|---|---|
+| 前端 UI 主页 + 消息组件 | 2 | shadcn/ui 初始化 + ChatView + MessageBubble + ToolCallCard |
+| SSE 流式输出 | 3 | `/api/chat/stream` 接 `harness.run_stream` + EventSourceResponse |
+| Stats dashboard 嵌入 | 4 | iframe 嵌入 `stats_report.render_stats_dashboard` HTML |
+| 历史会话 Sidebar | 5 | SQLite 持久化 + Sidebar 历史列表 + only-read 详情视图 |
+
+下一步立刻做 **Phase 2 前端主页**（3-4h），它是 MVP 最后能产出可视化 demo 的关键。
+
+---
+
 ## 2026-05-10 — HTML 工件渲染：把"给人看"的产物从 markdown 升级到自包含 HTML
 
 > 分支：`feature/html-artifacts`（新开）
