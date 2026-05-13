@@ -44,6 +44,20 @@ export interface SessionInfo {
 // ─────────────── 前端内部 ───────────────
 
 /**
+ * 工具调用（Phase 3）
+ *
+ * 后端 SSE 顺序：tool_start → ... → tool_end。
+ * 前端按 FIFO 配对（CodeMesh 不并发同名工具）。
+ */
+export interface ToolCall {
+  name: string;                        // "grep_text" / "read_file" / ...
+  args: Record<string, unknown>;
+  result?: string;                     // pending 时为 undefined
+  ok?: boolean;
+  status: "pending" | "ok" | "error";
+}
+
+/**
  * 单条消息（前端展示用）
  *
  * role 比后端多 system / error 两类，前端单独渲染。
@@ -52,6 +66,7 @@ export interface Message {
   id: string;          // 前端生成的 uuid
   role: "user" | "assistant" | "system" | "error";
   content: string;
+  toolCalls?: ToolCall[];  // assistant 走 agent loop 时累加
   model?: string;      // assistant 消息才有
   cost_rmb?: number;
   duration_ms?: number;

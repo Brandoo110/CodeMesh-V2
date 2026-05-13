@@ -14,9 +14,10 @@
  */
 
 import { useState, useEffect, useRef } from "react";
-import { sendChat, ApiError } from "@/lib/api";
+import { ApiError } from "@/lib/api";
+import { streamChat } from "@/lib/sse";
 import { useStore } from "@/lib/store";
-import type { Message } from "@/lib/types";
+import type { Message, ToolCall } from "@/lib/types";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
 
@@ -46,35 +47,112 @@ export function ChatView() {
       timestamp: Date.now(),
     };
     const pendingId = uuid();
+    const t0 = Date.now();
     const pendingMsg: Message = {
       id: pendingId,
       role: "assistant",
       content: "",
-      timestamp: Date.now(),
+      toolCalls: [],
+      timestamp: t0,
       pending: true,
     };
     setMessages((ms) => [...ms, userMsg, pendingMsg]);
     setSending(true);
 
     try {
-      const res = await sendChat({
-        task: text,
+      // SSE 流式消费：每个 event 增量更新 pending 消息
+      for await (const event of streamChat(text, {
         model: selectedModel || undefined,
-      });
-      setMessages((ms) =>
-        ms.map((m) =>
-          m.id === pendingId
-            ? {
-                ...m,
-                content: res.answer,
-                model: res.model,
-                duration_ms: res.duration_ms,
-                cost_rmb: res.cost_rmb,
-                pending: false,
-              }
-            : m,
-        ),
-      );
+      })) {
+        switch (event.event) {
+          case "token": {
+            const delta = String(event.data.delta || "");
+            setMessages((ms) =>
+              ms.map((m) =>
+                m.id === pendingId ? { ...m, content: m.content + delta } : m,
+              ),
+            );
+            break;
+          }
+          case "tool_start": {
+            const newTool: ToolCall = {
+              name: String(event.data.name || "unknown"),
+              args: (event.data.args as Record<string, unknown>) || {},
+              status: "pending",
+            };
+            setMessages((ms) =>
+              ms.map((m) =>
+                m.id === pendingId
+                  ? { ...m, toolCalls: [...(m.toolCalls || []), newTool] }
+                  : m,
+              ),
+            );
+            break;
+          }
+          case "tool_end": {
+            // FIFO 配对：找最近一个 pending 同名 tool 更新结果
+            setMessages((ms) =>
+              ms.map((m) => {
+                if (m.id !== pendingId) return m;
+                const tools = [...(m.toolCalls || [])];
+                const idx = tools.findIndex(
+                  (t) => t.name === event.data.name && t.status === "pending",
+                );
+                if (idx < 0) return m;
+                tools[idx] = {
+                  ...tools[idx],
+                  result: String(event.data.result || ""),
+                  ok: Boolean(event.data.ok),
+                  status: event.data.ok ? "ok" : "error",
+                };
+                return { ...m, toolCalls: tools };
+              }),
+            );
+            break;
+          }
+          case "usage": {
+            setMessages((ms) =>
+              ms.map((m) =>
+                m.id === pendingId
+                  ? {
+                      ...m,
+                      model: String(event.data.model || m.model || ""),
+                      cost_rmb: Number(event.data.cost_rmb || 0),
+                    }
+                  : m,
+              ),
+            );
+            break;
+          }
+          case "done": {
+            setMessages((ms) =>
+              ms.map((m) =>
+                m.id === pendingId
+                  ? { ...m, pending: false, duration_ms: Date.now() - t0 }
+                  : m,
+              ),
+            );
+            break;
+          }
+          case "error": {
+            const errMsg = String(event.data.message || "未知错误");
+            setMessages((ms) =>
+              ms.map((m) =>
+                m.id === pendingId
+                  ? {
+                      ...m,
+                      role: "error" as const,
+                      content: errMsg,
+                      pending: false,
+                      duration_ms: Date.now() - t0,
+                    }
+                  : m,
+              ),
+            );
+            break;
+          }
+        }
+      }
     } catch (e) {
       const msg =
         e instanceof ApiError

@@ -35,6 +35,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -61,6 +62,7 @@ from orchestration import (
     load_plugins,
 )
 from execution import set_skill_registry
+from orchestration.hooks import HookResult
 from orchestration.adapters import (
     DeepSeekAdapter,
     DashScopeAdapter,
@@ -624,6 +626,182 @@ class Harness:
         await self._maybe_journal(task, full)
         await self._maybe_extract_memories(task, full)
         await self._maybe_real_dream()
+
+    # ─────────────── 流式 + 结构化事件（Web UI Phase 3 / ADR-0006）───────────────
+
+    async def run_stream_full(self, task: str):
+        """
+        完整流式接口：yield 结构化字典事件。给 Web UI SSE 接 (web/routes/chat_stream.py)。
+
+        和 run_stream 的区别：
+          - run_stream: 只 simple 任务、yield 字符串 chunk、不带工具调用事件
+          - run_stream_full: simple + complex 都支持、yield dict events、含 tool_start/end
+
+        Event 协议：
+            {"type": "token",       "data": {"delta": "..."}}     流式 token（仅 simple）
+            {"type": "tool_start",  "data": {"name": "...", "args": {...}}}
+            {"type": "tool_end",    "data": {"name": "...", "result": "..."}}
+            {"type": "usage",       "data": {"prompt": int, "completion": int, "cost_rmb": float, "model": str}}
+            {"type": "done",        "data": {"answer": "..."}}    完整答案（complex 任务一次性给）
+            {"type": "error",       "data": {"message": "..."}}
+
+        实现思路（surgical，不改 execution/loop.py）：
+          - simple 任务: 走 adapter.complete_stream 流式 yield token，和 run_stream 一致
+          - complex 任务: asyncio.create_task(self.run(task)) 后台跑，主循环从 hooks 中转的
+            queue 消费 tool events，run 完成后 yield 完整答案（不流式，因为 agent loop 内部
+            非流式；要让 complex 也流式需要改 execution/loop.py 让 agent loop 成 generator）
+
+        hook 清理（hooks.py 没 unregister）：try/finally 直接从 _handlers list remove。
+        """
+        decision = await route(task)
+        print(
+            f"[router/stream] model={decision.model} "
+            f"complexity={decision.complexity} reason={decision.reason}"
+        )
+
+        try:
+            if decision.complexity == "simple":
+                async for ev in self._stream_simple(task, decision.model, decision.reason):
+                    yield ev
+            else:
+                async for ev in self._stream_complex(task, decision.model):
+                    yield ev
+        except Exception as e:
+            yield {"type": "error", "data": {"message": f"{type(e).__name__}: {e}"}}
+            return
+
+        yield {"type": "done", "data": {}}
+
+    async def _stream_simple(self, task: str, model_name: str, route_reason: str):
+        """Simple 任务流式：adapter.complete_stream 透出 token + 末尾 usage。"""
+        await self._ensure_long_term()
+        self.last_costs = []
+        self._current_task = task
+        self.observer.start_trace(task)
+        self.hooks.trigger(HookEvent.SESSION_START, task=task)
+        self.hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt=task)
+
+        adapter = self._get_adapter(model_name)
+        system = await self._build_system_with_context(task)
+        self.short_term.add("user", task)
+        await self._maybe_autocompact_short_term()
+
+        full_buf: list[str] = []
+        async for chunk in adapter.complete_stream(
+            messages=[{"role": "user", "content": task}],
+            system=system,
+        ):
+            full_buf.append(chunk)
+            yield {"type": "token", "data": {"delta": chunk}}
+
+        cost = self._record_cost(adapter)
+        full = "".join(full_buf)
+        self.short_term.add("assistant", full)
+        if self.enable_memory_compression:
+            await self.short_term.maybe_compress()
+
+        yield {
+            "type": "usage",
+            "data": {
+                "prompt": cost.tokens_in,
+                "completion": cost.tokens_out,
+                "cost_rmb": round(cost.cost_rmb, 4),
+                "model": adapter.name,
+            },
+        }
+
+        self.observer.log_llm_call(
+            model=adapter.name,
+            tokens_in=cost.tokens_in,
+            tokens_out=cost.tokens_out,
+            latency_ms=0,
+            route_reason=route_reason,
+        )
+        self.observer.end_trace(success=True, output=full)
+        self.hooks.trigger(HookEvent.STOP, task=task, output=full)
+        self.hooks.trigger(HookEvent.SESSION_END, success=True, task=task)
+        await self._maybe_journal(task, full)
+        await self._maybe_extract_memories(task, full)
+        await self._maybe_real_dream()
+
+    async def _stream_complex(self, task: str, model_name: str):
+        """
+        Complex 任务：跑 run() 同时 hook 中转 tool events。
+
+        实现：
+          1. 注册 PRE/POST_TOOL_USE callbacks 写入 internal asyncio.Queue
+          2. 启动 self.run(task) 作为后台 task
+          3. 主循环 wait_for(queue.get, timeout=0.1) 中转 events，直到 run 完成
+          4. run 完成后 yield 完整答案（一次性 token）+ usage
+          5. try/finally 清理 hook callbacks（手动 list.remove）
+        """
+        import asyncio
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def on_pre_tool(*, tool_name: str = "", args: Any = None, **_):
+            queue.put_nowait({
+                "type": "tool_start",
+                "data": {"name": tool_name, "args": args if isinstance(args, dict) else {}},
+            })
+            return HookResult.ok()
+
+        def on_post_tool(*, tool_name: str = "", result: str = "", **_):
+            # result 截断防爆（read_file 一个 10000 行文件会撑爆 SSE）
+            shown = result if len(result) < 2000 else result[:2000] + f"\n…[truncated, {len(result)} chars total]"
+            queue.put_nowait({
+                "type": "tool_end",
+                "data": {"name": tool_name, "result": shown, "ok": not result.startswith("[ERROR]")},
+            })
+            return HookResult.ok()
+
+        # 注册 + 记录引用方便清理
+        on_pre_tool.__name__ = "stream_full_pre"
+        on_post_tool.__name__ = "stream_full_post"
+        self.hooks.register(HookEvent.PRE_TOOL_USE, on_pre_tool)
+        self.hooks.register(HookEvent.POST_TOOL_USE, on_post_tool)
+
+        try:
+            run_task = asyncio.create_task(self.run(task))
+
+            # 边跑边中转 events
+            while not run_task.done():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.1)
+                    yield event
+                except asyncio.TimeoutError:
+                    continue
+
+            # 排空残留事件（防 final tool 没及时出队）
+            while not queue.empty():
+                yield queue.get_nowait()
+
+            # 拿完整结果
+            answer = await run_task
+            yield {"type": "token", "data": {"delta": answer}}
+
+            total_cost = sum(getattr(c, "cost_rmb", 0.0) for c in (self.last_costs or []))
+            total_in = sum(getattr(c, "tokens_in", 0) for c in (self.last_costs or []))
+            total_out = sum(getattr(c, "tokens_out", 0) for c in (self.last_costs or []))
+            yield {
+                "type": "usage",
+                "data": {
+                    "prompt": total_in,
+                    "completion": total_out,
+                    "cost_rmb": round(total_cost, 4),
+                    "model": model_name,
+                },
+            }
+        finally:
+            # hooks.py 没 unregister 方法 —— 直接从 _handlers list remove
+            try:
+                self.hooks._handlers[HookEvent.PRE_TOOL_USE].remove(on_pre_tool)
+            except ValueError:
+                pass
+            try:
+                self.hooks._handlers[HookEvent.POST_TOOL_USE].remove(on_post_tool)
+            except ValueError:
+                pass
 
     # ─────────────── 并发对比 ───────────────
 

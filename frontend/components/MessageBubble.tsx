@@ -15,6 +15,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useStore } from "@/lib/store";
 import type { Message } from "@/lib/types";
+import { ToolCallCard } from "./ToolCallCard";
 
 interface Props {
   message: Message;
@@ -66,19 +67,34 @@ export function MessageBubble({ message }: Props) {
         title={model?.name || message.model || "auto"}
       />
       <div className="flex-1 min-w-0">
-        {message.pending ? (
+        {/* 工具调用卡片在文本之前显示（先调用工具再回答）*/}
+        {message.toolCalls && message.toolCalls.length > 0 && (
+          <div className="mb-3">
+            {message.toolCalls.map((t, i) => (
+              <ToolCallCard key={i} tool={t} />
+            ))}
+          </div>
+        )}
+
+        {/* 内容 + pending 状态 */}
+        {message.pending && !message.content && (!message.toolCalls || message.toolCalls.length === 0) ? (
           <div className="text-fg-muted text-sm italic flex items-center gap-2">
             <span className="inline-block w-2 h-2 rounded-full bg-fg-muted animate-pulse" />
             <span>思考中...</span>
           </div>
         ) : (
           <>
-            <div className="prose-msg text-fg">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {message.content}
-              </ReactMarkdown>
-            </div>
-            {(message.duration_ms !== undefined || message.cost_rmb !== undefined) && (
+            {message.content && (
+              <div className="prose-msg text-fg">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {message.content}
+                </ReactMarkdown>
+                {message.pending && (
+                  <span className="inline-block w-2 h-4 ml-0.5 bg-fg animate-pulse align-middle" />
+                )}
+              </div>
+            )}
+            {!message.pending && (message.duration_ms !== undefined || message.cost_rmb !== undefined) && (
               <div className="mt-2 text-xs text-fg-subtle flex items-center gap-3">
                 {message.duration_ms !== undefined && (
                   <span>{(message.duration_ms / 1000).toFixed(2)}s</span>
