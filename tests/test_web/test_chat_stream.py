@@ -40,10 +40,17 @@ class TestChatStreamEndpoint(unittest.TestCase):
         app.dependency_overrides.clear()
 
     def _inject_stream(self, events):
+        class FakeShortTerm:
+            def clear(self):
+                pass
+            def add(self, role, content):
+                pass
+
         class FakeHarness:
             pass
         fake = FakeHarness()
         fake.run_stream_full = make_fake_stream(events)
+        fake.short_term = FakeShortTerm()  # chat_stream ephemeral 路径会 .clear()
         app.dependency_overrides[get_harness] = lambda: fake
 
     def test_stream_yields_token_and_done(self):

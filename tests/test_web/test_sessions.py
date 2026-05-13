@@ -1,38 +1,52 @@
 """
-Sessions CRUD 单测（Phase 1 内存版）。
+Sessions CRUD 单测（Phase 5：真接 SQLite）。
 
-测点：
-  1. POST 创建返回 uuid4 + title 正确回传
-  2. GET 列表按 updated_at 倒序
-  3. GET 单个不存在 → 404
-  4. DELETE 后 GET 应 404
+策略：
+  每个测试 setUp 用 tempfile 建临时 db，dependency_overrides 注入测试 store。
+  tearDown 清理临时 db。比 mock 真实 —— 顺便测 SQL schema 没写错。
 
 跑法：
     .venv/bin/python -m unittest -v tests.test_web.test_sessions
 """
+import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from web.routes.sessions import _SESSIONS
+from web.routes import sessions as sessions_module
 from web.server import app
+from web.sessions_store import SessionsStore, get_sessions_store
 
 
 class TestSessionsEndpoints(unittest.TestCase):
     def setUp(self):
+        # 临时 db 文件
+        self.tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp_db.close()
+        self.db_path = Path(self.tmp_db.name)
+
+        # 测试用 store + 重置 init 标记
+        self.store = SessionsStore(db_path=self.db_path)
+        asyncio.run(self.store.init())
+        sessions_module._initialized = True
+
+        app.dependency_overrides[get_sessions_store] = lambda: self.store
         self.client = TestClient(app)
-        _SESSIONS.clear()  # 每个测试隔离
 
     def tearDown(self):
-        _SESSIONS.clear()
+        app.dependency_overrides.clear()
+        sessions_module._initialized = False
+        if self.db_path.exists():
+            self.db_path.unlink()
 
     def test_create_returns_session_with_uuid(self):
         r = self.client.post("/api/sessions", json={"title": "测试会话"})
         self.assertEqual(r.status_code, 200)
         data = r.json()
         self.assertEqual(data["title"], "测试会话")
-        self.assertIn("id", data)
-        self.assertEqual(len(data["id"]), 36)  # uuid4 字符串长度
+        self.assertEqual(len(data["id"]), 36)
         self.assertEqual(data["message_count"], 0)
 
     def test_create_with_no_title_uses_default(self):
@@ -60,6 +74,17 @@ class TestSessionsEndpoints(unittest.TestCase):
 
     def test_delete_nonexistent_returns_404(self):
         r = self.client.delete("/api/sessions/does-not-exist")
+        self.assertEqual(r.status_code, 404)
+
+    def test_get_messages_empty_session(self):
+        r = self.client.post("/api/sessions", json={"title": "empty"})
+        sid = r.json()["id"]
+        msgs = self.client.get(f"/api/sessions/{sid}/messages")
+        self.assertEqual(msgs.status_code, 200)
+        self.assertEqual(msgs.json(), [])
+
+    def test_get_messages_nonexistent_session_404(self):
+        r = self.client.get("/api/sessions/nope/messages")
         self.assertEqual(r.status_code, 404)
 
 

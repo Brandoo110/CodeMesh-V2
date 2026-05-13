@@ -14,10 +14,10 @@
  */
 
 import { useState, useEffect, useRef } from "react";
-import { ApiError } from "@/lib/api";
+import { ApiError, getSessionMessages, listSessions } from "@/lib/api";
 import { streamChat } from "@/lib/sse";
 import { useStore } from "@/lib/store";
-import type { Message, ToolCall } from "@/lib/types";
+import type { Message, ToolCall, StoredMessage } from "@/lib/types";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
 
@@ -25,10 +25,26 @@ function uuid(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+/** 把后端 StoredMessage 转换成前端 Message 显示格式。 */
+function storedToMessage(s: StoredMessage): Message {
+  return {
+    id: `db-${s.id}`,
+    role: s.role,
+    content: s.content,
+    toolCalls: s.tool_calls || undefined,
+    model: s.model || undefined,
+    cost_rmb: s.cost_rmb ?? undefined,
+    duration_ms: s.duration_ms ?? undefined,
+    timestamp: new Date(s.created_at).getTime(),
+  };
+}
+
 export function ChatView() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [sending, setSending] = useState(false);
   const selectedModel = useStore((s) => s.selectedModel);
+  const currentSessionId = useStore((s) => s.currentSessionId);
+  const setSessions = useStore((s) => s.setSessions);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // 新消息时自动滚到底
@@ -38,6 +54,28 @@ export function ChatView() {
       behavior: "smooth",
     });
   }, [messages]);
+
+  // 切换 session 时加载历史
+  useEffect(() => {
+    if (!currentSessionId) {
+      setMessages([]);
+      return;
+    }
+    let cancelled = false;
+    getSessionMessages(currentSessionId)
+      .then((stored) => {
+        if (!cancelled) setMessages(stored.map(storedToMessage));
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          console.error("getSessionMessages failed:", e);
+          setMessages([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentSessionId]);
 
   async function handleSend(text: string) {
     const userMsg: Message = {
@@ -63,6 +101,7 @@ export function ChatView() {
       // SSE 流式消费：每个 event 增量更新 pending 消息
       for await (const event of streamChat(text, {
         model: selectedModel || undefined,
+        sessionId: currentSessionId || undefined,
       })) {
         switch (event.event) {
           case "token": {
@@ -169,6 +208,13 @@ export function ChatView() {
       );
     } finally {
       setSending(false);
+      // 持久化后刷新 sessions 列表（updated_at + message_count 变了）
+      if (currentSessionId) {
+        try {
+          const fresh = await listSessions();
+          setSessions(fresh);
+        } catch {}
+      }
     }
   }
 

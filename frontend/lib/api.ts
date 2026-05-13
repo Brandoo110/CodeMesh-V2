@@ -7,7 +7,7 @@
  *   3. 后续 Phase 3 加 SSE wrapper
  */
 
-import type { ChatRequest, ChatResponse, ModelInfo, SessionInfo } from "./types";
+import type { ChatRequest, ChatResponse, ModelInfo, SessionInfo, StoredMessage } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
@@ -70,4 +70,8 @@ export async function createSession(title?: string): Promise<SessionInfo> {
 
 export async function deleteSession(id: string): Promise<void> {
   await request(`/api/sessions/${id}`, { method: "DELETE" });
+}
+
+export async function getSessionMessages(id: string): Promise<StoredMessage[]> {
+  return request<StoredMessage[]>(`/api/sessions/${id}/messages`);
 }

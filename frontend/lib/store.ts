@@ -23,6 +23,12 @@ interface StoreState {
   setModels: (m: ModelInfo[]) => void;
   setSelectedModel: (id: string | null) => void;
 
+  // Sessions（Phase 5）
+  sessions: import("./types").SessionInfo[];
+  currentSessionId: string | null;
+  setSessions: (s: import("./types").SessionInfo[]) => void;
+  setCurrentSessionId: (id: string | null) => void;
+
   // UI
   sidebarOpen: boolean;
   toggleSidebar: () => void;
@@ -37,6 +43,11 @@ export const useStore = create<StoreState>((set) => ({
   selectedModel: null,
   setModels: (m) => set({ models: m }),
   setSelectedModel: (id) => set({ selectedModel: id }),
+
+  sessions: [],
+  currentSessionId: null,
+  setSessions: (s) => set({ sessions: s }),
+  setCurrentSessionId: (id) => set({ currentSessionId: id }),
 
   sidebarOpen: true,
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),

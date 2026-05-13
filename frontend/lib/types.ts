@@ -41,6 +41,23 @@ export interface SessionInfo {
   message_count: number;
 }
 
+/**
+ * GET /api/sessions/{id}/messages 返回的消息（Phase 5）
+ *
+ * 字段对应 web/sessions_store.py 的 session_messages 表。
+ * tool_calls 已经反序列化为 list[ToolCall] | null。
+ */
+export interface StoredMessage {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  tool_calls: ToolCall[] | null;
+  model: string | null;
+  cost_rmb: number | null;
+  duration_ms: number | null;
+  created_at: string;
+}
+
 // ─────────────── 前端内部 ───────────────
 
 /**

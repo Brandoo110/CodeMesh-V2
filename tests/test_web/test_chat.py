@@ -71,9 +71,15 @@ class TestChatEndpoint(unittest.TestCase):
         self.assertEqual(data["model"], "deepseek")
         self.assertAlmostEqual(data["cost_rmb"], 0.0030, places=4)
 
-    def test_session_id_echoed_back(self):
-        r = self.client.post("/api/chat", json={"task": "hi", "session_id": "abc"})
-        self.assertEqual(r.json()["session_id"], "abc")
+    def test_no_session_id_returns_none(self):
+        """ephemeral chat：不传 session_id，response 也是 None。"""
+        r = self.client.post("/api/chat", json={"task": "hi"})
+        self.assertIsNone(r.json().get("session_id"))
+
+    def test_nonexistent_session_id_returns_404(self):
+        """Phase 5：不存在的 session_id 直接 404。"""
+        r = self.client.post("/api/chat", json={"task": "hi", "session_id": "nope"})
+        self.assertEqual(r.status_code, 404)
 
 
 if __name__ == "__main__":
