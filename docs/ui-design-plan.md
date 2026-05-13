@@ -609,15 +609,19 @@ async def chat_stream(req: ChatRequest):
 - [x] FastAPI `/api/health` smoke test 通过（200 + 正确 JSON）
 - [ ] shadcn/ui 初始化（推迟到 Phase 2 用到时再装）
 
-**Python interpreter 注意事项**：
-用户机器 `python3 = /usr/local/bin/python3`（系统）但 `pip = miniconda`。
-后端命令一律用 **miniconda python**：
-```bash
-/Users/junjieli/miniconda3/bin/python3 -m uvicorn web.server:app --reload --port 8000
-```
-或在 shell 里 `alias py=/Users/junjieli/miniconda3/bin/python3`。
+**Python 环境**：项目专属 **`.venv/`**（Python 3.14，PEP 405 标准 venv，已 `.gitignore`）。
 
-**Demo**：`pnpm dev` + `uvicorn web.server:app` 双起来 → 浏览器看 Next.js 默认页 + curl 后端 `/api/health` 返回 `{"status": "ok"}`。
+| 操作 | 命令 |
+|------|------|
+| 创建 venv | `make venv` 或 `python3 -m venv .venv && .venv/bin/pip install -U pip wheel` |
+| 装依赖 | `make install` 或 `.venv/bin/pip install -e ".[web,skills,tokens]"` |
+| 跑后端 | `make ui-backend` 或 `.venv/bin/python -m uvicorn web.server:app --reload --port 8000` |
+| 跑前端 | `make ui-frontend`（另开 terminal）或 `cd frontend && pnpm dev` |
+| 跑测试 | `make test` |
+
+**为什么 Python venv 不 conda**：CodeMesh 是纯 Python 项目，不需要 CUDA/GPU/多 Python 版本切换/复杂二进制 wheel。venv 更轻、自包含、跟项目走。conda 适合 ML 训练 / 数据科学场景（学校的 `ai-agent` / `comp9444` 等 env 继续用 conda）。
+
+**Demo**：`make ui-backend` + 另开 terminal `make ui-frontend` → 浏览器 http://localhost:3000 看 Next.js 默认页 + `curl http://localhost:8000/api/health` 返回 `{"status": "ok"}`。
 
 ### Phase 1：后端 API 骨架（2-3h）
 
