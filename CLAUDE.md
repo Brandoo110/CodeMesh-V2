@@ -176,5 +176,6 @@ async def my_tool(...) -> str:        # 或 def，registry 都支持
 - `0003-dreaming-4-stage-consolidation.md` — Dreaming 4 阶段巩固循环
 - `0004-memory-7-layer-architecture.md` — Memory 7 层架构（复刻 Claude Code 内部）
 - `0005-domestic-multi-model.md` — 国内多模型差异化策略（v1 起持续）
+- `0006-web-ui-stack-fastapi-nextjs.md` — Web UI 技术栈选 FastAPI + Next.js（拒 NestJS，2026-05-14）
 
 新写决策按 `NNNN-短描述.md` 命名，标准结构：Status / Context / Decision / Consequences / 参考。**ADR 是讲述层最直接的素材**。
