@@ -34,7 +34,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from web import __version__
-from web.routes import health
+from web.routes import chat, health, models, sessions
 
 
 def create_app() -> FastAPI:
@@ -58,9 +58,16 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # 路由注册 —— Phase 0 只挂 health
-    # Phase 1+ 会按需 include_router 加 chat / models / sessions / stats
+    # 路由注册
+    # Phase 0: health
+    # Phase 1: + models / chat (非流式) / sessions (内存占位)
+    # Phase 3: + chat/stream
+    # Phase 4: + stats
+    # Phase 7: + settings
     app.include_router(health.router, prefix="/api")
+    app.include_router(models.router, prefix="/api")
+    app.include_router(chat.router, prefix="/api")
+    app.include_router(sessions.router, prefix="/api")
 
     return app
 
