@@ -244,6 +244,177 @@ bf29f68 feat(web): Phase 2 - frontend chat UI (Claude-style dark theme)
 
 ---
 
+## 2026-05-14（Phase 3）— SSE 流式 + 工具调用可视化（commit `21d627c`）
+
+> 分支：`feature/web-ui` 续作。前后端合并一个 commit（685 insertions / 27 deletions / 8 files）
+
+### 一、启动前的 contract surface
+
+读 `harness.py` 发现 CodeMesh 内部**两条路是分裂的**：
+
+| 方法 | 工具调用 | 流式 |
+|---|---|---|
+| `harness.run(task)` | ✅ complex 走 agent loop | ❌ 一次返回 |
+| `harness.run_stream(task)` | ❌ 只 simple | ✅ |
+
+无法同时拿 token 流 + 工具事件。Surface 三方案给用户拍板：
+
+| 方案 | 改 harness？ | 工时 | 选 |
+|---|---|---|---|
+| A. Surgical 只 token 流 | ❌ | 1-1.5h | |
+| **B. 加 run_stream_full（不改 loop.py）** | ✅ | 3-4h | **✅** |
+| C. Hook + asyncio.Queue 外部中转 | ❌ | 3h+ | |
+
+### 二、后端核心实现
+
+**`harness.run_stream_full(task)` 双路径**：
+
+- Simple：走 `adapter.complete_stream` 透出 token chunk（已有 run_stream 改 yield dict）
+- Complex：注册 PRE/POST_TOOL_USE hook callback 推 asyncio.Queue → `asyncio.create_task(self.run(task))` 后台跑 → 主循环 `wait_for(queue.get, timeout=0.1)` 中转 events → run 完成后一次性 yield 完整答案
+
+```python
+async def _stream_complex(self, task, model_name):
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def on_pre_tool(*, tool_name="", args=None, **_):
+        queue.put_nowait({"type": "tool_start", "data": {"name": tool_name, "args": args or {}}})
+        return HookResult.ok()
+    def on_post_tool(*, tool_name="", result="", **_):
+        shown = result if len(result) < 2000 else result[:2000] + "…[truncated]"
+        queue.put_nowait({"type": "tool_end", "data": {"name": tool_name, "result": shown, "ok": not result.startswith("[ERROR]")}})
+        return HookResult.ok()
+
+    self.hooks.register(HookEvent.PRE_TOOL_USE, on_pre_tool)
+    self.hooks.register(HookEvent.POST_TOOL_USE, on_post_tool)
+    try:
+        run_task = asyncio.create_task(self.run(task))
+        while not run_task.done():
+            try:
+                yield await asyncio.wait_for(queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+        while not queue.empty():
+            yield queue.get_nowait()
+        answer = await run_task
+        yield {"type": "token", "data": {"delta": answer}}
+        yield {"type": "usage", "data": {...}}
+    finally:
+        # hooks.py 没 unregister —— 手动 list.remove
+        self.hooks._handlers[HookEvent.PRE_TOOL_USE].remove(on_pre_tool)
+        self.hooks._handlers[HookEvent.POST_TOOL_USE].remove(on_post_tool)
+```
+
+**SSE route**（chat.py 扩展）：
+
+```python
+@router.post("/stream")
+async def chat_stream(req, harness=Depends(get_harness)):
+    async def event_generator():
+        async for event in harness.run_stream_full(req.task):
+            yield {"event": event["type"], "data": json.dumps(event["data"], ensure_ascii=False)}
+    return EventSourceResponse(event_generator())
+```
+
+**5 个新 SSE 测试**全过（token+done / tool 事件 / error / 422 / usage），全部 web 测试 20 → 25。
+
+### 三、前端核心实现
+
+**关键 surface**：**EventSource 不支持 POST**。改用 fetch + ReadableStream 手动解析 SSE 帧。
+
+**`lib/sse.ts` async generator**（116 行）：
+
+```typescript
+export async function* streamChat(task, options) {
+  const res = await fetch("/api/chat/stream", { method: "POST", ... });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // 按 \n\n 分帧 + parseSSEFrame yield
+      ...
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+```
+
+**`components/ToolCallCard.tsx`**（99 行）：折叠卡片 / pending 黄脉冲 / ok 绿 ✓ / error 红 ✗ / args JSON / result 50 行预览。
+
+**`ChatView` 改造**：单次 `await sendChat()` → `for await (const event of streamChat())` 6 个 case：
+
+- `token`: append delta 到 content
+- `tool_start`: push pending ToolCall
+- `tool_end`: FIFO 找最近 pending 同名 tool 更新结果（CodeMesh 不并发同名工具）
+- `usage`: 更新 model / cost
+- `done`: pending=false + duration_ms
+- `error`: role="error" + content=message
+
+**MessageBubble 更新**：toolCalls 在文本前 / pending 时显示打字光标 `▌`。
+
+### 四、关键 tradeoff（要诚实讲述）
+
+| trade-off | 现状 | 解决要做什么 |
+|---|---|---|
+| Complex 任务回答**不流式**（一次性出现） | 因为 agent loop 不是 generator | 改 execution/loop.py 6h+ |
+| Disconnect 不 cancel | run 继续跑完 | request.is_disconnected() + run_task.cancel() ~1h |
+| Planner step 不发 event | _run_planned 内部没 yield | 改 _run_planned 2h |
+| Tool result 2000 字符截断 | 防 SSE 撑爆 | 配 `Set-Cookie` 大对象传递？过度工程 |
+
+### 五、踩坑（7 个）
+
+1. **hooks.py 没 unregister** → 手动 `_handlers[event].remove(callback)` + try/finally
+2. **harness.py imports 缺**：补 `from typing import Any` + `from orchestration.hooks import HookResult`
+3. **EventSource 不支持 POST** → fetch + ReadableStream
+4. **ReadableStream releaseLock** → 必须在 finally 调，否则 stream 锁泄漏
+5. **UTF-8 多字节切断** → TextDecoder `{ stream: true }` 跨 chunk 保状态
+6. **TypeScript event.data 类型** → 每个字段 `String(...)` / `as Record<...>` narrowing
+7. **pending 状态多模态** → "思考中..." 仅在 content + toolCalls 都空时显示，避免和工具卡片重复
+
+### 六、Commit + 文件清单
+
+`21d627c feat(web): Phase 3 - SSE streaming with tool call visualization`
+
+| 文件 | 变化 |
+|---|---|
+| `harness.py` | +178 / -0（run_stream_full + 2 imports） |
+| `web/routes/chat.py` | +43 / -1（/stream endpoint） |
+| `tests/test_web/test_chat_stream.py` | +113 新建（5 tests） |
+| `frontend/lib/sse.ts` | +116 新建 |
+| `frontend/lib/types.ts` | +15（ToolCall 类型） |
+| `frontend/components/ToolCallCard.tsx` | +99 新建 |
+| `frontend/components/MessageBubble.tsx` | +20 / -10（toolCalls + cursor） |
+| `frontend/components/ChatView.tsx` | +95 / -25（streamChat for-await-of） |
+
+**没动**：execution/loop.py / orchestration/* / memory/* / feedback/* / web/schemas.py / web/deps.py。
+
+### 七、Phase 3 面试故事
+
+> "Phase 3 SSE 设计阶段 surface 一个事实：CodeMesh 的 `harness.run` 和 `run_stream` 是分裂的——run 有工具但不流式，run_stream 流式但只 simple 无工具。没法同时拿两者。
+>
+> 我给用户列了 3 个方案：A. 只做 token 流（surgical 但 demo 砍半）/ B. 加 run_stream_full（动 harness 但不动 loop）/ C. 外部 hook 中转（不动 harness 但 SSE 复杂）。用户选 B。
+>
+> 实现的精髓是 **Hook relay 模式** —— 注册 PRE/POST_TOOL_USE callback 推 asyncio.Queue，主循环 wait_for(0.1s) 中转 events 同时等 run() 完成。**不改 execution/loop.py 也拿到工具事件**。
+>
+> 前端关键 surface：**EventSource 不支持 POST**（设计文档拍头写的）。task 可能多行 markdown URL 装不下，必须 POST body。改用 fetch + ReadableStream 手动解析 SSE 帧——TextDecoder `{ stream: true }` 处理 UTF-8 多字节切断、ReadableStream `releaseLock()` finally 防 lock 泄漏。
+>
+> **诚实坏处段**：complex 任务回答不流式（一次性出，不逐字）；要让 complex 也逐字需要改 execution/loop.py 让 agent loop 成 async generator——6h+ 重构。这是工程纪律的 trade-off。"
+
+### 八、还没做（Phase 4-5）
+
+| Phase | 内容 |
+|---|---|
+| 4 | Stats Dashboard iframe 嵌入 `stats_report.py` 输出的 HTML + 日期范围选择器 |
+| 5 | 历史会话 SQLite（替换 _SESSIONS dict）+ Sidebar 真接 + TanStack Query 缓存 |
+
+Phase 5 完成 = MVP 关闭，merge `feature/web-ui` 到 main + 更新 README v5 + 写 DEVLOG 总段。
+
+---
+
 ## 2026-05-10 — HTML 工件渲染：把"给人看"的产物从 markdown 升级到自包含 HTML
 
 > 分支：`feature/html-artifacts`（新开）
