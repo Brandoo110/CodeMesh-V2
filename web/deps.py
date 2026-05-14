@@ -45,8 +45,8 @@ _NATIVE_KEY_ENV: dict[str, tuple[str, ...]] = {
 # name 是 UI 上的显示标签——和 adapter 里实际 model id 对齐方便用户知道在跑什么。
 # 实际 model id 可通过 DEEPSEEK_MODEL / GEMINI_MODEL / MINIMAX_MODEL 等 env 覆盖。
 # color 是品牌色（和 feedback/render_html.py 的 MODEL_COLORS 对齐）；
-# label 从 adapter 实际 model id 反推，避免 hardcode 撒谎（用户改 .env 里
-# *_MODEL 之后 UI label 也跟着变）。
+# UI label 直接用 adapter.model（如 "deepseek-v4-pro"）——厂商前缀被
+# model id 本身覆盖了（"deepseek-v4-pro" 已经含 "deepseek"），不重复加。
 _MODEL_COLOR = {
     "deepseek": "#5b8def",
     "qwen":     "#7c3aed",
@@ -55,14 +55,8 @@ _MODEL_COLOR = {
     "minimax":  "#f59e0b",
 }
 
-# provider id → 漂亮的厂商前缀（用于拼 UI label）
-_PROVIDER_LABEL = {
-    "deepseek": "DeepSeek",
-    "qwen":     "Qwen",
-    "doubao":   "Doubao",
-    "gemini":   "Gemini",
-    "minimax":  "MiniMax",
-}
+# 已知 provider 列表（list_models 按这个顺序输出）
+_PROVIDERS = ["deepseek", "qwen", "doubao", "gemini", "minimax"]
 
 
 def is_configured(model_id: str) -> bool:
@@ -113,17 +107,17 @@ def list_models() -> list[dict]:
     """
     返回**已配置**模型的 metadata。未配 API key 的不出现在列表里。
 
-    name 字段从 adapter.model 反推（如 "DeepSeek · deepseek-v4-pro"），
-    .env 里改 *_MODEL 之后 UI label 也会跟着变——不再 hardcode 撒谎。
+    name 字段直接用 adapter.model（如 "deepseek-v4-pro"），.env 里改
+    *_MODEL 之后 UI label 也会跟着变——不再 hardcode 撒谎。
     """
     rows: list[dict] = []
-    for provider in _PROVIDER_LABEL:
+    for provider in _PROVIDERS:
         if not is_configured(provider):
             continue
         model_id = _resolve_adapter_model_id(provider)
         rows.append({
             "id": provider,
-            "name": f"{_PROVIDER_LABEL[provider]} · {model_id}",
+            "name": model_id,
             "configured": True,
             "color": _MODEL_COLOR.get(provider, "#9ca3af"),
         })

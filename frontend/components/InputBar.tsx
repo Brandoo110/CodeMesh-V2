@@ -35,8 +35,12 @@ export function InputBar({ onSend, disabled }: Props) {
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    // Cmd+Enter / Ctrl+Enter 发送
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    // Enter 直接发送；Shift+Enter（或输入法 composing 中）换行
+    if (
+      e.key === "Enter" &&
+      !e.shiftKey &&
+      !e.nativeEvent.isComposing  // 中文输入法选词时回车不要触发发送
+    ) {
       e.preventDefault();
       handleSend();
     }
@@ -49,7 +53,7 @@ export function InputBar({ onSend, disabled }: Props) {
           <textarea
             ref={ref}
             className="flex-1 bg-transparent text-fg placeholder:text-fg-subtle resize-none outline-none px-2 py-1.5 text-[15px] leading-relaxed"
-            placeholder="问点什么...（Cmd+Enter 发送）"
+            placeholder="问点什么...（Enter 发送，Shift+Enter 换行）"
             rows={1}
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -60,7 +64,7 @@ export function InputBar({ onSend, disabled }: Props) {
             className="flex items-center justify-center w-8 h-8 rounded-md bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:text-fg-subtle text-canvas transition-colors flex-shrink-0"
             onClick={handleSend}
             disabled={disabled || !text.trim()}
-            title="发送 (Cmd+Enter)"
+            title="发送 (Enter)"
           >
             <Send size={16} />
           </button>
