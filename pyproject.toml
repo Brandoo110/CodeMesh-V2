@@ -35,11 +35,21 @@ skills = [
 tokens = [
     "tiktoken>=0.7.0",
 ]
+# Web UI 后端：pip install -e ".[web]"
+# FastAPI + SSE streaming，详见 ADR-0006 / docs/ui-design-plan.md
+web = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sse-starlette>=2.1.0",
+]
 # 全部可选项一次装：pip install -e ".[all]"
 all = [
     "chromadb>=0.5.0",
     "pyyaml>=6.0",
     "tiktoken>=0.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sse-starlette>=2.1.0",
 ]
 
 [project.scripts]
@@ -50,4 +60,4 @@ py-modules = ["harness", "cli"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["memory*", "execution*", "feedback*", "orchestration*", "rag*"]
+include = ["memory*", "execution*", "feedback*", "orchestration*", "rag*", "web*"]

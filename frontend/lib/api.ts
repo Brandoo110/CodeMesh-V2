@@ -1,0 +1,77 @@
+/**
+ * 后端 API client wrapper。
+ *
+ * 所有 fetch 调用集中在这里，便于：
+ *   1. 统一错误处理（throw ApiError with status）
+ *   2. base URL 切换（dev: localhost:8000 / prod: 同域）
+ *   3. 后续 Phase 3 加 SSE wrapper
+ */
+
+import type { ChatRequest, ChatResponse, ModelInfo, SessionInfo, StoredMessage } from "./types";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers || {}),
+    },
+  });
+
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail || JSON.stringify(body);
+    } catch {
+      // body 不是 JSON，用 statusText 兜底
+    }
+    throw new ApiError(res.status, detail);
+  }
+
+  return res.json();
+}
+
+// ─────────────── Endpoints ───────────────
+
+export async function fetchModels(): Promise<ModelInfo[]> {
+  return request<ModelInfo[]>("/api/models");
+}
+
+export async function sendChat(req: ChatRequest): Promise<ChatResponse> {
+  return request<ChatResponse>("/api/chat", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
+export async function listSessions(): Promise<SessionInfo[]> {
+  return request<SessionInfo[]>("/api/sessions");
+}
+
+export async function createSession(title?: string): Promise<SessionInfo> {
+  return request<SessionInfo>("/api/sessions", {
+    method: "POST",
+    body: JSON.stringify({ title: title || "新对话" }),
+  });
+}
+
+export async function deleteSession(id: string): Promise<void> {
+  await request(`/api/sessions/${id}`, { method: "DELETE" });
+}
+
+export async function getSessionMessages(id: string): Promise<StoredMessage[]> {
+  return request<StoredMessage[]>(`/api/sessions/${id}/messages`);
+}
