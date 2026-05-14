@@ -40,11 +40,13 @@ _NATIVE_KEY_ENV = {
 }
 
 # 模型展示 metadata（颜色和 feedback/render_html.py 的 MODEL_COLORS 对齐）
+# name 是 UI 上的显示标签——和 adapter 里实际 model id 对齐方便用户知道在跑什么。
+# 实际 model id 可通过 DEEPSEEK_MODEL / GEMINI_MODEL 等 env 覆盖。
 _MODEL_META = {
-    "deepseek": {"name": "DeepSeek V4 Pro", "color": "#5b8def"},
-    "qwen":     {"name": "Qwen 3 Max",      "color": "#7c3aed"},
-    "doubao":   {"name": "Doubao Pro",      "color": "#ef4444"},
-    "gemini":   {"name": "Gemini 2.5 Pro",  "color": "#10b981"},
+    "deepseek": {"name": "DeepSeek V4 Pro",      "color": "#5b8def"},
+    "qwen":     {"name": "Qwen 3 Max",           "color": "#7c3aed"},
+    "doubao":   {"name": "Doubao Pro",           "color": "#ef4444"},
+    "gemini":   {"name": "Gemini 3.1 Flash Lite", "color": "#10b981"},
 }
 
 

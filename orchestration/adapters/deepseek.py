@@ -39,11 +39,12 @@ class DeepSeekAdapter:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "deepseek-chat",
+        model: str | None = None,
         base_url: str = "https://api.deepseek.com/v1",
     ):
         self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
-        self.model = model
+        # 优先看 env，方便 .env 切换；默认 V4 Pro
+        self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
         self.client = AsyncOpenAI(api_key=self.api_key, base_url=base_url)
         # 初始化为 0，调用后更新
         self.last_usage = Usage()

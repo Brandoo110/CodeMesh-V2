@@ -42,7 +42,7 @@ class GeminiAdapter:
     ):
         # GEMINI_API_KEY 和 GOOGLE_API_KEY 两个环境变量官方文档都在用，两个都认
         self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
         self.client = AsyncOpenAI(api_key=self.api_key, base_url=base_url)
         self.last_usage = Usage()
 
