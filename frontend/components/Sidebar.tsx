@@ -128,9 +128,9 @@ export function Sidebar() {
       {/* 底部：设置 */}
       <div className="p-3 border-t border-border">
         <button
-          className="w-full flex items-center gap-2 px-3 py-2 rounded-md hover:bg-surface-hover text-fg-muted text-sm transition-colors"
+          className="w-full flex items-center gap-2 px-3 py-2 rounded-md hover:bg-surface-hover text-fg-muted text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
           disabled
-          title="Phase 7 启用"
+          title="暂未启用"
         >
           <Settings size={16} />
           <span>设置</span>

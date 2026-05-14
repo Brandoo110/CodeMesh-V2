@@ -244,8 +244,8 @@ function EmptyState() {
       <div className="text-sm text-fg-muted max-w-[480px]">
         国内多模型 Code Agent。问点代码问题、文件操作、或者就聊聊。
       </div>
-      <div className="mt-6 text-xs text-fg-subtle">
-        当前 Phase 2：非流式对话已通；流式 + 工具调用可视化在 Phase 3
+      <div className="mt-6 text-xs text-fg-subtle max-w-[480px]">
+        想让多个模型协作？顶栏切到「工作流」试试。
       </div>
     </div>
   );

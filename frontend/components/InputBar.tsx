@@ -66,7 +66,7 @@ export function InputBar({ onSend, disabled }: Props) {
           </button>
         </div>
         <div className="mt-2 text-xs text-fg-subtle text-center">
-          模型可能会出错。Phase 2 非流式，等响应可能需几秒。
+          模型可能会出错。复杂任务会调工具，首次响应需几秒。
         </div>
       </div>
     </div>
