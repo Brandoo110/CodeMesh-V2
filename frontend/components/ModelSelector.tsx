@@ -1,12 +1,17 @@
 "use client";
 
 /**
- * 模型选择器：dropdown 列 4 个模型 + configured 状态小圆点
+ * 模型选择器：dropdown 列已配置模型 + 品牌色小圆点
  *
- * Phase 2 单选；Phase 6 加 compare 多选。
+ * 顶栏的全局选择器。Workflows view 里每个 step 用独立的 ModelInlineSelector
+ * （在 StepCard.tsx 内）。
+ *
+ * "自动选择（router 决策）" 选项已移除——router 当前 Literal 只输出
+ * deepseek/qwen/doubao，对已配 Gemini / MiniMax 等模型的用户不友好。
+ * 强制让用户显式挑一个模型，避免误用。
  */
 
-import { Check, X, ChevronDown } from "lucide-react";
+import { Check, ChevronDown } from "lucide-react";
 import { useState } from "react";
 import { useStore } from "@/lib/store";
 
@@ -17,7 +22,7 @@ export function ModelSelector() {
   const [open, setOpen] = useState(false);
 
   const current = models.find((m) => m.id === selectedModel);
-  const label = current?.name || "自动选择（router 决策）";
+  const label = current?.name || "选择模型";
 
   return (
     <div className="relative">
@@ -43,20 +48,6 @@ export function ModelSelector() {
             onClick={() => setOpen(false)}
           />
           <div className="absolute top-full mt-1 right-0 z-20 min-w-[240px] rounded-md bg-surface border border-border shadow-lg py-1">
-            {/* "自动" 选项 */}
-            <button
-              className={`w-full flex items-center justify-between px-3 py-2 hover:bg-surface-hover text-sm text-fg ${
-                selectedModel === null ? "bg-surface-hover" : ""
-              }`}
-              onClick={() => {
-                setSelectedModel(null);
-                setOpen(false);
-              }}
-            >
-              <span>自动选择（router 决策）</span>
-              {selectedModel === null && <Check size={14} className="text-accent" />}
-            </button>
-            <div className="border-t border-border my-1" />
             {models.map((m) => (
               <button
                 key={m.id}
@@ -75,22 +66,11 @@ export function ModelSelector() {
                   />
                   <span className="text-fg">{m.name}</span>
                 </div>
-                <div className="flex items-center gap-2">
-                  {m.configured ? (
-                    <Check size={14} className="text-success" />
-                  ) : (
-                    <X size={14} className="text-fg-subtle" />
-                  )}
-                  {selectedModel === m.id && (
-                    <Check size={14} className="text-accent" />
-                  )}
-                </div>
+                {selectedModel === m.id && (
+                  <Check size={14} className="text-accent" />
+                )}
               </button>
             ))}
-            <div className="border-t border-border my-1" />
-            <div className="px-3 py-1.5 text-xs text-fg-subtle">
-              ✓ 已配 key &nbsp; ✗ 未配 key
-            </div>
           </div>
         </>
       )}

@@ -142,7 +142,7 @@ function ModelInlineSelector({ value, onChange, disabled }: InlineModelProps) {
   const [open, setOpen] = useState(false);
 
   const current = models.find((m) => m.id === value);
-  const label = current?.name || (value ?? "自动选择");
+  const label = current?.name || (value ?? "选择模型");
 
   return (
     <div className="relative">
@@ -165,17 +165,6 @@ function ModelInlineSelector({ value, onChange, disabled }: InlineModelProps) {
         <>
           <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
           <div className="absolute top-full mt-1 right-0 z-20 min-w-[180px] rounded-md bg-surface border border-border shadow-lg py-1">
-            <button
-              onClick={() => {
-                onChange(null);
-                setOpen(false);
-              }}
-              className="w-full text-left px-3 py-1.5 text-xs hover:bg-surface-hover text-fg-muted"
-              title="不强制指定，让 router 看任务内容自动挑模型"
-            >
-              自动选择（router 决策）
-            </button>
-            <div className="border-t border-border my-1" />
             {models.map((m) => (
               <button
                 key={m.id}
