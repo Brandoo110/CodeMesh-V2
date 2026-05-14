@@ -6,6 +6,7 @@ from .deepseek import DeepSeekAdapter
 from .dashscope import DashScopeAdapter
 from .volcengine import VolcEngineAdapter
 from .gemini import GeminiAdapter
+from .minimax import MiniMaxAdapter
 
 __all__ = [
     "ModelAdapter",
@@ -15,4 +16,5 @@ __all__ = [
     "DashScopeAdapter",
     "VolcEngineAdapter",
     "GeminiAdapter",
+    "MiniMaxAdapter",
 ]

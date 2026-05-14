@@ -65,6 +65,7 @@ from execution import set_skill_registry
 from orchestration.hooks import HookResult
 from orchestration.adapters import (
     DeepSeekAdapter,
+    MiniMaxAdapter,
     DashScopeAdapter,
     VolcEngineAdapter,
     GeminiAdapter,
@@ -249,6 +250,7 @@ class Harness:
             "deepseek": "DEEPSEEK_API_KEY",
             "qwen":     "DASHSCOPE_API_KEY",
             "doubao":   "VOLC_API_KEY",
+            "minimax":  "MINIMAX_API_KEY",
         }.get(name)
 
         # 真实 key 一般 30+ 字符；设阈值 20 过滤常见占位符
@@ -266,6 +268,7 @@ class Harness:
                 case "qwen":     adapter = DashScopeAdapter()
                 case "doubao":   adapter = VolcEngineAdapter()
                 case "gemini":   adapter = GeminiAdapter()
+                case "minimax":  adapter = MiniMaxAdapter()
                 case _:
                     print(f"[harness] unknown model {name!r}, fallback to deepseek")
                     adapter = DeepSeekAdapter()
