@@ -65,9 +65,9 @@ class TestSeedTemplates(unittest.TestCase):
         # 三角审查: 3 步
         triangle = next(w for w in wfs if "三角审查" in w["name"])
         self.assertEqual(triangle["step_count"], 3)
-        # 多模型对比: 4 步（3 实现 + 1 综合）
+        # 多模型对比: 3 步（2 实现 + 1 综合）
         compare = next(w for w in wfs if "多模型对比" in w["name"])
-        self.assertEqual(compare["step_count"], 4)
+        self.assertEqual(compare["step_count"], 3)
 
     def test_reviewer_step_is_read_only(self):
         """三角审查模板的 Reviewer 步骤应该只读（护城河 #1 实证）。"""
@@ -88,17 +88,20 @@ class TestSeedTemplates(unittest.TestCase):
         wfs = run(self.store.list_workflows())
         compare = next(w for w in wfs if "多模型对比" in w["name"])
         steps = run(self.store.get_steps(compare["id"]))
-        summary = steps[3]
+        # 综合点评是最后一步
+        summary = steps[-1]
+        self.assertIn("综合", summary["name"])
         self.assertEqual(summary["enable_tools"], [])
 
     def test_templates_have_three_different_models(self):
-        """Aider 流水线第 1 步是强模型（doubao），第 2 步是廉价模型（deepseek）。"""
+        """Aider 流水线两步用不同模型（DeepSeek 架构 + Gemini 编辑）。"""
         run(seed_templates(self.store))
         wfs = run(self.store.list_workflows())
         aider = next(w for w in wfs if "Aider" in w["name"])
         steps = run(self.store.get_steps(aider["id"]))
-        self.assertEqual(steps[0]["model"], "doubao")
-        self.assertEqual(steps[1]["model"], "deepseek")
+        self.assertEqual(steps[0]["model"], "deepseek")
+        self.assertEqual(steps[1]["model"], "gemini")
+        self.assertNotEqual(steps[0]["model"], steps[1]["model"])
 
 
 if __name__ == "__main__":

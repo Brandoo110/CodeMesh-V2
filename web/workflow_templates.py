@@ -31,12 +31,12 @@ TEMPLATES: list[dict] = [
         "name": "Aider 流水线（Architect + Editor）",
         "description": (
             "致敬 Aider architect/editor 范式：强模型负责架构设计（只读探查），"
-            "廉价模型负责具体实现。两步分工可降低 70%+ 成本。"
+            "另一个模型负责具体实现。两步分工分离思考和动手。"
         ),
         "steps": [
             {
                 "name": "1. 架构设计（Architect）",
-                "model": "doubao",
+                "model": "deepseek",
                 "enable_tools": ["grep_text", "read_file", "glob_files", "lsp_code"],
                 "system_prompt": (
                     "You are a senior software architect. Explore the codebase with "
@@ -50,7 +50,7 @@ TEMPLATES: list[dict] = [
             },
             {
                 "name": "2. 编写代码（Editor）",
-                "model": "deepseek",
+                "model": "gemini",
                 "enable_tools": [
                     "grep_text", "read_file", "edit_file", "write_file",
                     "glob_files", "lsp_code",
@@ -74,7 +74,7 @@ TEMPLATES: list[dict] = [
         "steps": [
             {
                 "name": "1. Planner",
-                "model": "doubao",
+                "model": "deepseek",
                 "enable_tools": ["grep_text", "read_file", "glob_files", "lsp_code"],
                 "system_prompt": (
                     "You plan the change. Read the task, explore relevant files, "
@@ -85,7 +85,7 @@ TEMPLATES: list[dict] = [
             },
             {
                 "name": "2. Coder",
-                "model": "deepseek",
+                "model": "gemini",
                 "enable_tools": [
                     "grep_text", "read_file", "edit_file", "write_file",
                     "glob_files", "lsp_code",
@@ -99,7 +99,7 @@ TEMPLATES: list[dict] = [
             },
             {
                 "name": "3. Reviewer",
-                "model": "qwen",
+                "model": "deepseek",
                 "enable_tools": ["grep_text", "read_file", "glob_files", "lsp_code"],
                 "system_prompt": (
                     "Review the code changes from Step 2. Check: "
@@ -113,10 +113,10 @@ TEMPLATES: list[dict] = [
         ],
     },
     {
-        "name": "多模型对比（同任务 × 3 模型）",
+        "name": "多模型对比（同任务 × 2 模型 + 综合）",
         "description": (
-            "同一任务用三家国产模型分别实现，最后用强模型综合点评——"
-            "CodeMesh 多模型对比卖点的工作流化版本。MVP 串行执行。"
+            "同一任务用 DeepSeek 和 Gemini 分别实现，最后综合点评——"
+            "多模型对比卖点的工作流化版本。MVP 串行执行。"
         ),
         "steps": [
             {
@@ -133,21 +133,8 @@ TEMPLATES: list[dict] = [
                 "user_prompt": "",
             },
             {
-                "name": "1b. Qwen 实现",
-                "model": "qwen",
-                "enable_tools": [
-                    "grep_text", "read_file", "edit_file", "write_file",
-                    "glob_files", "lsp_code",
-                ],
-                "system_prompt": (
-                    "Implement the user's task using available tools. Be "
-                    "self-contained — don't reference 'the other implementations'."
-                ),
-                "user_prompt": "",
-            },
-            {
-                "name": "1c. Doubao 实现",
-                "model": "doubao",
+                "name": "1b. Gemini 实现",
+                "model": "gemini",
                 "enable_tools": [
                     "grep_text", "read_file", "edit_file", "write_file",
                     "glob_files", "lsp_code",
@@ -160,10 +147,10 @@ TEMPLATES: list[dict] = [
             },
             {
                 "name": "2. 综合点评",
-                "model": "gemini",
+                "model": "deepseek",
                 "enable_tools": [],   # 纯文本生成，禁工具
                 "system_prompt": (
-                    "Compare the three implementations from Steps 1a-1c. Output "
+                    "Compare the two implementations from Steps 1a and 1b. Output "
                     "a structured comparison covering: (1) correctness, "
                     "(2) code style / readability, (3) edge-case handling, "
                     "(4) recommended pick with one-paragraph reason."

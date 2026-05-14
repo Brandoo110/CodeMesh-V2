@@ -224,7 +224,10 @@ class Harness:
         if self.preferred_model:
             from orchestration.router import RouteDecision
             complexity = "simple" if self.tool_allowlist == [] else "complex"
-            return RouteDecision(
+            # RouteDecision.model 是 Literal["deepseek","qwen","doubao"]，
+            # 不接受 "gemini" 等其他值。用 model_construct 绕开 Pydantic 验证
+            # —— 这只是个 DTO，下游 _get_adapter 接受任意字符串。
+            return RouteDecision.model_construct(
                 model=self.preferred_model,
                 complexity=complexity,
                 reason=f"workflow override (tool_allowlist={self.tool_allowlist})",
