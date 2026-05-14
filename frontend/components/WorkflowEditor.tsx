@@ -32,9 +32,12 @@ interface Props {
   detail: WorkflowDetail;
   /** 任何后端写操作完成后回调，父组件应该重新拉 detail。 */
   onChange: () => Promise<void> | void;
+  /** 触发执行整个工作流（Phase 6.5）。 */
+  onRun?: () => Promise<void> | void;
+  isRunning?: boolean;
 }
 
-export function WorkflowEditor({ detail, onChange }: Props) {
+export function WorkflowEditor({ detail, onChange, onRun, isRunning }: Props) {
   const setCurrentWorkflowId = useStore((s) => s.setCurrentWorkflowId);
   const [name, setName] = useState(detail.name);
   const [description, setDescription] = useState(detail.description);
@@ -139,12 +142,23 @@ export function WorkflowEditor({ detail, onChange }: Props) {
             </button>
           ) : (
             <button
-              disabled
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-fg-subtle/30 text-fg-muted text-sm cursor-not-allowed"
-              title="Phase 6.4 启用执行"
+              onClick={() => onRun?.()}
+              disabled={
+                isRunning ||
+                detail.steps.length === 0 ||
+                !onRun
+              }
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-accent hover:bg-accent-hover text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title={
+                detail.steps.length === 0
+                  ? "至少添加 1 个步骤"
+                  : isRunning
+                    ? "正在执行..."
+                    : "执行整个工作流"
+              }
             >
               <Play size={14} />
-              执行
+              {isRunning ? "执行中" : "执行"}
             </button>
           )}
         </div>
