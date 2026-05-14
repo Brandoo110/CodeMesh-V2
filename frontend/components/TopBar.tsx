@@ -24,9 +24,9 @@ export function TopBar() {
   const setView = useStore((s) => s.setView);
 
   return (
-    <header className="h-14 flex-shrink-0 border-b border-border bg-canvas flex items-center justify-between px-4">
-      {/* 左：sidebar toggle + 标题 */}
-      <div className="flex items-center gap-3">
+    <header className="h-14 flex-shrink-0 border-b border-border bg-canvas flex items-center px-4">
+      {/* 左：sidebar toggle + 标题（flex-1 占据剩余空间 1/2） */}
+      <div className="flex-1 flex items-center gap-3">
         <button
           className="p-1.5 rounded-md hover:bg-surface text-fg-muted transition-colors"
           onClick={toggleSidebar}
@@ -37,7 +37,7 @@ export function TopBar() {
         <h1 className="text-sm font-medium text-fg">CodeMesh</h1>
       </div>
 
-      {/* 中：segmented control 3-tab */}
+      {/* 中：segmented control 3-tab（不 grow，靠左右 flex-1 居中） */}
       <div className="flex items-center bg-surface rounded-lg p-0.5 border border-border">
         {VIEWS.map(({ id, label, icon: Icon }) => (
           <button
@@ -56,8 +56,8 @@ export function TopBar() {
         ))}
       </div>
 
-      {/* 右：ModelSelector（仅 chat 显示，workflow 模型在 step 内选） */}
-      <div className="flex items-center gap-2 min-w-[120px] justify-end">
+      {/* 右：ModelSelector（flex-1 让 model 名长短不影响中间居中） */}
+      <div className="flex-1 flex items-center gap-2 justify-end">
         {view === "chat" && <ModelSelector />}
       </div>
     </header>
