@@ -41,8 +41,8 @@ CodeMesh 是 **面试 / 学习项目**，不是上线产品。这条决定了所
 
 详细技术笔记按主题拆到独立文件：
 
-- `Projects/CodeMesh/web-ui-backend-notes.md`
-- `Projects/CodeMesh/web-ui-frontend-notes.md`
+- `Projects/CodeMesh/backend-notes.md`
+- `Projects/CodeMesh/frontend-notes.md`
 - 未来加新主题时新建独立 md，不堆 devlog
 
 ---
