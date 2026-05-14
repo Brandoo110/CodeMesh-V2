@@ -44,12 +44,24 @@ _NATIVE_KEY_ENV: dict[str, tuple[str, ...]] = {
 # 模型展示 metadata（颜色和 feedback/render_html.py 的 MODEL_COLORS 对齐）
 # name 是 UI 上的显示标签——和 adapter 里实际 model id 对齐方便用户知道在跑什么。
 # 实际 model id 可通过 DEEPSEEK_MODEL / GEMINI_MODEL / MINIMAX_MODEL 等 env 覆盖。
-_MODEL_META = {
-    "deepseek": {"name": "DeepSeek V4 Pro",       "color": "#5b8def"},
-    "qwen":     {"name": "Qwen 3 Max",            "color": "#7c3aed"},
-    "doubao":   {"name": "Doubao Pro",            "color": "#ef4444"},
-    "gemini":   {"name": "Gemini 3.1 Flash Lite", "color": "#10b981"},
-    "minimax":  {"name": "MiniMax M2.7",          "color": "#f59e0b"},
+# color 是品牌色（和 feedback/render_html.py 的 MODEL_COLORS 对齐）；
+# label 从 adapter 实际 model id 反推，避免 hardcode 撒谎（用户改 .env 里
+# *_MODEL 之后 UI label 也跟着变）。
+_MODEL_COLOR = {
+    "deepseek": "#5b8def",
+    "qwen":     "#7c3aed",
+    "doubao":   "#ef4444",
+    "gemini":   "#10b981",
+    "minimax":  "#f59e0b",
+}
+
+# provider id → 漂亮的厂商前缀（用于拼 UI label）
+_PROVIDER_LABEL = {
+    "deepseek": "DeepSeek",
+    "qwen":     "Qwen",
+    "doubao":   "Doubao",
+    "gemini":   "Gemini",
+    "minimax":  "MiniMax",
 }
 
 
@@ -65,20 +77,54 @@ def is_configured(model_id: str) -> bool:
     return any(len(os.getenv(e, "").strip()) >= 20 for e in env_names)
 
 
+def _resolve_adapter_model_id(provider: str) -> str:
+    """
+    从 adapter 反推真实 model id（DEEPSEEK_MODEL / GEMINI_MODEL 等 env
+    覆盖后 UI label 跟着变）。adapter 实例化不发网络请求——AsyncOpenAI 客户
+    端是 lazy 的——所以这一步零成本。
+    """
+    # lazy import 避免循环依赖
+    from orchestration.adapters import (
+        DashScopeAdapter,
+        DeepSeekAdapter,
+        GeminiAdapter,
+        MiniMaxAdapter,
+        VolcEngineAdapter,
+    )
+
+    try:
+        match provider:
+            case "deepseek":
+                return DeepSeekAdapter().model
+            case "qwen":
+                return DashScopeAdapter().model
+            case "doubao":
+                return VolcEngineAdapter().model
+            case "gemini":
+                return GeminiAdapter().model
+            case "minimax":
+                return MiniMaxAdapter().model
+    except Exception:  # noqa: BLE001
+        pass
+    return provider  # 兜底
+
+
 def list_models() -> list[dict]:
     """
-    返回**已配置**模型的 metadata。未配 API key 的不出现在列表里，
-    避免用户在 UI 里选了一个跑不通的模型。
+    返回**已配置**模型的 metadata。未配 API key 的不出现在列表里。
 
-    用户后续配上对应 env 后无需改代码，重启后端 / hot-reload 即可生效。
+    name 字段从 adapter.model 反推（如 "DeepSeek · deepseek-v4-pro"），
+    .env 里改 *_MODEL 之后 UI label 也会跟着变——不再 hardcode 撒谎。
     """
-    return [
-        {
-            "id": model_id,
-            "name": meta["name"],
+    rows: list[dict] = []
+    for provider in _PROVIDER_LABEL:
+        if not is_configured(provider):
+            continue
+        model_id = _resolve_adapter_model_id(provider)
+        rows.append({
+            "id": provider,
+            "name": f"{_PROVIDER_LABEL[provider]} · {model_id}",
             "configured": True,
-            "color": meta["color"],
-        }
-        for model_id, meta in _MODEL_META.items()
-        if is_configured(model_id)
-    ]
+            "color": _MODEL_COLOR.get(provider, "#9ca3af"),
+        })
+    return rows
