@@ -34,10 +34,21 @@ interface Props {
   onChange: () => Promise<void> | void;
   /** 触发执行整个工作流（Phase 6.5）。 */
   onRun?: () => Promise<void> | void;
+  /** 触发单步执行（Phase 6.8）。 */
+  onRunStep?: (stepId: string) => Promise<void> | void;
   isRunning?: boolean;
+  /** 当前正在跑的 step id（单步或整体都可能填）。 */
+  runningStepId?: string | null;
 }
 
-export function WorkflowEditor({ detail, onChange, onRun, isRunning }: Props) {
+export function WorkflowEditor({
+  detail,
+  onChange,
+  onRun,
+  onRunStep,
+  isRunning,
+  runningStepId,
+}: Props) {
   const setCurrentWorkflowId = useStore((s) => s.setCurrentWorkflowId);
   const [name, setName] = useState(detail.name);
   const [description, setDescription] = useState(detail.description);
@@ -218,6 +229,8 @@ export function WorkflowEditor({ detail, onChange, onRun, isRunning }: Props) {
                 readOnly={readOnly}
                 onUpdate={(patch) => handleStepUpdate(step.id, patch)}
                 onDelete={() => handleStepDelete(step.id)}
+                onRunStep={onRunStep ? () => onRunStep(step.id) : undefined}
+                isRunningStep={runningStepId === step.id}
               />
 
               {/* 步骤连接线（最后一个不画） */}

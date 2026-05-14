@@ -20,11 +20,12 @@
  *   isRunning:    SSE 流尚未 done 之前是 true
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useStore } from "@/lib/store";
 import { listWorkflows, getWorkflow } from "@/lib/workflow-api";
-import { streamWorkflowRun } from "@/lib/workflow-sse";
-import type { WorkflowDetail } from "@/lib/workflow-types";
+import { streamWorkflowRun, streamStepRun } from "@/lib/workflow-sse";
+import type { WorkflowDetail, Step } from "@/lib/workflow-types";
+import type { StreamEvent } from "@/lib/workflow-sse";
 import { WorkflowList } from "./WorkflowList";
 import { WorkflowEditor } from "./WorkflowEditor";
 import { WorkflowRunPanel, type StepRunState } from "./WorkflowRunPanel";
@@ -99,12 +100,175 @@ export function WorkflowsView() {
 
   // ───── 执行入口 ─────
 
+  /** 公共 SSE 消费器：handleRun 和 handleRunStep 共用。 */
+  const consumeEvents = useCallback(
+    async (gen: AsyncGenerator<StreamEvent>) => {
+      setIsRunning(true);
+      setRunError(null);
+
+      try {
+        for await (const ev of gen) {
+          const data = ev.data as Record<string, unknown>;
+          const stepId = data.step_id as string | undefined;
+
+          switch (ev.event) {
+            case "run_start":
+              setCurrentRunId(data.run_id as string);
+              break;
+
+            case "step_start":
+              if (stepId) {
+                setRunStates((prev) => {
+                  const next = new Map(prev);
+                  next.set(stepId, {
+                    status: "running",
+                    output: "",
+                    toolCalls: [],
+                  });
+                  return next;
+                });
+              }
+              break;
+
+            case "token":
+              if (stepId) {
+                setRunStates((prev) => {
+                  const next = new Map(prev);
+                  const cur = next.get(stepId);
+                  if (cur) {
+                    next.set(stepId, {
+                      ...cur,
+                      output: cur.output + (data.delta as string),
+                    });
+                  }
+                  return next;
+                });
+              }
+              break;
+
+            case "tool_start":
+              if (stepId) {
+                setRunStates((prev) => {
+                  const next = new Map(prev);
+                  const cur = next.get(stepId);
+                  if (cur) {
+                    next.set(stepId, {
+                      ...cur,
+                      toolCalls: [
+                        ...cur.toolCalls,
+                        {
+                          name: data.name as string,
+                          args: data.args as Record<string, unknown> | undefined,
+                          status: "pending",
+                        },
+                      ],
+                    });
+                  }
+                  return next;
+                });
+              }
+              break;
+
+            case "tool_end":
+              if (stepId) {
+                setRunStates((prev) => {
+                  const next = new Map(prev);
+                  const cur = next.get(stepId);
+                  if (cur) {
+                    const updated = [...cur.toolCalls];
+                    for (let i = updated.length - 1; i >= 0; i--) {
+                      if (
+                        updated[i].name === (data.name as string) &&
+                        updated[i].status === "pending"
+                      ) {
+                        updated[i] = {
+                          ...updated[i],
+                          result: data.result as string,
+                          ok: data.ok as boolean,
+                          status: data.ok ? "ok" : "error",
+                        };
+                        break;
+                      }
+                    }
+                    next.set(stepId, { ...cur, toolCalls: updated });
+                  }
+                  return next;
+                });
+              }
+              break;
+
+            case "diff":
+              if (stepId) {
+                setRunStates((prev) => {
+                  const next = new Map(prev);
+                  const cur = next.get(stepId);
+                  if (cur) {
+                    next.set(stepId, {
+                      ...cur,
+                      fileDiffs: data.diffs as import("./WorkflowRunPanel").StepRunState["fileDiffs"],
+                    });
+                  }
+                  return next;
+                });
+              }
+              break;
+
+            case "step_end":
+              if (stepId) {
+                const ok = data.ok as boolean;
+                setRunStates((prev) => {
+                  const next = new Map(prev);
+                  const cur = next.get(stepId);
+                  if (cur) {
+                    next.set(stepId, {
+                      ...cur,
+                      status: ok ? "done" : "error",
+                      costRmb: data.cost_rmb as number | undefined,
+                      durationMs: data.duration_ms as number | undefined,
+                      modelUsed: data.model_used as string | undefined,
+                      error: data.error as string | undefined,
+                    });
+                  }
+                  return next;
+                });
+                if (data.cost_rmb) {
+                  setTotalCost((c) => c + (data.cost_rmb as number));
+                }
+              }
+              break;
+
+            case "done":
+              setIsRunning(false);
+              if (!data.ok) {
+                setRunError((data.error as string) || "执行失败");
+              }
+              reloadDetail();
+              break;
+
+            case "error":
+              setRunError(data.message as string);
+              setIsRunning(false);
+              break;
+
+            case "cancelled":
+              setIsRunning(false);
+              break;
+          }
+        }
+      } catch (e) {
+        setRunError((e as Error).message);
+      } finally {
+        setIsRunning(false);
+      }
+    },
+    [reloadDetail],
+  );
+
+  /** 整体工作流执行：所有 steps 重置为 pending 再开始。 */
   const handleRun = useCallback(async () => {
     if (!detail || detail.steps.length === 0) return;
-
-    // 初始化所有 step 为 pending
     const fresh = new Map<string, StepRunState>();
-    detail.steps.forEach((s) =>
+    detail.steps.forEach((s: Step) =>
       fresh.set(s.id, {
         status: "pending",
         output: "",
@@ -112,173 +276,48 @@ export function WorkflowsView() {
       }),
     );
     setRunStates(fresh);
-    setIsRunning(true);
-    setRunError(null);
     setTotalCost(0);
+    await consumeEvents(streamWorkflowRun(detail.id));
+  }, [detail, consumeEvents]);
 
-    try {
-      for await (const ev of streamWorkflowRun(detail.id)) {
-        const data = ev.data as Record<string, unknown>;
-        const stepId = data.step_id as string | undefined;
+  /** 单步执行：只重置该 step 的状态，其他保留（让用户看历史输出对比）。 */
+  const handleRunStep = useCallback(
+    async (stepId: string) => {
+      if (!detail) return;
+      // 找前一步的 output 作为 seed input
+      const idx = detail.steps.findIndex((s: Step) => s.id === stepId);
+      const seedInput = idx > 0
+        ? runStates.get(detail.steps[idx - 1].id)?.output || ""
+        : "";
 
-        switch (ev.event) {
-          case "run_start":
-            setCurrentRunId(data.run_id as string);
-            break;
+      setRunStates((prev) => {
+        const next = new Map(prev);
+        next.set(stepId, {
+          status: "running",
+          output: "",
+          toolCalls: [],
+        });
+        return next;
+      });
 
-          case "step_start":
-            if (stepId) {
-              setRunStates((prev) => {
-                const next = new Map(prev);
-                next.set(stepId, {
-                  status: "running",
-                  output: "",
-                  toolCalls: [],
-                });
-                return next;
-              });
-            }
-            break;
-
-          case "token":
-            if (stepId) {
-              setRunStates((prev) => {
-                const next = new Map(prev);
-                const cur = next.get(stepId);
-                if (cur) {
-                  next.set(stepId, {
-                    ...cur,
-                    output: cur.output + (data.delta as string),
-                  });
-                }
-                return next;
-              });
-            }
-            break;
-
-          case "tool_start":
-            if (stepId) {
-              setRunStates((prev) => {
-                const next = new Map(prev);
-                const cur = next.get(stepId);
-                if (cur) {
-                  next.set(stepId, {
-                    ...cur,
-                    toolCalls: [
-                      ...cur.toolCalls,
-                      {
-                        name: data.name as string,
-                        args: data.args as Record<string, unknown> | undefined,
-                        status: "pending",
-                      },
-                    ],
-                  });
-                }
-                return next;
-              });
-            }
-            break;
-
-          case "tool_end":
-            if (stepId) {
-              setRunStates((prev) => {
-                const next = new Map(prev);
-                const cur = next.get(stepId);
-                if (cur) {
-                  // FIFO 配对：找最近一个 pending 的同名 tool call
-                  const updated = [...cur.toolCalls];
-                  for (let i = updated.length - 1; i >= 0; i--) {
-                    if (
-                      updated[i].name === (data.name as string) &&
-                      updated[i].status === "pending"
-                    ) {
-                      updated[i] = {
-                        ...updated[i],
-                        result: data.result as string,
-                        ok: data.ok as boolean,
-                        status: data.ok ? "ok" : "error",
-                      };
-                      break;
-                    }
-                  }
-                  next.set(stepId, { ...cur, toolCalls: updated });
-                }
-                return next;
-              });
-            }
-            break;
-
-          case "diff":
-            if (stepId) {
-              setRunStates((prev) => {
-                const next = new Map(prev);
-                const cur = next.get(stepId);
-                if (cur) {
-                  next.set(stepId, {
-                    ...cur,
-                    fileDiffs: data.diffs as import("./WorkflowRunPanel").StepRunState["fileDiffs"],
-                  });
-                }
-                return next;
-              });
-            }
-            break;
-
-          case "step_end":
-            if (stepId) {
-              const ok = data.ok as boolean;
-              setRunStates((prev) => {
-                const next = new Map(prev);
-                const cur = next.get(stepId);
-                if (cur) {
-                  next.set(stepId, {
-                    ...cur,
-                    status: ok ? "done" : "error",
-                    costRmb: data.cost_rmb as number | undefined,
-                    durationMs: data.duration_ms as number | undefined,
-                    modelUsed: data.model_used as string | undefined,
-                    error: data.error as string | undefined,
-                  });
-                }
-                return next;
-              });
-              if (data.cost_rmb) {
-                setTotalCost((c) => c + (data.cost_rmb as number));
-              }
-            }
-            break;
-
-          case "done":
-            setIsRunning(false);
-            if (!data.ok) {
-              setRunError((data.error as string) || "执行失败");
-            }
-            // 同步刷新详情（看新的运行历史 etc）
-            reloadDetail();
-            break;
-
-          case "error":
-            setRunError(data.message as string);
-            setIsRunning(false);
-            break;
-
-          case "cancelled":
-            setIsRunning(false);
-            break;
-        }
-      }
-    } catch (e) {
-      setRunError((e as Error).message);
-      setIsRunning(false);
-    } finally {
-      setIsRunning(false);
-    }
-  }, [detail, reloadDetail]);
+      await consumeEvents(
+        streamStepRun(detail.id, stepId, seedInput || undefined),
+      );
+    },
+    [detail, runStates, consumeEvents],
+  );
 
   const handleStopLocal = useCallback(() => {
-    // 后端已经收到 cancel；前端只更新视觉
     setIsRunning(false);
   }, []);
+
+  /** 当前正在执行的 step id（任何模式都用同一字段）。 */
+  const runningStepId = useMemo(() => {
+    for (const [sid, state] of runStates) {
+      if (state.status === "running") return sid;
+    }
+    return null;
+  }, [runStates]);
 
   return (
     <div className="flex-1 flex overflow-hidden">
@@ -296,7 +335,9 @@ export function WorkflowsView() {
             detail={detail}
             onChange={reloadDetail}
             onRun={handleRun}
+            onRunStep={handleRunStep}
             isRunning={isRunning}
+            runningStepId={runningStepId}
           />
         ) : (
           <div className="p-8 text-fg-subtle">工作流不存在</div>

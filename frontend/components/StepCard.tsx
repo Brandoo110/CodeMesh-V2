@@ -16,7 +16,7 @@
  */
 
 import { useEffect, useState } from "react";
-import { Trash2, ChevronDown } from "lucide-react";
+import { Trash2, ChevronDown, Play } from "lucide-react";
 import { useStore } from "@/lib/store";
 import type { Step } from "@/lib/workflow-types";
 import { ToolAllowlistEditor } from "./ToolAllowlistEditor";
@@ -26,9 +26,12 @@ interface Props {
   readOnly?: boolean;
   onUpdate: (patch: Partial<Step>) => Promise<void> | void;
   onDelete: () => Promise<void> | void;
+  /** v5 Phase 6.8：单独运行这一步。父组件接 streamStepRun。 */
+  onRunStep?: () => Promise<void> | void;
+  isRunningStep?: boolean;
 }
 
-export function StepCard({ step, readOnly, onUpdate, onDelete }: Props) {
+export function StepCard({ step, readOnly, onUpdate, onDelete, onRunStep, isRunningStep }: Props) {
   const [name, setName] = useState(step.name);
   const [systemPrompt, setSystemPrompt] = useState(step.system_prompt);
   const [userPrompt, setUserPrompt] = useState(step.user_prompt);
@@ -68,6 +71,17 @@ export function StepCard({ step, readOnly, onUpdate, onDelete }: Props) {
           onChange={(m) => onUpdate({ model: m })}
           disabled={readOnly}
         />
+        {!readOnly && onRunStep && (
+          <button
+            onClick={() => onRunStep()}
+            disabled={isRunningStep}
+            className="flex items-center gap-1 px-2 py-1 text-xs rounded-md text-fg-muted hover:text-accent hover:bg-canvas transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            title="只运行这一步（输入 = 上一步 output）"
+          >
+            <Play size={12} />
+            单独运行
+          </button>
+        )}
         {!readOnly && (
           <button
             onClick={onDelete}
