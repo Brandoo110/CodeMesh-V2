@@ -94,19 +94,22 @@ def _build_router_agent() -> Agent[None, RouteDecision]:
             api_key=ds_key,
             base_url="https://api.deepseek.com/v1",
         )
-        model = OpenAIModel("deepseek-chat", provider=provider)
-    elif os.getenv("GEMINI_API_KEY"):
+        # 读 env 让 .env 切模型生效，和 adapter 一致；默认 V4 Pro
+        model = OpenAIModel(
+            os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"), provider=provider
+        )
+    elif os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
         provider = OpenAIProvider(
-            api_key=os.getenv("GEMINI_API_KEY", ""),
+            api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", ""),
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
         model = OpenAIModel(
-            os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), provider=provider
+            os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"), provider=provider
         )
     else:
         # 都没配，保底起一个 DeepSeek provider，在真正调用时会失败，由上层友好提示
         provider = OpenAIProvider(api_key="", base_url="https://api.deepseek.com/v1")
-        model = OpenAIModel("deepseek-chat", provider=provider)
+        model = OpenAIModel("deepseek-v4-pro", provider=provider)
 
     return Agent(
         model=model,
