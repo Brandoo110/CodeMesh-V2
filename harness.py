@@ -191,6 +191,16 @@ class Harness:
         # 跟踪 consecutive_failures，连续 3 次失败后停止自动压缩防止坏 LLM 反复浪费钱。
         self.auto_compact_state = AutoCompactState()
 
+        # v5 Phase 6.4：工具白名单（每 step 可独立设置）
+        # None / ["*"] = 全开（兼容现有 run / run_stream_full 行为）
+        # [] = 完全禁用（纯文本生成步骤）
+        # ["grep_text", "read_file"] = 显式白名单
+        self.tool_allowlist: "list[str] | None" = None
+
+    def set_tool_allowlist(self, allowlist: "list[str] | None") -> None:
+        """v5：编排器在每 step 创建临时 harness 后调用，filter agent loop 的工具。"""
+        self.tool_allowlist = allowlist
+
     async def _ensure_long_term(self) -> None:
         await self.long_term.init()
 
@@ -530,6 +540,7 @@ class Harness:
                         messages=[{"role": "user", "content": step.description}],
                         system=system,
                         on_tool_call=on_tool_call,
+                        tool_allowlist=self.tool_allowlist,  # v5
                     )
                 else:
                     # 纯思考 → 单轮 stream 省钱省时

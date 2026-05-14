@@ -61,3 +61,99 @@ class SessionInfo(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = Field(default="新对话", description="标题；不传默认'新对话'")
+
+
+# ─────────────── Workflows (v5) ───────────────
+
+class WorkflowInfo(BaseModel):
+    """工作流元数据。GET /api/workflows 返回 list of this。"""
+    id: str
+    name: str
+    description: str = ""
+    is_template: bool = False
+    created_at: datetime
+    updated_at: datetime
+    step_count: int = 0
+
+
+class WorkflowCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(default="", max_length=1000)
+
+
+class WorkflowUpdateRequest(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=1000)
+
+
+class StepInfo(BaseModel):
+    """单个步骤定义。"""
+    id: str
+    workflow_id: str
+    step_order: int
+    name: str
+    model: Optional[str] = None
+    system_prompt: str = ""
+    user_prompt: str = ""
+    enable_tools: list[str] = Field(default_factory=lambda: ["*"])
+
+
+class StepCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    model: Optional[str] = None
+    system_prompt: str = ""
+    user_prompt: str = ""
+    enable_tools: list[str] = Field(default_factory=lambda: ["*"])
+
+
+class StepUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    model: Optional[str] = None
+    system_prompt: Optional[str] = None
+    user_prompt: Optional[str] = None
+    enable_tools: Optional[list[str]] = None
+
+
+class StepReorderRequest(BaseModel):
+    step_ids: list[str] = Field(..., description="按新顺序排列的 step id 列表")
+
+
+class WorkflowDetail(WorkflowInfo):
+    """GET /api/workflows/{id} 返回，含 steps。"""
+    steps: list[StepInfo] = Field(default_factory=list)
+
+
+# ─────────────── Workflow Runs (v5) ───────────────
+
+class RunInfo(BaseModel):
+    """单次执行元数据。"""
+    id: str
+    workflow_id: str
+    status: str  # running / done / error / cancelled
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    total_cost_rmb: float = 0.0
+    error: Optional[str] = None
+
+
+class StepResultInfo(BaseModel):
+    """单步执行结果。"""
+    id: int
+    run_id: str
+    step_id: str
+    step_order: int
+    status: str
+    output: Optional[str] = None
+    error: Optional[str] = None
+    tool_calls: Optional[list[dict]] = None
+    file_diffs: Optional[list[dict]] = None
+    model_used: Optional[str] = None
+    cost_rmb: Optional[float] = None
+    duration_ms: Optional[int] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class RunDetail(RunInfo):
+    """GET /api/workflows/runs/{id} 返回，含 step_results。"""
+    step_results: list[StepResultInfo] = Field(default_factory=list)

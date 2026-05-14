@@ -167,5 +167,6 @@ async def my_tool(...) -> str:        # 或 def，registry 都支持
 - `0004-memory-7-layer-architecture.md` — Memory 7 层架构（复刻 Claude Code 内部）
 - `0005-domestic-multi-model.md` — 国内多模型差异化策略（v1 起持续）
 - `0006-web-ui-stack-fastapi-nextjs.md` — Web UI 技术栈选 FastAPI + Next.js（拒 NestJS，2026-05-14）
+- `0007-multi-model-workflow.md` — v5 多模型工作流编排器：定位 *Dify-style workflow for Claude Code-style coding agents*；3 个差异化护城河（工具白名单 per step / 3 Coding 模板 / diff-aware 数据流）；明确不做通用 AI 应用编排（2026-05-14）
 
 新写决策按 `NNNN-短描述.md` 命名，标准结构：Status / Context / Decision / Consequences / 参考。**ADR 是讲述层最直接的素材**。

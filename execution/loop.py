@@ -57,6 +57,7 @@ async def run_agent_loop(
     system: str = "",
     max_iterations: int = MAX_ITERATIONS,
     on_tool_call=None,   # 可选回调：hook 系统会传进来
+    tool_allowlist: "set[str] | list[str] | None" = None,   # v5 Phase 6.4：工具白名单
 ) -> str:
     """
     运行 Agent Loop 直到模型停止调工具或达到上限。
@@ -82,12 +83,34 @@ async def run_agent_loop(
     client = adapter.client  # type: ignore[attr-defined]
     model = adapter.model    # type: ignore[attr-defined]
 
+    # v5 Phase 6.4 工具白名单 filter（向后兼容：None 或 ["*"] 全开）
+    #
+    # 设计：在循环外算一次 effective_tools 和 allowed_names。前者给 model 看（list_tools），
+    # 后者用于 dispatch 时的兜底拒绝（防止模型硬调被禁的工具）。
+    allow_all = tool_allowlist is None or (
+        isinstance(tool_allowlist, (list, tuple)) and "*" in tool_allowlist
+    )
+    if allow_all:
+        effective_tools = TOOL_SCHEMAS
+        allowed_names: "set[str] | None" = None
+    else:
+        allowed_names = set(tool_allowlist or ())
+        effective_tools = [
+            s for s in TOOL_SCHEMAS
+            if s.get("function", {}).get("name") in allowed_names
+        ]
+
+    # tools=[] 时 OpenAI 协议会报错，必须传 None 才能跳过 function calling
+    # 这一支用于 enable_tools=[] 的"纯文本生成"步骤
+    tools_arg = effective_tools if effective_tools else None
+    tool_choice_arg = "auto" if effective_tools else "none"
+
     for iteration in range(max_iterations):
         resp = await client.chat.completions.create(
             model=model,
             messages=convo,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",   # 让模型自己决定要不要调工具
+            tools=tools_arg,
+            tool_choice=tool_choice_arg,
             temperature=0.3,
         )
 
@@ -124,7 +147,15 @@ async def run_agent_loop(
             except json.JSONDecodeError:
                 args = {}
 
-            result = await dispatch_tool(tool_name, args)
+            # v5 Phase 6.4：白名单二次防御
+            # 一般模型看不到被禁的工具，但仍要兜底拒绝硬调（如旧 cache / prompt 注入）
+            if allowed_names is not None and tool_name not in allowed_names:
+                result = (
+                    f"[ERROR] tool {tool_name!r} is not allowed in this step. "
+                    f"Allowed tools: {sorted(allowed_names) or '(none)'}"
+                )
+            else:
+                result = await dispatch_tool(tool_name, args)
 
             # 触发外部回调（hook 在这里起作用）
             if on_tool_call is not None:
