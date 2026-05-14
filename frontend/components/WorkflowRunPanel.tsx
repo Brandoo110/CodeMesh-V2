@@ -14,9 +14,10 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { Square, Check, X, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { Square, Check, X, ChevronDown, ChevronRight, Loader2, GitCompare } from "lucide-react";
 import { cancelRun } from "@/lib/workflow-sse";
-import type { Step } from "@/lib/workflow-types";
+import type { Step, FileDiff } from "@/lib/workflow-types";
+import { DiffViewer } from "./DiffViewer";
 
 export interface StepRunState {
   status: "pending" | "running" | "done" | "error" | "cancelled";
@@ -28,6 +29,7 @@ export interface StepRunState {
     ok?: boolean;
     status: "pending" | "ok" | "error";
   }[];
+  fileDiffs?: FileDiff[];     // v5 Phase 6.6
   costRmb?: number;
   durationMs?: number;
   modelUsed?: string;
@@ -235,6 +237,17 @@ function StepRunRow({ step, state, expanded: defaultExpanded }: RowProps) {
 
           {fail && state.error && (
             <div className="text-xs text-error font-mono">{state.error}</div>
+          )}
+
+          {/* v5 Phase 6.6 护城河 #3：file diffs */}
+          {state.fileDiffs && state.fileDiffs.length > 0 && (
+            <div className="pt-2 border-t border-border/30 space-y-2">
+              <div className="flex items-center gap-1.5 text-xs text-fg-muted">
+                <GitCompare size={11} />
+                文件变更 ({state.fileDiffs.length})
+              </div>
+              <DiffViewer diffs={state.fileDiffs} collapsed={true} />
+            </div>
           )}
         </div>
       )}

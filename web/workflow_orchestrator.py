@@ -18,12 +18,24 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 from harness import Harness
 from web.workflows_store import WorkflowsStore
+
+
+# diff snapshot 配置（详见 docs/workflow-design-plan.md §8.3）
+_SNAPSHOT_SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "__pycache__", ".next",
+    "dist", "build", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".codemesh",  # 跳过工作流自己的 DB 目录
+}
+_SNAPSHOT_MAX_FILE_BYTES = 100_000  # 跳过大文件（图片 / 数据）
+_DIFF_MAX_FILES = 30                # 单步 diff 最多记 30 个文件
+_DIFF_MAX_BYTES = 200_000           # file_diffs JSON 总上限 ~200KB
 
 
 class WorkflowOrchestrator:
@@ -111,6 +123,9 @@ class WorkflowOrchestrator:
 
             harness = self._make_step_harness(step)
 
+            # diff snapshot before（Phase 6.6 护城河 #3）
+            before_snapshot = self._snapshot_dir()
+
             full_answer = ""
             tool_calls: list[dict] = []
             cost_rmb = 0.0
@@ -161,6 +176,21 @@ class WorkflowOrchestrator:
 
             duration_ms = int((time.time() - step_start_ts) * 1000)
 
+            # diff snapshot after + 计算 diff（Phase 6.6 护城河 #3）
+            file_diffs: Optional[list[dict]] = None
+            try:
+                after_snapshot = self._snapshot_dir()
+                file_diffs = self._compute_diffs(before_snapshot, after_snapshot)
+                # diff 也作为 SSE 事件吐给前端（实时展示）
+                if file_diffs:
+                    yield {
+                        "type": "diff",
+                        "data": {"step_id": step["id"], "diffs": file_diffs},
+                    }
+            except Exception as snap_err:
+                # diff 失败不影响主流程（锦上添花层）
+                print(f"[orchestrator] diff snapshot failed: {snap_err}")
+
             # 持久化 step result
             status = "error" if step_error else "done"
             await self.store.save_step_result(
@@ -170,7 +200,7 @@ class WorkflowOrchestrator:
                 output=full_answer or None,
                 error=step_error,
                 tool_calls=tool_calls or None,
-                file_diffs=None,  # Phase 6.6 填
+                file_diffs=file_diffs,
                 model_used=model_used,
                 cost_rmb=cost_rmb,
                 duration_ms=duration_ms,
@@ -236,3 +266,70 @@ class WorkflowOrchestrator:
             h.short_term.set_system(step["system_prompt"])
         h.set_tool_allowlist(step.get("enable_tools") or ["*"])
         return h
+
+    # ─────────────── Diff snapshot（Phase 6.6 护城河 #3） ───────────────
+
+    def _snapshot_dir(self) -> dict[str, tuple[str, str]]:
+        """
+        遍历 work_dir，返回 {rel_path: (sha256, content)} 映射。
+
+        性能保护（详见 design plan §8.3）：
+        - skip 目录：_SNAPSHOT_SKIP_DIRS
+        - skip 大文件：> _SNAPSHOT_MAX_FILE_BYTES
+        - 二进制文件用 errors="ignore" 兜底（read_text 不会抛）
+        - 任何单文件错误 → 跳过（snapshot 不能阻塞主流程）
+        """
+        snap: dict[str, tuple[str, str]] = {}
+        for path in self.work_dir.rglob("*"):
+            try:
+                if not path.is_file():
+                    continue
+                if any(p in path.parts for p in _SNAPSHOT_SKIP_DIRS):
+                    continue
+                stat = path.stat()
+                if stat.st_size > _SNAPSHOT_MAX_FILE_BYTES:
+                    continue
+                content = path.read_text(errors="ignore")
+            except (OSError, UnicodeDecodeError):
+                continue
+            digest = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+            rel = str(path.relative_to(self.work_dir))
+            snap[rel] = (digest, content)
+        return snap
+
+    def _compute_diffs(
+        self,
+        before: dict[str, tuple[str, str]],
+        after: dict[str, tuple[str, str]],
+    ) -> list[dict]:
+        """对比 before / after，返回变化文件列表（含完整 before/after 内容）。"""
+        diffs: list[dict] = []
+        total_bytes = 0
+        all_paths = sorted(set(before) | set(after))
+        for path in all_paths:
+            b_digest, b_content = before.get(path, ("", ""))
+            a_digest, a_content = after.get(path, ("", ""))
+            if b_digest == a_digest:
+                continue
+            kind = (
+                "modified" if (path in before and path in after)
+                else ("created" if path in after else "deleted")
+            )
+            entry = {
+                "path": path,
+                "before": b_content,
+                "after": a_content,
+                "kind": kind,
+            }
+            # 单条 diff 大小
+            entry_size = len(b_content) + len(a_content)
+            if total_bytes + entry_size > _DIFF_MAX_BYTES:
+                # 超阈值 → 截断 content，保留 path 让 UI 显示"变更但不展开"
+                entry["before"] = b_content[:500] + ("\n…[truncated]" if len(b_content) > 500 else "")
+                entry["after"] = a_content[:500] + ("\n…[truncated]" if len(a_content) > 500 else "")
+                entry["truncated"] = True
+            total_bytes += entry_size
+            diffs.append(entry)
+            if len(diffs) >= _DIFF_MAX_FILES:
+                break
+        return diffs

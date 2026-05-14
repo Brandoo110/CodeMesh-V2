@@ -238,6 +238,56 @@ class TestOrchestrator(unittest.TestCase):
         final_run = asyncio.run(self.store.get_run(run["id"]))
         self.assertEqual(final_run["status"], "error")
 
+    def test_snapshot_skips_skip_dirs_and_large_files(self):
+        """Phase 6.6: snapshot 不抓 .git / node_modules / 大文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            (wd / ".git").mkdir()
+            (wd / ".git" / "config").write_text("[core]")
+            (wd / "node_modules").mkdir()
+            (wd / "node_modules" / "x.js").write_text("var x = 1;")
+            (wd / "src").mkdir()
+            (wd / "src" / "main.py").write_text("print('hi')")
+            (wd / "big.bin").write_text("x" * 200_000)  # 超阈值
+
+            orch = WorkflowOrchestrator(self.store, work_dir=wd)
+            snap = orch._snapshot_dir()
+            paths = set(snap.keys())
+            self.assertIn("src/main.py", paths)
+            self.assertNotIn("big.bin", paths)
+            self.assertFalse(any(".git" in p for p in paths))
+            self.assertFalse(any("node_modules" in p for p in paths))
+
+    def test_compute_diffs_detects_create_modify_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            orch = WorkflowOrchestrator(self.store, work_dir=wd)
+
+            before = {
+                "a.py": ("hash_a", "print('a')"),
+                "b.py": ("hash_b", "print('b old')"),
+            }
+            after = {
+                "a.py": ("hash_a", "print('a')"),                # unchanged
+                "b.py": ("hash_b2", "print('b new')"),           # modified
+                "c.py": ("hash_c", "print('c')"),                # created
+            }
+            diffs = orch._compute_diffs(before, after)
+            kinds = {d["path"]: d["kind"] for d in diffs}
+            self.assertEqual(kinds.get("b.py"), "modified")
+            self.assertEqual(kinds.get("c.py"), "created")
+            self.assertNotIn("a.py", kinds)  # unchanged not in diffs
+
+            # 删除场景
+            after2 = {"b.py": ("hash_b", "print('b old')")}
+            before2 = {
+                "b.py": ("hash_b", "print('b old')"),
+                "deleted.py": ("hash_d", "x = 1"),
+            }
+            diffs2 = orch._compute_diffs(before2, after2)
+            kinds2 = {d["path"]: d["kind"] for d in diffs2}
+            self.assertEqual(kinds2.get("deleted.py"), "deleted")
+
     def test_cancel_flag_stops_between_steps(self):
         wid, s1, s2 = self._build_two_step_workflow()
         run = asyncio.run(self.store.create_run(wid))

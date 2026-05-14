@@ -208,6 +208,22 @@ export function WorkflowsView() {
             }
             break;
 
+          case "diff":
+            if (stepId) {
+              setRunStates((prev) => {
+                const next = new Map(prev);
+                const cur = next.get(stepId);
+                if (cur) {
+                  next.set(stepId, {
+                    ...cur,
+                    fileDiffs: data.diffs as import("./WorkflowRunPanel").StepRunState["fileDiffs"],
+                  });
+                }
+                return next;
+              });
+            }
+            break;
+
           case "step_end":
             if (stepId) {
               const ok = data.ok as boolean;
