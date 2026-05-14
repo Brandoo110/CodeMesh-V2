@@ -6,9 +6,11 @@ Workflows / Steps / Runs CRUD（v5 Phase 6.1）。
 
 路由前缀：/workflows（最终被 server.py 挂到 /api 下）。
 """
-from typing import Any
+import json
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from sse_starlette.sse import EventSourceResponse
 
 from web.schemas import (
     RunDetail,
@@ -23,6 +25,7 @@ from web.schemas import (
     WorkflowInfo,
     WorkflowUpdateRequest,
 )
+from web.workflow_orchestrator import WorkflowOrchestrator
 from web.workflows_store import WorkflowsStore, get_workflows_store
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
@@ -266,3 +269,120 @@ async def get_run(
         **run,
         step_results=[StepResultInfo(**r) for r in results],
     )
+
+
+# ─────────────── Execution (SSE) ───────────────
+
+# 模块级 orchestrator 单例。所有 run 共享一份 cancel flags dict——
+# 这是有意为之：跨请求才能让 cancel 路由找到正在跑的 run。
+_orchestrator: Optional[WorkflowOrchestrator] = None
+
+
+def _get_orchestrator(store: WorkflowsStore) -> WorkflowOrchestrator:
+    global _orchestrator
+    if _orchestrator is None or _orchestrator.store is not store:
+        _orchestrator = WorkflowOrchestrator(store=store)
+    return _orchestrator
+
+
+async def _stream_run_events(
+    orchestrator: WorkflowOrchestrator,
+    workflow_id: str,
+    run_id: str,
+    *,
+    only_step_id: Optional[str] = None,
+    seed_input: Optional[str] = None,
+):
+    """共享 SSE event generator：把 orchestrator 事件转 EventSource 帧。"""
+    try:
+        async for event in orchestrator.run(
+            workflow_id, run_id,
+            only_step_id=only_step_id,
+            seed_input=seed_input,
+        ):
+            yield {
+                "event": event.get("type", "message"),
+                "data": json.dumps(event.get("data", {}), ensure_ascii=False),
+            }
+    except Exception as e:
+        yield {
+            "event": "error",
+            "data": json.dumps(
+                {"message": f"{type(e).__name__}: {e}"}, ensure_ascii=False,
+            ),
+        }
+
+
+@router.post("/{workflow_id}/run")
+async def run_workflow(
+    workflow_id: str,
+    store: WorkflowsStore = Depends(get_workflows_store),
+):
+    """
+    执行整个工作流（SSE）。
+
+    协议：每个 step 依次推 step_start → token* → tool_start/end* → usage →
+    step_end。流末尾 done（含 total_cost）。任一步骤失败立即终止整个 run。
+
+    Run id 在端点内 create_run 创建并通过 run_start 事件回传给前端，
+    便于后续 cancel / 查询。
+    """
+    await _ensure_init(store)
+    wf = await store.get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+    if wf["step_count"] == 0:
+        raise HTTPException(400, "workflow has no steps")
+
+    run = await store.create_run(workflow_id)
+    orchestrator = _get_orchestrator(store)
+
+    return EventSourceResponse(
+        _stream_run_events(orchestrator, workflow_id, run["id"]),
+    )
+
+
+@router.post("/{workflow_id}/steps/{step_id}/run")
+async def run_single_step(
+    workflow_id: str,
+    step_id: str,
+    seed_input: str = "",
+    store: WorkflowsStore = Depends(get_workflows_store),
+):
+    """
+    单步执行（Phase 6.8 启用入口；Phase 6.4 路由先就绪）。
+
+    seed_input 作为上一步输出注入；若空则只用 step.user_prompt。
+    """
+    await _ensure_init(store)
+    wf = await store.get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+    step = await store.get_step(step_id)
+    if not step or step["workflow_id"] != workflow_id:
+        raise HTTPException(404, f"step {step_id} not found in workflow {workflow_id}")
+
+    run = await store.create_run(workflow_id)
+    orchestrator = _get_orchestrator(store)
+    return EventSourceResponse(
+        _stream_run_events(
+            orchestrator, workflow_id, run["id"],
+            only_step_id=step_id, seed_input=seed_input or None,
+        ),
+    )
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(
+    run_id: str,
+    store: WorkflowsStore = Depends(get_workflows_store),
+) -> dict[str, Any]:
+    """
+    标记 run 为 cancelled。当前 step 跑完后退出（不打断 LLM call）。
+
+    返回 ok=True 即使 run 不存在 / 已结束——cancel 是幂等动作。
+    """
+    await _ensure_init(store)
+    orchestrator = _get_orchestrator(store)
+    orchestrator.cancel(run_id)
+    return {"ok": True, "run_id": run_id}
