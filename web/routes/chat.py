@@ -82,12 +82,17 @@ async def chat(
         # ephemeral chat：清空 short_term 但保留 system
         harness.short_term.clear()
 
-    # 2. 跑 harness
+    # 2. 跑 harness（如果前端选了模型，绕开 router，强制用选定模型）
     t0 = time.perf_counter()
+    prev_pref = harness.preferred_model
     try:
+        if req.model:
+            harness.set_preferred_model(req.model)
         answer = await harness.run(req.task)
     except Exception as e:
         raise HTTPException(500, f"{type(e).__name__}: {e}")
+    finally:
+        harness.set_preferred_model(prev_pref)
     duration_ms = int((time.perf_counter() - t0) * 1000)
 
     costs = getattr(harness, "last_costs", []) or []
@@ -146,42 +151,51 @@ async def chat_stream(
         harness.short_term.clear()
 
     # 2. 流式生成 + 同时累积答案/工具/用量用于落库
+    # 如果前端选了模型，临时设 preferred_model 绕开 router；流结束 reset。
+    prev_pref = harness.preferred_model
+    if req.model:
+        harness.set_preferred_model(req.model)
+
     async def event_generator():
         full_answer: list[str] = []
         tool_calls: list[dict] = []
         usage_data: dict = {}
         error_msg: str | None = None
 
-        async for event in harness.run_stream_full(req.task):
-            etype = event.get("type", "token")
-            edata = event.get("data", {})
+        try:
+            async for event in harness.run_stream_full(req.task):
+                etype = event.get("type", "token")
+                edata = event.get("data", {})
 
-            # 累积用于持久化
-            if etype == "token":
-                full_answer.append(str(edata.get("delta", "")))
-            elif etype == "tool_start":
-                tool_calls.append({
-                    "name": edata.get("name", ""),
-                    "args": edata.get("args", {}),
-                    "status": "pending",
-                })
-            elif etype == "tool_end":
-                # FIFO 配对 pending 同名工具更新结果
-                for tc in tool_calls:
-                    if tc.get("name") == edata.get("name") and tc.get("status") == "pending":
-                        tc["result"] = edata.get("result", "")
-                        tc["ok"] = bool(edata.get("ok", True))
-                        tc["status"] = "ok" if tc["ok"] else "error"
-                        break
-            elif etype == "usage":
-                usage_data = edata
-            elif etype == "error":
-                error_msg = str(edata.get("message", ""))
+                # 累积用于持久化
+                if etype == "token":
+                    full_answer.append(str(edata.get("delta", "")))
+                elif etype == "tool_start":
+                    tool_calls.append({
+                        "name": edata.get("name", ""),
+                        "args": edata.get("args", {}),
+                        "status": "pending",
+                    })
+                elif etype == "tool_end":
+                    # FIFO 配对 pending 同名工具更新结果
+                    for tc in tool_calls:
+                        if tc.get("name") == edata.get("name") and tc.get("status") == "pending":
+                            tc["result"] = edata.get("result", "")
+                            tc["ok"] = bool(edata.get("ok", True))
+                            tc["status"] = "ok" if tc["ok"] else "error"
+                            break
+                elif etype == "usage":
+                    usage_data = edata
+                elif etype == "error":
+                    error_msg = str(edata.get("message", ""))
 
-            yield {
-                "event": etype,
-                "data": json.dumps(edata, ensure_ascii=False),
-            }
+                yield {
+                    "event": etype,
+                    "data": json.dumps(edata, ensure_ascii=False),
+                }
+        finally:
+            # 流结束（含异常）reset preferred_model，避免污染下一个 chat
+            harness.set_preferred_model(prev_pref)
 
         # 3. 持久化（流结束）
         if req.session_id and not error_msg:
