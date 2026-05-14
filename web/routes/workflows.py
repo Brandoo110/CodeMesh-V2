@@ -26,6 +26,7 @@ from web.schemas import (
     WorkflowUpdateRequest,
 )
 from web.workflow_orchestrator import WorkflowOrchestrator
+from web.workflow_templates import seed_templates
 from web.workflows_store import WorkflowsStore, get_workflows_store
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
@@ -35,9 +36,15 @@ _initialized = False
 
 
 async def _ensure_init(store: WorkflowsStore) -> None:
+    """首请求时建表 + 注入内置模板。后续请求跳过。"""
     global _initialized
     if not _initialized:
         await store.init()
+        # Phase 6.7：内置模板 idempotent seed
+        try:
+            await seed_templates(store)
+        except Exception as e:
+            print(f"[workflows] failed to seed templates: {e}")
         _initialized = True
 
 
