@@ -11,6 +11,7 @@ import { Sidebar } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { ChatView } from "@/components/ChatView";
 import { StatsView } from "@/components/StatsView";
+import { WorkflowsView } from "@/components/WorkflowsView";
 import { useStore } from "@/lib/store";
 import { fetchModels } from "@/lib/api";
 
@@ -25,6 +26,16 @@ export default function Home() {
         console.error("Failed to load models:", e);
       });
   }, [setModels]);
+
+  // workflows view 占满整个区域（无外部 Sidebar），保持 chat / stats 现有结构
+  if (view === "workflows") {
+    return (
+      <div className="flex h-screen w-screen overflow-hidden bg-canvas flex-col">
+        <TopBar />
+        <WorkflowsView />
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-canvas">

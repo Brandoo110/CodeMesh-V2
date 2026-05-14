@@ -13,8 +13,9 @@
 
 import { create } from "zustand";
 import type { ModelInfo } from "./types";
+import type { Workflow } from "./workflow-types";
 
-export type View = "chat" | "stats";
+export type View = "chat" | "stats" | "workflows";
 
 interface StoreState {
   // 模型
@@ -33,9 +34,15 @@ interface StoreState {
   sidebarOpen: boolean;
   toggleSidebar: () => void;
 
-  // View 切换（Phase 4）
+  // View 切换（Phase 4 → Phase 6.2 加 workflows）
   view: View;
   setView: (v: View) => void;
+
+  // Workflows（v5 Phase 6.2）
+  workflows: Workflow[];
+  currentWorkflowId: string | null;
+  setWorkflows: (w: Workflow[]) => void;
+  setCurrentWorkflowId: (id: string | null) => void;
 }
 
 export const useStore = create<StoreState>((set) => ({
@@ -54,4 +61,9 @@ export const useStore = create<StoreState>((set) => ({
 
   view: "chat",
   setView: (v) => set({ view: v }),
+
+  workflows: [],
+  currentWorkflowId: null,
+  setWorkflows: (w) => set({ workflows: w }),
+  setCurrentWorkflowId: (id) => set({ currentWorkflowId: id }),
 }));
