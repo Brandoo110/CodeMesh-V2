@@ -33,14 +33,22 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _dumps_tools(allowlist: list[str]) -> str:
-    """工具白名单序列化。None 或空当作 ['*'] 即全开（向后兼容）。"""
-    if not allowlist:
+def _dumps_tools(allowlist: Optional[list[str]]) -> str:
+    """
+    工具白名单序列化。三种语义严格区分：
+      None  → ["*"]   未传 = 默认全开（向后兼容）
+      []    → []      明确"完全禁用"（纯文本生成步骤）
+      [...] → [...]   显式白名单
+
+    早期把 [] 也当 ["*"] 吞掉是 bug——前端"禁用"按钮就是用 [] 表达禁用。
+    """
+    if allowlist is None:
         return json.dumps(["*"])
     return json.dumps(allowlist, ensure_ascii=False)
 
 
 def _loads_tools(raw: Optional[str]) -> list[str]:
+    """反序列化。空字符串 / None → 默认 ["*"]；其余按 JSON 解析（含合法的 []）。"""
     if not raw:
         return ["*"]
     try:
@@ -292,7 +300,10 @@ class WorkflowsStore:
             )
             max_order = (await cur.fetchone())[0]
             next_order = max_order + 1
-            tools_json = _dumps_tools(enable_tools or ["*"])
+            # Python truthy 陷阱：`enable_tools or ["*"]` 会把 [] 也变成 ["*"]，
+            # 破坏"完全禁用"语义。只把真正的 None 当默认。
+            stored_tools = ["*"] if enable_tools is None else enable_tools
+            tools_json = _dumps_tools(stored_tools)
             await db.execute(
                 """
                 INSERT INTO workflow_steps
@@ -311,7 +322,7 @@ class WorkflowsStore:
             "model": model,
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
-            "enable_tools": enable_tools or ["*"],
+            "enable_tools": stored_tools,
         }
 
     async def get_steps(self, wid: str) -> list[dict[str, Any]]:

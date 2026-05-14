@@ -70,7 +70,9 @@ export async function* streamChat(
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      // normalize CRLF → LF: sse-starlette 在 chunked transfer 下发的是 \r\n
+      // 而 indexOf("\n\n") 找不到 \r\n\r\n 中的连续 \n，所以必须先 normalize
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
 
       // SSE 用 \n\n 分帧
       let idx: number;

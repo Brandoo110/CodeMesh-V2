@@ -197,9 +197,39 @@ class Harness:
         # ["grep_text", "read_file"] = 显式白名单
         self.tool_allowlist: "list[str] | None" = None
 
+        # v5 Phase 6.4：preferred_model — 编排器强制指定的模型（绕开 router）。
+        # None = 走 router 自动决策（chat 行为不变）。
+        # 设了非空字符串 = 所有 route() 都被 short-circuit 成这个 model。
+        self.preferred_model: "str | None" = None
+
     def set_tool_allowlist(self, allowlist: "list[str] | None") -> None:
         """v5：编排器在每 step 创建临时 harness 后调用，filter agent loop 的工具。"""
         self.tool_allowlist = allowlist
+
+    def set_preferred_model(self, model: "str | None") -> None:
+        """v5：编排器在每 step 创建临时 harness 后调用，强制指定模型（绕 router）。"""
+        self.preferred_model = model
+
+    async def _decide_route(self, task: str):
+        """
+        Router 决策的统一入口。
+
+        如果 preferred_model 已设置（工作流场景），就 short-circuit 返回一个
+        RouteDecision，跳过 LLM 决策。否则照常走 route()。
+
+        complexity 推断规则（preferred_model 模式下）：
+          - tool_allowlist == [] → simple（纯文本步骤）
+          - 其他（None / 数组）→ complex（agent loop，可调工具）
+        """
+        if self.preferred_model:
+            from orchestration.router import RouteDecision
+            complexity = "simple" if self.tool_allowlist == [] else "complex"
+            return RouteDecision(
+                model=self.preferred_model,
+                complexity=complexity,
+                reason=f"workflow override (tool_allowlist={self.tool_allowlist})",
+            )
+        return await route(task)
 
     async def _ensure_long_term(self) -> None:
         await self.long_term.init()
@@ -452,7 +482,7 @@ class Harness:
         self.hooks.trigger(HookEvent.SESSION_START, task=task)
         self.hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt=task)
 
-        decision = await route(task)
+        decision = await self._decide_route(task)
         print(
             f"[router] model={decision.model} "
             f"complexity={decision.complexity} reason={decision.reason}"
@@ -468,6 +498,25 @@ class Harness:
         t0 = time.perf_counter()
         if decision.complexity == "simple":
             answer = await self._run_single_turn(adapter, task, system)
+        elif self.preferred_model:
+            # v5 工作流场景：每个 step 已是最小单位，跳过 planner 二次拆分，
+            # 直接进 agent loop。planner 输出 "【步骤 N】..." 在工作流里没意义。
+            #
+            # 同时把 tool_call 桥接到 harness.hooks——这样 _stream_complex 的
+            # PRE/POST_TOOL_USE 监听才能拿到 tool 事件转 SSE。
+            def _hook_bridge(name: str, args: dict, result: str) -> None:
+                self.hooks.fire_pre(name, args)
+                self.hooks.fire_post(name, result)
+
+            answer = await run_agent_loop(
+                adapter=adapter,
+                messages=[{"role": "user", "content": task}],
+                system=system,
+                on_tool_call=_hook_bridge,
+                tool_allowlist=self.tool_allowlist,
+            )
+            # record costs from the agent loop
+            self._record_cost(adapter)
         else:
             answer = await self._run_planned(task, system, decision.model)
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -599,7 +648,7 @@ class Harness:
         self.hooks.trigger(HookEvent.SESSION_START, task=task)
         self.hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, prompt=task)
 
-        decision = await route(task)
+        decision = await self._decide_route(task)
         print(
             f"[router] model={decision.model} "
             f"complexity={decision.complexity} reason={decision.reason}"
@@ -640,42 +689,40 @@ class Harness:
 
     # ─────────────── 流式 + 结构化事件（Web UI Phase 3 / ADR-0006）───────────────
 
-    async def run_stream_full(self, task: str):
+    async def run_stream_full(self, task: str, model_override: "str | None" = None):
         """
         完整流式接口：yield 结构化字典事件。给 Web UI SSE 接 (web/routes/chat_stream.py)。
 
-        和 run_stream 的区别：
-          - run_stream: 只 simple 任务、yield 字符串 chunk、不带工具调用事件
-          - run_stream_full: simple + complex 都支持、yield dict events、含 tool_start/end
-
-        Event 协议：
-            {"type": "token",       "data": {"delta": "..."}}     流式 token（仅 simple）
-            {"type": "tool_start",  "data": {"name": "...", "args": {...}}}
-            {"type": "tool_end",    "data": {"name": "...", "result": "..."}}
-            {"type": "usage",       "data": {"prompt": int, "completion": int, "cost_rmb": float, "model": str}}
-            {"type": "done",        "data": {"answer": "..."}}    完整答案（complex 任务一次性给）
-            {"type": "error",       "data": {"message": "..."}}
-
-        实现思路（surgical，不改 execution/loop.py）：
-          - simple 任务: 走 adapter.complete_stream 流式 yield token，和 run_stream 一致
-          - complex 任务: asyncio.create_task(self.run(task)) 后台跑，主循环从 hooks 中转的
-            queue 消费 tool events，run 完成后 yield 完整答案（不流式，因为 agent loop 内部
-            非流式；要让 complex 也流式需要改 execution/loop.py 让 agent loop 成 generator）
-
-        hook 清理（hooks.py 没 unregister）：try/finally 直接从 _handlers list remove。
+        v5 Phase 6 修复：
+          - 加 model_override 参数。编排器在工作流场景每步指定 model 时传入，
+            绕开 router 决策——这是 v5 "每步选不同模型" 卖点的真正落地。
+          - 同时绕 complexity 决策：如果 tool_allowlist == [] 强制 simple（纯文本）；
+            否则按 tools 可见性走 complex（agent loop）。
         """
-        decision = await route(task)
-        print(
-            f"[router/stream] model={decision.model} "
-            f"complexity={decision.complexity} reason={decision.reason}"
-        )
+        if model_override:
+            # 编排器明确指定了 model：跳过 router；用 tool_allowlist 推断 complexity。
+            # tool_allowlist=[] → simple（无工具，纯文本生成）
+            # tool_allowlist=None/[...] → complex（agent loop）
+            complexity = "simple" if self.tool_allowlist == [] else "complex"
+            model = model_override
+            reason = f"workflow step override (allowlist={self.tool_allowlist})"
+            print(f"[router/stream] OVERRIDE model={model} complexity={complexity}")
+        else:
+            decision = await self._decide_route(task)
+            print(
+                f"[router/stream] model={decision.model} "
+                f"complexity={decision.complexity} reason={decision.reason}"
+            )
+            model = decision.model
+            complexity = decision.complexity
+            reason = decision.reason
 
         try:
-            if decision.complexity == "simple":
-                async for ev in self._stream_simple(task, decision.model, decision.reason):
+            if complexity == "simple":
+                async for ev in self._stream_simple(task, model, reason):
                     yield ev
             else:
-                async for ev in self._stream_complex(task, decision.model):
+                async for ev in self._stream_complex(task, model):
                     yield ev
         except Exception as e:
             yield {"type": "error", "data": {"message": f"{type(e).__name__}: {e}"}}

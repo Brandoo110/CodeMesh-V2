@@ -45,7 +45,9 @@ async function* consumeSSE(res: Response): AsyncGenerator<StreamEvent> {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      // 把 CRLF normalize 成 LF（sse-starlette 在 chunked transfer 下发的是 \r\n
+      // 而非 \n，导致 indexOf("\n\n") 永远找不到帧边界）
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
       let idx: number;
       while ((idx = buffer.indexOf("\n\n")) >= 0) {
         const frame = buffer.slice(0, idx);

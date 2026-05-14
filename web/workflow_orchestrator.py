@@ -264,7 +264,12 @@ class WorkflowOrchestrator:
         )
         if step.get("system_prompt"):
             h.short_term.set_system(step["system_prompt"])
-        h.set_tool_allowlist(step.get("enable_tools") or ["*"])
+        # 区分 None（未配，默认全开）和 []（明确禁用）——避免 truthy 陷阱
+        et = step.get("enable_tools")
+        h.set_tool_allowlist(["*"] if et is None else et)
+        # v5 核心卖点：每步用配置的模型，绕开 router 自动决策
+        if step.get("model"):
+            h.set_preferred_model(step["model"])
         return h
 
     # ─────────────── Diff snapshot（Phase 6.6 护城河 #3） ───────────────
