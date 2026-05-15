@@ -13,12 +13,38 @@
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useState } from "react";
+import { ChevronRight, ChevronDown, Brain } from "lucide-react";
 import { useStore } from "@/lib/store";
 import type { Message } from "@/lib/types";
 import { ToolCallCard } from "./ToolCallCard";
 
 interface Props {
   message: Message;
+}
+
+/**
+ * 拆分 reasoning 模型（MiniMax-M2.x / DeepSeek-R1 等）的 `<think>...</think>`
+ * 思考过程和正式答案。流式期间 `</think>` 可能还没出现——这时整个 thinking
+ * 段还在累积，answer 暂时为空。
+ */
+function splitThink(text: string): {
+  thinking: string;
+  answer: string;
+  thinkingClosed: boolean;
+} {
+  // 闭合后的状态：<think>...</think> 后面是 answer
+  const closed = text.match(/^<think>([\s\S]*?)<\/think>\s*([\s\S]*)$/);
+  if (closed) {
+    return { thinking: closed[1].trim(), answer: closed[2].trim(), thinkingClosed: true };
+  }
+  // 还在 thinking 中
+  const open = text.match(/^<think>([\s\S]*)$/);
+  if (open) {
+    return { thinking: open[1].trim(), answer: "", thinkingClosed: false };
+  }
+  // 没有 think 标签，全部是 answer
+  return { thinking: "", answer: text, thinkingClosed: true };
 }
 
 export function MessageBubble({ message }: Props) {
@@ -59,6 +85,8 @@ export function MessageBubble({ message }: Props) {
   }
 
   // ─── Assistant ───
+  const { thinking, answer, thinkingClosed } = splitThink(message.content);
+
   return (
     <div className="flex gap-3 mb-6 max-w-[720px]">
       <div
@@ -84,10 +112,14 @@ export function MessageBubble({ message }: Props) {
           </div>
         ) : (
           <>
-            {message.content && (
+            {/* Reasoning 模型的 <think>...</think> 段：折叠显示 */}
+            {thinking && (
+              <ThinkingBlock text={thinking} streaming={!thinkingClosed} />
+            )}
+            {answer && (
               <div className="prose-msg text-fg">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {message.content}
+                  {answer}
                 </ReactMarkdown>
                 {message.pending && (
                   <span className="inline-block w-2 h-4 ml-0.5 bg-fg animate-pulse align-middle" />
@@ -108,6 +140,33 @@ export function MessageBubble({ message }: Props) {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 思考过程折叠块。流式时（streaming=true）显示淡化的实时 thinking；
+ * 闭合后默认折叠，点击展开看完整推理。
+ */
+function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }) {
+  // 流式时默认展开（让用户看到正在思考）；闭合后默认折叠（避免占地方）
+  const [open, setOpen] = useState(streaming);
+
+  return (
+    <div className="mb-3 rounded-md border border-border bg-surface/40">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-1.5 px-3 py-1.5 text-xs text-fg-muted hover:text-fg transition-colors"
+      >
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        <Brain size={12} />
+        <span>{streaming ? "思考中..." : "已思考"}</span>
+      </button>
+      {open && (
+        <div className="px-3 pb-2 text-xs text-fg-subtle whitespace-pre-wrap leading-relaxed border-t border-border/50 pt-2">
+          {text}
+        </div>
+      )}
     </div>
   );
 }

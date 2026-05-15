@@ -47,11 +47,13 @@ export function ChatView() {
   const setSessions = useStore((s) => s.setSessions);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // 新消息时自动滚到底
+  // 新消息时自动滚到底。流式期间每个 token 都触发，smooth scroll 会被打断，
+  // 用 instant + requestAnimationFrame 确保 layout 完成后再跳。
   useEffect(() => {
-    scrollRef.current?.scrollTo({
-      top: scrollRef.current.scrollHeight,
-      behavior: "smooth",
+    const el = scrollRef.current;
+    if (!el) return;
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
     });
   }, [messages]);
 
@@ -219,9 +221,11 @@ export function ChatView() {
   }
 
   return (
-    <div className="flex-1 flex flex-col min-w-0">
+    // min-h-0 是 flexbox + overflow 陷阱的标准修复：flex item 默认 min-height: auto
+    // 会让子元素被内容撑开，overflow-y-auto 失效。flex-1 + min-h-0 才能真正滚动。
+    <div className="flex-1 flex flex-col min-w-0 min-h-0">
       {/* 消息列表（滚动区） */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-8">
+      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-6 py-8">
         <div className="max-w-[820px] mx-auto">
           {messages.length === 0 ? (
             <EmptyState />
