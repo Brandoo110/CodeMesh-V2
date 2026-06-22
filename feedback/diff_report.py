@@ -4,7 +4,7 @@ Edit diff HTML 渲染（Harness 反馈层）
 
 【这模块解决什么】
 模型每次调 `edit_file` 工具，原本只返回一行 "OK: edited path (+12 bytes)"。
-对人类来说，这一行远远不够——尤其面试 demo 时，"我让 agent 改了什么？"
+对人类来说，这一行远远不够——尤其demo 时，"我让 agent 改了什么？"
 需要打开能看的 diff。
 
 这模块做"在 edit_file 成功后顺手把 diff 落盘成 HTML"，开关由 env var
@@ -18,7 +18,7 @@ Edit diff HTML 渲染（Harness 反馈层）
 HTML（行号 + 颜色块 + sticky 头部）。可控、零依赖、和 `render_html.py`
 主题完全一致。
 
-【面试点】
+【设计要点】
 "Q: 为啥不直接 git diff？"
 → Agent 修改的文件可能不在 git 仓库里（脚本、临时配置）；而且 git diff
   需要先 commit/stage，不适合"工具执行后立刻给人看"这个场景。

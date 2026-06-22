@@ -9,7 +9,7 @@ complex 任务走 planner-executor 时，原本只在终端 print 形如：
       step 2/3: [qwen] 重写 auth.py
       step 3/3: [doubao] 跑测试
 
-行号打印对面试 / demo 体验很弱：看不到拓扑、看不到每步实际成本、出错也不知道
+行号打印对demo 体验很弱：看不到拓扑、看不到每步实际成本、出错也不知道
 卡哪一步。这模块基于 `feedback/render_html.py` 把 plan + 执行结果渲染成
 单文件 HTML：步骤卡片、模型品牌色、状态徽章、成本 / 时长、输出预览。
 
@@ -17,7 +17,7 @@ complex 任务走 planner-executor 时，原本只在终端 print 形如：
 env `CODEMESH_HTML_PLAN=1` 时，每次跑 complex 任务结束后自动写到
 `.codemesh/plans/<ts>.html`，按 mtime 滚动保留 20 个。
 
-【面试点】
+【设计要点】
 "Q: 为什么不直接对接 LangGraph 的可视化？"
 → LangGraph 的图状态在节点间流转，可视化要 D3 / mermaid runtime；本项目的
   planner 是顺序执行 + 共享 short_term，渲染需求是"每步是什么 + 状态 + 成本"，

@@ -10,8 +10,6 @@ Workflows / Steps / Runs / StepResults 持久化（v5 Phase 6.1）。
   workflow_steps          步骤定义（含 enable_tools JSON 数组）
   workflow_runs           一次执行实例
   workflow_step_results   单步结果（含 tool_calls / file_diffs JSON）
-
-详见 docs/workflow-design-plan.md §4。
 """
 from __future__ import annotations
 
@@ -112,7 +110,8 @@ class WorkflowsStore:
                     started_at      TEXT NOT NULL,
                     completed_at    TEXT,
                     total_cost_rmb  REAL DEFAULT 0,
-                    error           TEXT
+                    error           TEXT,
+                    final_reply     TEXT
                 )
                 """
             )
@@ -146,7 +145,16 @@ class WorkflowsStore:
                 "CREATE INDEX IF NOT EXISTS idx_step_results_run "
                 "ON workflow_step_results(run_id, step_order)"
             )
+            await self._ensure_column(db, "workflow_runs", "final_reply", "TEXT")
             await db.commit()
+
+    async def _ensure_column(self, db, table: str, column: str, ddl: str) -> None:
+        """SQLite 轻量迁移：旧库没有新列时补一列。"""
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        existing = {row[1] for row in rows}
+        if column not in existing:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     # ─────────────── Workflows CRUD ───────────────
 
@@ -484,6 +492,7 @@ class WorkflowsStore:
             "completed_at": None,
             "total_cost_rmb": 0.0,
             "error": None,
+            "final_reply": None,
         }
 
     async def update_run(
@@ -493,6 +502,7 @@ class WorkflowsStore:
         status: Optional[str] = None,
         total_cost: Optional[float] = None,
         error: Optional[str] = None,
+        final_reply: Optional[str] = None,
     ) -> None:
         """状态推进：status 到终态（done/error/cancelled）时自动写 completed_at。"""
         fields: list[str] = []
@@ -509,6 +519,9 @@ class WorkflowsStore:
         if error is not None:
             fields.append("error = ?")
             values.append(error)
+        if final_reply is not None:
+            fields.append("final_reply = ?")
+            values.append(final_reply)
         if not fields:
             return
         values.append(run_id)
@@ -524,7 +537,8 @@ class WorkflowsStore:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
-                SELECT id, workflow_id, status, started_at, completed_at, total_cost_rmb, error
+                SELECT id, workflow_id, status, started_at, completed_at,
+                       total_cost_rmb, error, final_reply
                 FROM workflow_runs WHERE id = ?
                 """,
                 (run_id,),
@@ -540,6 +554,7 @@ class WorkflowsStore:
             "completed_at": row["completed_at"],
             "total_cost_rmb": row["total_cost_rmb"] or 0.0,
             "error": row["error"],
+            "final_reply": row["final_reply"],
         }
 
     async def list_runs(self, wid: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -547,7 +562,8 @@ class WorkflowsStore:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
-                SELECT id, workflow_id, status, started_at, completed_at, total_cost_rmb, error
+                SELECT id, workflow_id, status, started_at, completed_at,
+                       total_cost_rmb, error, final_reply
                 FROM workflow_runs WHERE workflow_id = ?
                 ORDER BY started_at DESC LIMIT ?
                 """,
@@ -563,6 +579,7 @@ class WorkflowsStore:
                 "completed_at": r["completed_at"],
                 "total_cost_rmb": r["total_cost_rmb"] or 0.0,
                 "error": r["error"],
+                "final_reply": r["final_reply"],
             }
             for r in rows
         ]

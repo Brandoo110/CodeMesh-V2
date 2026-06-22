@@ -40,7 +40,7 @@ CC / OH 的设计是"任务结束自动抽"：
 - 减：复杂的 metadata 解析 / search 评分 —— 复用现有 long_term + dreamer.recall
 - 加：抽取触发自动调（OH 的 memory/manager.py 只做存储，没抽取）
 
-【面试故事】
+【设计背景】
 "OpenHarness 提供了记忆存储基础设施（memory/manager.py），但没做'任务结束自动抽取'。
 我自己写了 80 行 auto_extract，按 CC 设计的 4 类型分类（user/feedback/project/reference）+
 Why/How 双段模板，硬约束在 200 行 / 25KB。这是 OH 没覆盖的层，CodeMesh 这部分**领先**。"

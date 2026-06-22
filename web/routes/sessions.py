@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from web.schemas import SessionCreateRequest, SessionInfo
+from web.schemas import SessionCreateRequest, SessionInfo, SessionUpdateRequest
 from web.sessions_store import SessionsStore, get_sessions_store
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -56,6 +56,27 @@ async def get_session(
     if not data:
         raise HTTPException(404, f"session {session_id} not found")
     return SessionInfo(**data)
+
+
+@router.put("/{session_id}", response_model=SessionInfo)
+async def update_session(
+    session_id: str,
+    req: SessionUpdateRequest,
+    store: SessionsStore = Depends(get_sessions_store),
+) -> SessionInfo:
+    """重命名会话。"""
+    await _ensure_init(store)
+    data = await store.get_session(session_id)
+    if not data:
+        raise HTTPException(404, f"session {session_id} not found")
+
+    title = req.title.strip() if req.title is not None else None
+    if title is not None and not title:
+        raise HTTPException(422, "title cannot be blank")
+
+    await store.update_session(session_id, title=title)
+    updated = await store.get_session(session_id)
+    return SessionInfo(**updated)
 
 
 @router.delete("/{session_id}")

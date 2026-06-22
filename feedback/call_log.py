@@ -5,7 +5,7 @@
 【这模块解决什么】
 README §7 承诺过一个 `codemesh stats` 子命令但没实现，因为 stats 强依赖
 Langfuse 需要外网账号。这模块改用 **本地 JSONL 文件** 做日志，纯离线、
-零依赖、面试现场也能演示。
+零依赖、local demo也能演示。
 
 【数据格式】
 每行一个 JSON 对象，append-only（不会改写历史）：

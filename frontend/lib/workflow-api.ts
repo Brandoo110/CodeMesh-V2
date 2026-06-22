@@ -13,6 +13,8 @@ import type {
   Workflow,
   WorkflowCreateRequest,
   WorkflowDetail,
+  WorkflowPromptDraftRequest,
+  WorkflowPromptDraftResponse,
   WorkflowUpdateRequest,
 } from "./workflow-types";
 import { ApiError } from "./api";
@@ -28,10 +30,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!res.ok) {
-    let detail = res.statusText;
+    let detail: unknown = res.statusText;
     try {
       const body = await res.json();
-      detail = body.detail || JSON.stringify(body);
+      detail = body.detail ?? body;
     } catch {
       // fall through
     }
@@ -115,4 +117,19 @@ export async function listRuns(workflowId: string, limit = 20): Promise<Run[]> {
 
 export async function getRun(runId: string): Promise<RunDetail> {
   return request<RunDetail>(`/api/workflows/runs/${runId}`);
+}
+
+// ─────────────── Prompt Drafts ───────────────
+
+export async function draftWorkflowPromptChanges(
+  workflowId: string,
+  req: WorkflowPromptDraftRequest,
+): Promise<WorkflowPromptDraftResponse> {
+  return request<WorkflowPromptDraftResponse>(
+    `/api/workflows/${workflowId}/prompt-draft`,
+    {
+      method: "POST",
+      body: JSON.stringify(req),
+    },
+  );
 }

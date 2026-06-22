@@ -17,6 +17,7 @@ FastAPI app 入口。
 CORS 策略
 ----------------------------------------------------------------------
 localhost 单用户场景（ADR-0006 部署目标），允许 Next.js 默认端口 3000。
+3001 / 3010 作为本地备用端口，避免和其他演示项目冲突。
 后续 Phase 8 部署时按域名收紧。
 
 ----------------------------------------------------------------------
@@ -34,7 +35,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from web import __version__
-from web.routes import chat, health, models, sessions, stats, workflows
+from web.routes import chat, health, memory, models, sessions, stats, workflows
 
 
 def create_app() -> FastAPI:
@@ -52,6 +53,10 @@ def create_app() -> FastAPI:
         allow_origins=[
             "http://localhost:3000",
             "http://127.0.0.1:3000",
+            "http://localhost:3001",
+            "http://127.0.0.1:3001",
+            "http://localhost:3010",
+            "http://127.0.0.1:3010",
         ],
         allow_credentials=True,
         allow_methods=["*"],
@@ -69,6 +74,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/api")
     app.include_router(sessions.router, prefix="/api")
     app.include_router(stats.router, prefix="/api")
+    app.include_router(memory.router, prefix="/api")
     app.include_router(workflows.router, prefix="/api")  # v5 Phase 6.1
 
     return app

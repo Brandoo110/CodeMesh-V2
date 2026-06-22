@@ -76,6 +76,28 @@ class TestSessionsEndpoints(unittest.TestCase):
         r = self.client.delete("/api/sessions/does-not-exist")
         self.assertEqual(r.status_code, 404)
 
+    def test_update_session_title(self):
+        r1 = self.client.post("/api/sessions", json={"title": "新对话"})
+        sid = r1.json()["id"]
+
+        r2 = self.client.put(
+            f"/api/sessions/{sid}",
+            json={"title": "求职投递看板讨论"},
+        )
+
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.json()["title"], "求职投递看板讨论")
+        sessions = self.client.get("/api/sessions").json()
+        self.assertEqual(sessions[0]["title"], "求职投递看板讨论")
+
+    def test_update_session_title_rejects_blank(self):
+        r1 = self.client.post("/api/sessions", json={"title": "新对话"})
+        sid = r1.json()["id"]
+
+        r2 = self.client.put(f"/api/sessions/{sid}", json={"title": "   "})
+
+        self.assertEqual(r2.status_code, 422)
+
     def test_get_messages_empty_session(self):
         r = self.client.post("/api/sessions", json={"title": "empty"})
         sid = r.json()["id"]

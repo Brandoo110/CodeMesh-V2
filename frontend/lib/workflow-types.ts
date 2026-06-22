@@ -41,6 +41,7 @@ export interface Run {
   completed_at: string | null;
   total_cost_rmb: number;
   error: string | null;
+  final_reply: string | null;
 }
 
 export interface FileDiff {
@@ -86,6 +87,34 @@ export interface WorkflowCreateRequest {
 export interface WorkflowUpdateRequest {
   name?: string;
   description?: string;
+}
+
+export interface WorkflowContinueRequest {
+  user_request: string;
+  run_context?: string;
+  start_step_id?: string | null;
+}
+
+export interface WorkflowPromptDraftRequest {
+  user_request: string;
+  run_context?: string;
+}
+
+export type WorkflowPromptField = "system_prompt" | "user_prompt";
+
+export interface WorkflowPromptChange {
+  step_id: string;
+  step_name: string;
+  field: WorkflowPromptField;
+  old_text: string;
+  new_text: string;
+  reason: string;
+}
+
+export interface WorkflowPromptDraftResponse {
+  summary: string;
+  start_step_id: string;
+  changes: WorkflowPromptChange[];
 }
 
 export interface StepCreateRequest {

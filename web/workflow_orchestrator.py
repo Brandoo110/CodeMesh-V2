@@ -1,8 +1,6 @@
 """
 多模型工作流编排器（v5 Phase 6.4）。
 
-设计要点（详见 docs/workflow-design-plan.md §5.3）：
-
 - 每步独立 Harness 实例，承载 step.model + step.system_prompt + step.enable_tools
 - 步骤间数据流：上一步 output 隐式拼到下一步 user_prompt 前
 - SSE 事件协议：run_start → step_start → token* → tool_start/end* → usage →
@@ -19,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import re
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
@@ -27,7 +27,7 @@ from harness import Harness
 from web.workflows_store import WorkflowsStore
 
 
-# diff snapshot 配置（详见 docs/workflow-design-plan.md §8.3）
+# diff snapshot 配置：跳过依赖目录和大文件，限制单步 diff payload。
 _SNAPSHOT_SKIP_DIRS = {
     ".git", "node_modules", ".venv", "__pycache__", ".next",
     "dist", "build", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -36,6 +36,23 @@ _SNAPSHOT_SKIP_DIRS = {
 _SNAPSHOT_MAX_FILE_BYTES = 100_000  # 跳过大文件（图片 / 数据）
 _DIFF_MAX_FILES = 30                # 单步 diff 最多记 30 个文件
 _DIFF_MAX_BYTES = 200_000           # file_diffs JSON 总上限 ~200KB
+
+_FINAL_REPLY_SYSTEM = (
+    "你负责在 coding workflow 结束后，替用户整理最终回复。"
+    "请用自然、简洁的中文说明已经完成了什么、产物在哪里、用户怎么验证。"
+    "不要逐字复述 Reviewer 或工具日志，不要输出 <think>、分析过程或内部提示。"
+    "如果 Reviewer 提到风险，只保留对用户有用的结论。"
+)
+_REVIEW_DECISION_SYSTEM = (
+    "你是 coding workflow 的 Review Decision Controller。"
+    "你的任务是根据 workflow 上下文、Coder 产物、Reviewer 输出和文件变更，"
+    "判断当前任务是否已经达到用户要求。"
+    "如果 Reviewer 明确或隐含认为交付物未完成、存在阻塞问题、缺少必需模块、"
+    "验证未通过或需要补充后才能交付，返回 needs_rework。"
+    "如果只是非阻塞建议、风格建议或后续优化，返回 done。"
+    "必须只输出 JSON，不要 Markdown，不要 <think>。"
+)
+_WRITE_TOOLS = {"edit_file", "write_file", "delete_file"}
 
 
 class WorkflowOrchestrator:
@@ -64,6 +81,7 @@ class WorkflowOrchestrator:
         run_id: str,
         *,
         only_step_id: Optional[str] = None,
+        start_step_id: Optional[str] = None,
         seed_input: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         """
@@ -73,7 +91,8 @@ class WorkflowOrchestrator:
             workflow_id: 工作流 id
             run_id:      run 实例 id（由路由层先 create_run 再传入）
             only_step_id: 只跑这一步（单步执行场景，Phase 6.8 启用）
-            seed_input:   只跑单步时上一步 output 的注入值；整体跑时无效
+            start_step_id: 从这个 step 开始顺序跑到末尾（用户继续修改场景）
+            seed_input:   注入到首个待执行 step 的上下文
 
         Yields:
             dict 事件（type / data 两键）；data 内含 step_id / step_order 等
@@ -84,6 +103,15 @@ class WorkflowOrchestrator:
             if not steps:
                 yield {"type": "error", "data": {"message": f"step {only_step_id} not found"}}
                 return
+        elif start_step_id is not None:
+            start_idx = next(
+                (idx for idx, step in enumerate(steps) if step["id"] == start_step_id),
+                None,
+            )
+            if start_idx is None:
+                yield {"type": "error", "data": {"message": f"step {start_step_id} not found"}}
+                return
+            steps = steps[start_idx:]
 
         yield {
             "type": "run_start",
@@ -92,8 +120,12 @@ class WorkflowOrchestrator:
 
         prev_output = seed_input or ""
         total_cost = 0.0
+        step_summaries: list[dict[str, Any]] = []
+        step_idx = 0
+        rework_used = False
 
-        for step in steps:
+        while step_idx < len(steps):
+            step = steps[step_idx]
             # 用户 cancel 检查（在 step boundary 之间）
             if self._cancel_flags.get(run_id):
                 await self.store.update_run(run_id, status="cancelled")
@@ -156,7 +188,7 @@ class WorkflowOrchestrator:
                                 tc["status"] = "ok" if data.get("ok", True) else "error"
                                 break
                     elif etype == "usage":
-                        cost_rmb = float(data.get("cost_rmb") or 0.0)
+                        cost_rmb += float(data.get("cost_rmb") or 0.0)
                         if data.get("model"):
                             model_used = data["model"]
                     elif etype == "error":
@@ -206,6 +238,15 @@ class WorkflowOrchestrator:
                 duration_ms=duration_ms,
             )
             total_cost += cost_rmb
+            step_summaries.append({
+                "name": step["name"],
+                "status": status,
+                "output": full_answer,
+                "error": step_error,
+                "file_diffs": file_diffs or [],
+                "model_used": model_used,
+                "cost_rmb": cost_rmb,
+            })
 
             yield {
                 "type": "step_end",
@@ -230,13 +271,92 @@ class WorkflowOrchestrator:
 
             prev_output = full_answer
 
-        await self.store.update_run(run_id, status="done", total_cost=total_cost)
+            if only_step_id is None and self._is_reviewer_step(step):
+                rework_step_idx = self._find_previous_writable_step_idx(
+                    steps, step_idx
+                )
+                decision, decision_cost, decision_model = await self._decide_rework_with_model(
+                    steps=steps,
+                    step_summaries=step_summaries,
+                    reviewer_step=step,
+                    reviewer_output=full_answer,
+                    target_step=steps[rework_step_idx] if rework_step_idx is not None else None,
+                )
+                total_cost += decision_cost
+                target_step = (
+                    steps[rework_step_idx]
+                    if rework_step_idx is not None
+                    and decision["status"] == "needs_rework"
+                    else None
+                )
+                yield {
+                    "type": "review_decision",
+                    "data": {
+                        "reviewer_step_id": step["id"],
+                        "reviewer_name": step["name"],
+                        "status": decision["status"],
+                        "target_step_id": target_step["id"] if target_step else None,
+                        "target_name": target_step["name"] if target_step else None,
+                        "reason": decision["reason"],
+                        "rework_prompt": decision["rework_prompt"],
+                        "cost_rmb": decision_cost,
+                        "model": decision_model,
+                    },
+                }
+
+                if (
+                    not rework_used
+                    and target_step is not None
+                    and decision["status"] == "needs_rework"
+                ):
+                    rework_used = True
+                    prev_output = self._build_rework_prompt(decision, full_answer)
+                    yield {
+                        "type": "rework_requested",
+                        "data": {
+                            "reviewer_step_id": step["id"],
+                            "reviewer_name": step["name"],
+                            "target_step_id": steps[rework_step_idx]["id"],
+                            "target_name": steps[rework_step_idx]["name"],
+                            "reason": decision["reason"],
+                        },
+                    }
+                    step_idx = rework_step_idx
+                    continue
+
+            step_idx += 1
+
+        final_reply, final_cost, final_model = await self._generate_final_reply(
+            steps, step_summaries
+        )
+        if final_reply:
+            total_cost += final_cost
+            yield {
+                "type": "final_start",
+                "data": {"model": final_model},
+            }
+            yield {
+                "type": "final_end",
+                "data": {
+                    "reply": final_reply,
+                    "cost_rmb": final_cost,
+                    "model": final_model,
+                },
+            }
+
+        await self.store.update_run(
+            run_id,
+            status="done",
+            total_cost=total_cost,
+            final_reply=final_reply or None,
+        )
         yield {
             "type": "done",
             "data": {
                 "ok": True,
                 "total_cost": total_cost,
                 "run_id": run_id,
+                "final_reply": final_reply,
             },
         }
 
@@ -272,6 +392,241 @@ class WorkflowOrchestrator:
             h.set_preferred_model(step["model"])
         return h
 
+    async def _generate_final_reply(
+        self,
+        steps: list[dict],
+        step_summaries: list[dict[str, Any]],
+    ) -> tuple[str, float, str]:
+        """
+        用第一步模型整理面向用户的最终回复。
+
+        这不是新的业务 step，不允许调工具，也不写入 step_results；它只是把
+        Planner/Coder/Reviewer 的输出整理成用户最终能读的一段话。
+        """
+        if not steps:
+            return "", 0.0, "auto"
+
+        first_model = steps[0].get("model") or "auto"
+        prompt = self._build_final_reply_prompt(step_summaries)
+        summary_step = {
+            "model": first_model,
+            "system_prompt": _FINAL_REPLY_SYSTEM,
+            "enable_tools": [],
+        }
+        harness = self._make_step_harness(summary_step)
+
+        reply_parts: list[str] = []
+        cost_rmb = 0.0
+        model_used = first_model
+        try:
+            async for ev in harness.run_stream_full(prompt):
+                etype = ev.get("type")
+                data = ev.get("data") or {}
+                if etype == "token":
+                    reply_parts.append(str(data.get("delta") or ""))
+                elif etype == "usage":
+                    cost_rmb += float(data.get("cost_rmb") or 0.0)
+                    if data.get("model"):
+                        model_used = str(data["model"])
+                elif etype == "error":
+                    return (
+                        f"工作流已经完成，但最终回复生成失败：{data.get('message')}",
+                        cost_rmb,
+                        model_used,
+                    )
+        except Exception as e:
+            return (
+                f"工作流已经完成，但最终回复生成失败：{type(e).__name__}: {e}",
+                cost_rmb,
+                model_used,
+            )
+
+        return _sanitize_final_reply("".join(reply_parts)), cost_rmb, model_used
+
+    def _build_final_reply_prompt(self, step_summaries: list[dict[str, Any]]) -> str:
+        parts = [
+            "请根据下面的 workflow 执行结果，给用户写最终回复。",
+            "要求：",
+            "- 用中文自然表达，像 coding agent 完成任务后的回复；",
+            "- 不要直接复制 Reviewer 原文；",
+            "- 不要输出 <think> 或内部推理；",
+            "- 如果有产物文件，明确告诉用户路径；",
+            "- 如果有验证方式，说明用户下一步怎么验证；",
+            "- 控制在 120-220 字。",
+            "",
+            "执行结果：",
+        ]
+        for idx, item in enumerate(step_summaries, start=1):
+            diffs = item.get("file_diffs") or []
+            diff_paths = ", ".join(
+                d.get("path", "") for d in diffs if d.get("path")
+            )
+            output = _truncate(str(item.get("output") or ""), 1800)
+            error = item.get("error")
+            parts.extend([
+                f"\nStep {idx}: {item.get('name')}",
+                f"状态: {item.get('status')}",
+                f"模型: {item.get('model_used')}",
+                f"成本: ¥{float(item.get('cost_rmb') or 0.0):.4f}",
+            ])
+            if diff_paths:
+                parts.append(f"文件变更: {diff_paths}")
+            if error:
+                parts.append(f"错误: {error}")
+            if output:
+                parts.append(f"输出摘要来源:\n{output}")
+        return "\n".join(parts)
+
+    async def _decide_rework_with_model(
+        self,
+        *,
+        steps: list[dict],
+        step_summaries: list[dict[str, Any]],
+        reviewer_step: dict,
+        reviewer_output: str,
+        target_step: Optional[dict],
+    ) -> tuple[dict[str, str], float, str]:
+        """
+        用模型做 Review → Rework 决策。
+
+        编排器不再通过关键词猜 Reviewer 意图，而是让一个禁工具的隐藏
+        decision pass 读取当前任务状态并返回结构化 JSON。
+        """
+        model = reviewer_step.get("model") or (steps[0].get("model") if steps else "auto")
+        harness = self._make_step_harness({
+            "model": model,
+            "system_prompt": _REVIEW_DECISION_SYSTEM,
+            "enable_tools": [],
+        })
+        prompt = self._build_review_decision_prompt(
+            step_summaries=step_summaries,
+            reviewer_step=reviewer_step,
+            reviewer_output=reviewer_output,
+            target_step=target_step,
+        )
+
+        parts: list[str] = []
+        cost_rmb = 0.0
+        model_used = str(model or "auto")
+        try:
+            async for ev in harness.run_stream_full(prompt):
+                etype = ev.get("type")
+                data = ev.get("data") or {}
+                if etype == "token":
+                    parts.append(str(data.get("delta") or ""))
+                elif etype == "usage":
+                    cost_rmb += float(data.get("cost_rmb") or 0.0)
+                    if data.get("model"):
+                        model_used = str(data["model"])
+                elif etype == "error":
+                    return _done_review_decision(
+                        f"review decision failed: {data.get('message')}"
+                    ), cost_rmb, model_used
+        except Exception as e:
+            return _done_review_decision(
+                f"review decision failed: {type(e).__name__}: {e}"
+            ), cost_rmb, model_used
+
+        return _parse_review_decision("".join(parts)), cost_rmb, model_used
+
+    def _build_review_decision_prompt(
+        self,
+        *,
+        step_summaries: list[dict[str, Any]],
+        reviewer_step: dict,
+        reviewer_output: str,
+        target_step: Optional[dict],
+    ) -> str:
+        parts = [
+            "请判断当前 workflow 是否需要自动返工。",
+            "输出必须是 JSON，格式如下：",
+            '{"status":"done|needs_rework","target_step":"none|previous_writable",'
+            '"reason":"一句话原因","rework_prompt":"如果需要返工，写给 Coder 的具体修改指令"}',
+            "",
+            "判定规则：",
+            "- 只有必需功能缺失、验收未达标、Reviewer 认为需要补充后才能交付时，status 才是 needs_rework；",
+            "- 如果只是建议优化、可选增强、风格意见，status 是 done；",
+            "- rework_prompt 必须可直接交给目标 step 执行；",
+            "- 不要因为 Reviewer 语气委婉就忽略实际未完成状态。",
+            "",
+        ]
+        if target_step:
+            parts.extend([
+                "可返工目标 step：",
+                f"- {target_step.get('name')} (id={target_step.get('id')})",
+                "",
+            ])
+        parts.append("已完成步骤摘要：")
+        for idx, item in enumerate(step_summaries, start=1):
+            diffs = item.get("file_diffs") or []
+            diff_paths = ", ".join(
+                d.get("path", "") for d in diffs if d.get("path")
+            )
+            parts.extend([
+                f"\nStep {idx}: {item.get('name')}",
+                f"状态: {item.get('status')}",
+            ])
+            if diff_paths:
+                parts.append(f"文件变更: {diff_paths}")
+            output = _truncate(str(item.get("output") or ""), 1200)
+            if output:
+                parts.append(f"输出:\n{output}")
+        parts.extend([
+            "",
+            f"当前 Reviewer step: {reviewer_step.get('name')}",
+            "Reviewer 输出全文：",
+            _truncate(reviewer_output, 2400),
+        ])
+        return "\n".join(parts)
+
+    def _is_reviewer_step(self, step: dict) -> bool:
+        name = str(step.get("name") or "").lower()
+        return "reviewer" in name or "review" in name or "审查" in name
+
+    def _find_previous_writable_step_idx(
+        self,
+        steps: list[dict],
+        reviewer_idx: int,
+    ) -> Optional[int]:
+        for idx in range(reviewer_idx - 1, -1, -1):
+            if self._step_can_write(steps[idx]):
+                return idx
+        return None
+
+    def find_continue_start_step_id(
+        self,
+        steps: list[dict],
+        explicit_step_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        用户追加修改时默认从最后一个可写 step 继续。
+
+        三角审查模板里这通常是 Coder；后续 Reviewer 仍会继续执行，形成
+        “用户要求 → Coder 改 → Reviewer 复查”的闭环。
+        """
+        if explicit_step_id:
+            return explicit_step_id if any(s["id"] == explicit_step_id for s in steps) else None
+        for step in reversed(steps):
+            if self._step_can_write(step):
+                return step["id"]
+        return steps[0]["id"] if steps else None
+
+    def _step_can_write(self, step: dict) -> bool:
+        allowlist = step.get("enable_tools")
+        tools = set(allowlist or [])
+        return "*" in tools or bool(tools.intersection(_WRITE_TOOLS))
+
+    def _build_rework_prompt(self, decision: dict[str, str], reviewer_output: str) -> str:
+        prompt = decision.get("rework_prompt") or decision.get("reason") or reviewer_output
+        return (
+            "Review Decision 判定当前任务需要返工。\n"
+            "请基于当前文件继续修复，只处理下面指出的具体问题，不要重写无关内容。"
+            "修完后简短说明修改点和验证方式。\n\n"
+            f"返工原因：\n{decision.get('reason') or '未提供'}\n\n"
+            f"返工指令：\n{prompt}\n\n"
+            f"Reviewer 输出：\n{reviewer_output}"
+        )
+
     # ─────────────── Diff snapshot（Phase 6.6 护城河 #3） ───────────────
 
     def _snapshot_dir(self) -> dict[str, tuple[str, str]]:
@@ -285,7 +640,11 @@ class WorkflowOrchestrator:
         - 任何单文件错误 → 跳过（snapshot 不能阻塞主流程）
         """
         snap: dict[str, tuple[str, str]] = {}
-        for path in self.work_dir.rglob("*"):
+        try:
+            paths = list(self.work_dir.rglob("*"))
+        except OSError:
+            return snap
+        for path in paths:
             try:
                 if not path.is_file():
                     continue
@@ -338,3 +697,60 @@ class WorkflowOrchestrator:
             if len(diffs) >= _DIFF_MAX_FILES:
                 break
         return diffs
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]"
+
+
+def _parse_review_decision(text: str) -> dict[str, str]:
+    cleaned = _sanitize_final_reply(text)
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    raw = match.group(0) if match else cleaned
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return _done_review_decision("review decision JSON parse failed")
+
+    status = str(data.get("status") or "done").strip().lower()
+    if status in {"needs_rework", "rework", "needs-work", "needs work"}:
+        status = "needs_rework"
+    else:
+        status = "done"
+
+    target_step = str(data.get("target_step") or "none").strip()
+    if status != "needs_rework":
+        target_step = "none"
+
+    reason = str(data.get("reason") or "").strip()
+    rework_prompt = str(data.get("rework_prompt") or "").strip()
+    if status == "needs_rework" and not rework_prompt:
+        rework_prompt = reason
+    if not reason:
+        reason = "review decision did not provide a reason"
+
+    return {
+        "status": status,
+        "target_step": target_step,
+        "reason": _truncate(reason, 500).strip(),
+        "rework_prompt": _truncate(rework_prompt, 1200).strip(),
+    }
+
+
+def _done_review_decision(reason: str) -> dict[str, str]:
+    return {
+        "status": "done",
+        "target_step": "none",
+        "reason": reason,
+        "rework_prompt": "",
+    }
+
+
+def _sanitize_final_reply(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
+    return text.strip()

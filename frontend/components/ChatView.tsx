@@ -59,11 +59,15 @@ export function ChatView() {
 
   // 切换 session 时加载历史
   useEffect(() => {
-    if (!currentSessionId) {
-      setMessages([]);
-      return;
-    }
     let cancelled = false;
+    if (!currentSessionId) {
+      queueMicrotask(() => {
+        if (!cancelled) setMessages([]);
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
     getSessionMessages(currentSessionId)
       .then((stored) => {
         if (!cancelled) setMessages(stored.map(storedToMessage));
@@ -246,7 +250,7 @@ function EmptyState() {
     <div className="flex flex-col items-center justify-center min-h-[400px] text-center select-none">
       <div className="text-2xl font-medium text-fg mb-3">CodeMesh</div>
       <div className="text-sm text-fg-muted max-w-[480px]">
-        国内多模型 Code Agent。问点代码问题、文件操作、或者就聊聊。
+        多模型 Code Agent。问点代码问题、文件操作、或者就聊聊。
       </div>
       <div className="mt-6 text-xs text-fg-subtle max-w-[480px]">
         想让多个模型协作？顶栏切到「工作流」试试。

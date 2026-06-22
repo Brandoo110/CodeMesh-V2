@@ -13,7 +13,7 @@ LSP = Language Server Protocol。完整版需要起一个语言服务进程（py
 3. ast 静态分析对"找 def class assign"足够精确，覆盖 95% 场景
 4. 不依赖 stdin/stdout JSON-RPC 协议，调试简单
 
-【面试讲法】
+【设计说明】
 "为什么不直接用 pyright？"
 → Coding Agent 是单次查询多次终止的进程，启动 pyright daemon 不值。
    ast.parse 三十毫秒能把整个仓库的 symbol table 拉出来，

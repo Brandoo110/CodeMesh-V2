@@ -55,11 +55,15 @@ class FakeHarness:
     def __init__(self, **kwargs):
         self.short_term = FakeShortTerm()
         self.tool_allowlist = None
+        self.preferred_model = None
         self.received_tasks: list[str] = []
         FakeHarness.instances.append(self)
 
     def set_tool_allowlist(self, allowlist):
         self.tool_allowlist = allowlist
+
+    def set_preferred_model(self, model):
+        self.preferred_model = model
 
     async def run_stream_full(self, task: str):
         self.received_tasks.append(task)
@@ -107,6 +111,23 @@ class TestOrchestrator(unittest.TestCase):
         ))
         return wid, s1, s2
 
+    def _build_review_workflow(self):
+        wf = asyncio.run(self.store.create_workflow("review-loop"))
+        wid = wf["id"]
+        planner = asyncio.run(self.store.add_step(
+            wid, name="1. Planner", model="deepseek", system_prompt="plan",
+            enable_tools=["grep_text", "read_file"],
+        ))
+        coder = asyncio.run(self.store.add_step(
+            wid, name="2. Coder", model="gemini", system_prompt="code",
+            enable_tools=["grep_text", "read_file", "edit_file", "write_file"],
+        ))
+        reviewer = asyncio.run(self.store.add_step(
+            wid, name="3. Reviewer", model="deepseek", system_prompt="review",
+            enable_tools=["grep_text", "read_file"],
+        ))
+        return wid, planner, coder, reviewer
+
     def _run_collect(self, orchestrator, wid, run_id, **kwargs):
         events = []
         async def collect():
@@ -151,7 +172,7 @@ class TestOrchestrator(unittest.TestCase):
         self._run_collect(orch, wid, run["id"])
 
         # 第二个 FakeHarness 实例接到的 task 应该含 "step1 output"
-        self.assertEqual(len(FakeHarness.instances), 2)
+        self.assertGreaterEqual(len(FakeHarness.instances), 2)
         task2 = FakeHarness.instances[1].received_tasks[0]
         self.assertIn("step1 output", task2)
 
@@ -166,6 +187,15 @@ class TestOrchestrator(unittest.TestCase):
                          ["grep_text", "read_file"])
         # Step 2 全开 ["*"]
         self.assertEqual(FakeHarness.instances[1].tool_allowlist, ["*"])
+
+    def test_preferred_model_propagated_per_step(self):
+        wid, s1, s2 = self._build_two_step_workflow()
+        run = asyncio.run(self.store.create_run(wid))
+        orch = WorkflowOrchestrator(self.store)
+        self._run_collect(orch, wid, run["id"])
+
+        self.assertEqual(FakeHarness.instances[0].preferred_model, "deepseek")
+        self.assertEqual(FakeHarness.instances[1].preferred_model, "qwen")
 
     def test_step_system_prompt_applied(self):
         wid, s1, s2 = self._build_two_step_workflow()
@@ -214,6 +244,259 @@ class TestOrchestrator(unittest.TestCase):
         # run 标记 done
         final_run = asyncio.run(self.store.get_run(run["id"]))
         self.assertEqual(final_run["status"], "done")
+
+    def test_final_reply_uses_first_step_model_and_counts_cost(self):
+        wid, s1, s2 = self._build_two_step_workflow()
+        run = asyncio.run(self.store.create_run(wid))
+        orch = WorkflowOrchestrator(self.store)
+
+        FakeHarness.reply_queue = [
+            [
+                {"type": "token", "data": {"delta": "plan output"}},
+                {"type": "usage", "data": {"cost_rmb": 0.002, "model": "deepseek"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "coder output"}},
+                {"type": "usage", "data": {"cost_rmb": 0.003, "model": "qwen"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "用户可读总结"}},
+                {"type": "usage", "data": {"cost_rmb": 0.004, "model": "deepseek"}},
+                {"type": "done", "data": {}},
+            ],
+        ]
+
+        events = self._run_collect(orch, wid, run["id"])
+        types = [e["type"] for e in events]
+
+        self.assertIn("final_start", types)
+        self.assertIn("final_end", types)
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["data"]["final_reply"], "用户可读总结")
+        self.assertAlmostEqual(events[-1]["data"]["total_cost"], 0.009)
+
+        self.assertEqual(len(FakeHarness.instances), 3)
+        self.assertEqual(FakeHarness.instances[2].preferred_model, "deepseek")
+        self.assertEqual(FakeHarness.instances[2].tool_allowlist, [])
+        self.assertIn("plan output", FakeHarness.instances[2].received_tasks[0])
+        self.assertIn("coder output", FakeHarness.instances[2].received_tasks[0])
+
+        final_run = asyncio.run(self.store.get_run(run["id"]))
+        self.assertAlmostEqual(final_run["total_cost_rmb"], 0.009)
+
+    def test_reviewer_feedback_loops_back_to_coder_once(self):
+        wid, planner, coder, reviewer = self._build_review_workflow()
+        run = asyncio.run(self.store.create_run(wid))
+        orch = WorkflowOrchestrator(self.store)
+
+        FakeHarness.reply_queue = [
+            [
+                {"type": "token", "data": {"delta": "plan output"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "initial implementation"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {
+                    "delta": (
+                        "Run Self Check 的 Reset 验证没有证明数据回到了初始数量，"
+                        "当前实现离验收标准还有差距。"
+                    ),
+                }},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": json.dumps({
+                    "status": "needs_rework",
+                    "target_step": "previous_writable",
+                    "reason": "Reset 自检没有证明数据回到初始数量。",
+                    "rework_prompt": "请补强 Reset 自检，验证 afterReset 等于初始数量 6。",
+                })}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "fixed reset self check"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {
+                    "delta": "Reset 自检已覆盖 afterReset 等于 6，复查通过。",
+                }},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": json.dumps({
+                    "status": "done",
+                    "target_step": "none",
+                    "reason": "复查通过。",
+                    "rework_prompt": "",
+                })}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "最终总结"}},
+                {"type": "done", "data": {}},
+            ],
+        ]
+
+        events = self._run_collect(orch, wid, run["id"])
+        step_starts = [e for e in events if e["type"] == "step_start"]
+
+        self.assertEqual(
+            [e["data"]["step_id"] for e in step_starts],
+            [planner["id"], coder["id"], reviewer["id"], coder["id"], reviewer["id"]],
+        )
+        decision_events = [e for e in events if e["type"] == "review_decision"]
+        self.assertEqual([e["data"]["status"] for e in decision_events],
+                         ["needs_rework", "done"])
+        self.assertIn("Reset", FakeHarness.instances[3].received_tasks[0])
+        self.assertIn("Reset 自检", FakeHarness.instances[4].received_tasks[0])
+
+        results = asyncio.run(self.store.get_step_results(run["id"]))
+        self.assertEqual(len(results), 5)
+        final_run = asyncio.run(self.store.get_run(run["id"]))
+        self.assertEqual(final_run["status"], "done")
+
+    def test_reviewer_intent_decision_triggers_rework_without_keyword_match(self):
+        wid, planner, coder, reviewer = self._build_review_workflow()
+        run = asyncio.run(self.store.create_run(wid))
+        orch = WorkflowOrchestrator(self.store)
+
+        FakeHarness.reply_queue = [
+            [
+                {"type": "token", "data": {"delta": "plan output"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "v1 html"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {
+                    "delta": (
+                        "Reviewer 已完成对 V1 的详细校验。页面目前停留在概览层，"
+                        "没有把 docs 证据、角色职责和交付表达组织成可交付版本。"
+                    ),
+                }},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": json.dumps({
+                    "status": "needs_rework",
+                    "target_step": "previous_writable",
+                    "reason": "页面停留在概览层，缺少 docs 证据、角色职责和交付表达。",
+                    "rework_prompt": "请补齐证据矩阵、自检区、返工记录区和讲解区。",
+                })}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "reworked html"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {
+                    "delta": "返工后的 HTML 已覆盖证据矩阵、自检区和讲解区。",
+                }},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": json.dumps({
+                    "status": "done",
+                    "target_step": "none",
+                    "reason": "返工后达到交付标准。",
+                    "rework_prompt": "",
+                })}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "最终总结"}},
+                {"type": "done", "data": {}},
+            ],
+        ]
+
+        events = self._run_collect(orch, wid, run["id"])
+        step_starts = [e for e in events if e["type"] == "step_start"]
+        rework_events = [e for e in events if e["type"] == "rework_requested"]
+
+        self.assertEqual(
+            [e["data"]["step_id"] for e in step_starts],
+            [planner["id"], coder["id"], reviewer["id"], coder["id"], reviewer["id"]],
+        )
+        self.assertEqual(len(rework_events), 1)
+        self.assertEqual(rework_events[0]["data"]["target_step_id"], coder["id"])
+        self.assertIn("页面停留在概览层", rework_events[0]["data"]["reason"])
+        self.assertIn("证据矩阵", FakeHarness.instances[4].received_tasks[0])
+
+    def test_parse_review_decision_handles_done_json(self):
+        decision = wo_module._parse_review_decision(json.dumps({
+            "status": "done",
+            "target_step": "none",
+            "reason": "整体达标，只有非阻塞建议。",
+            "rework_prompt": "",
+        }))
+        self.assertEqual(decision["status"], "done")
+        self.assertEqual(decision["target_step"], "none")
+
+    def test_continue_run_starts_at_coder_and_then_reviews(self):
+        wid, planner, coder, reviewer = self._build_review_workflow()
+        run = asyncio.run(self.store.create_run(wid))
+        orch = WorkflowOrchestrator(self.store)
+
+        FakeHarness.reply_queue = [
+            [
+                {"type": "token", "data": {"delta": "updated implementation"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {
+                    "delta": "复查通过，当前修改满足追加要求。",
+                }},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": json.dumps({
+                    "status": "done",
+                    "target_step": "none",
+                    "reason": "复查通过。",
+                    "rework_prompt": "",
+                })}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "继续修改总结"}},
+                {"type": "done", "data": {}},
+            ],
+        ]
+
+        events = self._run_collect(
+            orch,
+            wid,
+            run["id"],
+            start_step_id=coder["id"],
+            seed_input="用户追加修改要求：把 Reset 自检改严格",
+        )
+        step_starts = [e for e in events if e["type"] == "step_start"]
+
+        self.assertEqual(
+            [e["data"]["step_id"] for e in step_starts],
+            [coder["id"], reviewer["id"]],
+        )
+        self.assertNotEqual(step_starts[0]["data"]["step_id"], planner["id"])
+        self.assertIn(
+            "把 Reset 自检改严格",
+            FakeHarness.instances[0].received_tasks[0],
+        )
+        self.assertIn(
+            "updated implementation",
+            FakeHarness.instances[1].received_tasks[0],
+        )
+
+        results = asyncio.run(self.store.get_step_results(run["id"]))
+        self.assertEqual([r["step_id"] for r in results], [coder["id"], reviewer["id"]])
 
     def test_step_error_terminates_workflow(self):
         wid, s1, s2 = self._build_two_step_workflow()
@@ -350,6 +633,77 @@ class TestRunEndpoint(unittest.TestCase):
         self.assertIn("event: step_start", body)
         self.assertIn("event: step_end", body)
         self.assertIn("event: done", body)
+
+    def test_continue_workflow_streams_from_writable_step(self):
+        wf = self.client.post("/api/workflows", json={"name": "review-loop"}).json()
+        wid = wf["id"]
+        planner = self.client.post(
+            f"/api/workflows/{wid}/steps",
+            json={
+                "name": "1. Planner",
+                "model": "deepseek",
+                "enable_tools": ["grep_text", "read_file"],
+            },
+        ).json()
+        coder = self.client.post(
+            f"/api/workflows/{wid}/steps",
+            json={
+                "name": "2. Coder",
+                "model": "gemini",
+                "enable_tools": ["grep_text", "read_file", "edit_file", "write_file"],
+            },
+        ).json()
+        reviewer = self.client.post(
+            f"/api/workflows/{wid}/steps",
+            json={
+                "name": "3. Reviewer",
+                "model": "deepseek",
+                "enable_tools": ["grep_text", "read_file"],
+            },
+        ).json()
+
+        FakeHarness.reply_queue = [
+            [
+                {"type": "token", "data": {"delta": "patched implementation"}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {
+                    "delta": "复查通过，当前修改满足追加要求。",
+                }},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": json.dumps({
+                    "status": "done",
+                    "target_step": "none",
+                    "reason": "复查通过。",
+                    "rework_prompt": "",
+                })}},
+                {"type": "done", "data": {}},
+            ],
+            [
+                {"type": "token", "data": {"delta": "继续修改总结"}},
+                {"type": "done", "data": {}},
+            ],
+        ]
+
+        with self.client.stream(
+            "POST",
+            f"/api/workflows/{wid}/continue",
+            json={
+                "user_request": "把 Reset 自检改严格",
+                "run_context": "上次已经生成 artifacts/job_pipeline/index.html",
+            },
+        ) as r:
+            self.assertEqual(r.status_code, 200)
+            body = "".join(r.iter_text())
+
+        self.assertIn(f'"step_id": "{coder["id"]}"', body)
+        self.assertIn(f'"step_id": "{reviewer["id"]}"', body)
+        self.assertNotIn(f'"step_id": "{planner["id"]}"', body)
+        self.assertIn("把 Reset 自检改严格", FakeHarness.instances[0].received_tasks[0])
+        self.assertIn("上次已经生成", FakeHarness.instances[0].received_tasks[0])
 
     def test_cancel_endpoint_returns_ok(self):
         r = self.client.post("/api/workflows/runs/anything/cancel")

@@ -30,7 +30,7 @@ Agent Loop：执行层的心脏（Harness 执行层）
   2. 没有 tool_calls
   3. 迭代次数超过 max_iterations（防死循环）
 
-【面试点】
+【设计要点】
 "Agent Loop 死循环怎么防？"
 → max_iterations 硬上限 + 每轮检查 tool_call 是否重复（同一文件读第 3 次）。
   更进阶的做法是让另一个"监工" Agent 判断主 Agent 是不是卡住了。
@@ -105,6 +105,13 @@ async def run_agent_loop(
     tools_arg = effective_tools if effective_tools else None
     tool_choice_arg = "auto" if effective_tools else "none"
 
+    # 累计 usage：agent loop 可能跑多轮（tool call 来回），harness 取 adapter.last_usage
+    # 一次性算成本。这里把每轮 resp.usage 相加，最后写回 adapter.last_usage，
+    # 否则 cost 永远是 0（adapter 自己只在 complete/complete_stream 里更新 last_usage）。
+    from orchestration.adapters.base import Usage as _Usage
+    accum_in = 0
+    accum_out = 0
+
     for iteration in range(max_iterations):
         resp = await client.chat.completions.create(
             model=model,
@@ -113,6 +120,18 @@ async def run_agent_loop(
             tool_choice=tool_choice_arg,
             temperature=0.3,
         )
+
+        # 累计 token；某些 mock/test 响应可能没 usage
+        if getattr(resp, "usage", None):
+            accum_in += getattr(resp.usage, "prompt_tokens", 0) or 0
+            accum_out += getattr(resp.usage, "completion_tokens", 0) or 0
+            try:
+                adapter.last_usage = _Usage(  # type: ignore[attr-defined]
+                    prompt_tokens=accum_in,
+                    completion_tokens=accum_out,
+                )
+            except Exception:
+                pass
 
         msg = resp.choices[0].message
 

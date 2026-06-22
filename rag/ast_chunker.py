@@ -30,7 +30,7 @@ Python 代码库（CodeMesh 自己），生产场景再上 tree-sitter 不迟。
   - 类下的 docstring + 顶层 assign → 合并成一个 "class header" chunk
   - 模块顶部 imports + 模块 docstring → 一个 "module header" chunk
 
-【面试点】
+【设计要点】
 "Q: 按行切和按 AST 切实际效果差多少？"
 → 业界（LangChain Code Splitter 论文 2023）的对比：AST 切让代码搜索的
   Recall@5 从 ~40% 涨到 ~65%。改动小、收益直接。

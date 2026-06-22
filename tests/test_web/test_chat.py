@@ -24,14 +24,28 @@ from web.deps import get_harness
 from web.server import app
 
 
+class _FakeShortTerm:
+    def clear(self):
+        pass
+
+
+class _FakeHarness:
+    def __init__(self):
+        self.run = AsyncMock(return_value="模拟回答内容")
+        self.last_costs = []
+        self.short_term = _FakeShortTerm()
+        self.preferred_model = None
+
+    def set_preferred_model(self, model):
+        self.preferred_model = model
+
+
 class TestChatEndpoint(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
 
-        # Fake harness 不调真实 API（CodeMesh CLAUDE.md 测试铁律）
-        self.fake_harness = AsyncMock()
-        self.fake_harness.run = AsyncMock(return_value="模拟回答内容")
-        self.fake_harness.last_costs = []
+        # Fake harness 不调真实 API（CodeMesh testing rule）
+        self.fake_harness = _FakeHarness()
         app.dependency_overrides[get_harness] = lambda: self.fake_harness
 
     def tearDown(self):

@@ -14,7 +14,8 @@
  * - 任何编辑操作都先调后端，成功后 onChange 让父组件重新拉 detail
  */
 
-import { useEffect, useState } from "react";
+import { useRef, useState } from "react";
+import type { FocusEvent, MouseEvent } from "react";
 import { Plus, GitFork, ArrowUp, ArrowDown, Play } from "lucide-react";
 import {
   addStep,
@@ -24,6 +25,7 @@ import {
   updateStep,
   updateWorkflow,
 } from "@/lib/workflow-api";
+import { formatApiErrorDetail } from "@/lib/api";
 import type { Step, WorkflowDetail } from "@/lib/workflow-types";
 import { useStore } from "@/lib/store";
 import { StepCard } from "./StepCard";
@@ -41,6 +43,12 @@ interface Props {
   runningStepId?: string | null;
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : formatApiErrorDetail(error);
+}
+
+type MetaField = "name" | "description";
+
 export function WorkflowEditor({
   detail,
   onChange,
@@ -53,32 +61,70 @@ export function WorkflowEditor({
   const [name, setName] = useState(detail.name);
   const [description, setDescription] = useState(detail.description);
   const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    setName(detail.name);
-    setDescription(detail.description);
-  }, [detail.id, detail.name, detail.description]);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const autoSelectedFields = useRef<Set<string>>(new Set());
+  const mouseUpSelectField = useRef<string | null>(null);
 
   const readOnly = detail.is_template;
 
   // ───── workflow 元数据 ─────
 
+  const selectMetaFieldOnce = (
+    field: MetaField,
+    event: FocusEvent<HTMLInputElement>,
+  ) => {
+    if (readOnly) return;
+    const key = `${detail.id}:${field}`;
+    if (autoSelectedFields.current.has(key)) return;
+
+    const input = event.currentTarget;
+    autoSelectedFields.current.add(key);
+    mouseUpSelectField.current = key;
+    requestAnimationFrame(() => input.select());
+  };
+
+  const keepAutoSelectionOnMouseUp = (
+    field: MetaField,
+    event: MouseEvent<HTMLInputElement>,
+  ) => {
+    const key = `${detail.id}:${field}`;
+    if (mouseUpSelectField.current !== key) return;
+
+    event.preventDefault();
+    mouseUpSelectField.current = null;
+  };
+
   const commitName = async () => {
     if (readOnly || name === detail.name) return;
-    await updateWorkflow(detail.id, { name });
-    await onChange();
+    setSaveError(null);
+    try {
+      await updateWorkflow(detail.id, { name });
+      await onChange();
+    } catch (error) {
+      console.error("Failed to update workflow name:", error);
+      setName(detail.name);
+      setSaveError(`保存工作流名失败：${describeError(error)}`);
+    }
   };
 
   const commitDescription = async () => {
     if (readOnly || description === detail.description) return;
-    await updateWorkflow(detail.id, { description });
-    await onChange();
+    setSaveError(null);
+    try {
+      await updateWorkflow(detail.id, { description });
+      await onChange();
+    } catch (error) {
+      console.error("Failed to update workflow description:", error);
+      setDescription(detail.description);
+      setSaveError(`保存工作流描述失败：${describeError(error)}`);
+    }
   };
 
   // ───── steps ─────
 
   const handleAddStep = async () => {
     setBusy(true);
+    setSaveError(null);
     try {
       await addStep(detail.id, {
         name: `Step ${detail.steps.length + 1}`,
@@ -88,6 +134,9 @@ export function WorkflowEditor({
         enable_tools: ["*"],
       });
       await onChange();
+    } catch (error) {
+      console.error("Failed to add workflow step:", error);
+      setSaveError(`添加步骤失败：${describeError(error)}`);
     } finally {
       setBusy(false);
     }
@@ -110,18 +159,28 @@ export function WorkflowEditor({
     if (target < 0 || target >= detail.steps.length) return;
     const newIds = detail.steps.map((s) => s.id);
     [newIds[idx], newIds[target]] = [newIds[target], newIds[idx]];
-    await reorderSteps(detail.id, newIds);
-    await onChange();
+    setSaveError(null);
+    try {
+      await reorderSteps(detail.id, newIds);
+      await onChange();
+    } catch (error) {
+      console.error("Failed to reorder workflow steps:", error);
+      setSaveError(`调整步骤顺序失败：${describeError(error)}`);
+    }
   };
 
   // ───── fork（模板专属） ─────
 
   const handleFork = async () => {
     setBusy(true);
+    setSaveError(null);
     try {
       const forked = await forkWorkflow(detail.id);
       await onChange();
       setCurrentWorkflowId(forked.id);  // 切到副本
+    } catch (error) {
+      console.error("Failed to fork workflow:", error);
+      setSaveError(`Fork 失败：${describeError(error)}`);
     } finally {
       setBusy(false);
     }
@@ -135,7 +194,11 @@ export function WorkflowEditor({
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            onBlur={commitName}
+            onFocus={(e) => selectMetaFieldOnce("name", e)}
+            onMouseUp={(e) => keepAutoSelectionOnMouseUp("name", e)}
+            onBlur={() => {
+              void commitName();
+            }}
             disabled={readOnly}
             placeholder="工作流名"
             className="flex-1 bg-transparent text-xl font-medium text-fg outline-none placeholder:text-fg-subtle disabled:cursor-not-allowed"
@@ -143,7 +206,9 @@ export function WorkflowEditor({
 
           {readOnly ? (
             <button
-              onClick={handleFork}
+              onClick={() => {
+                void handleFork();
+              }}
               disabled={busy}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-accent hover:bg-accent-hover text-white text-sm font-medium transition-colors disabled:opacity-50"
               title="复制为可编辑副本"
@@ -177,11 +242,21 @@ export function WorkflowEditor({
         <input
           value={description}
           onChange={(e) => setDescription(e.target.value)}
-          onBlur={commitDescription}
+          onFocus={(e) => selectMetaFieldOnce("description", e)}
+          onMouseUp={(e) => keepAutoSelectionOnMouseUp("description", e)}
+          onBlur={() => {
+            void commitDescription();
+          }}
           disabled={readOnly}
           placeholder="一句话描述这个工作流要做什么"
           className="w-full bg-transparent text-sm text-fg-muted outline-none placeholder:text-fg-subtle disabled:cursor-not-allowed"
         />
+
+        {saveError && (
+          <div className="rounded-md bg-error/10 px-3 py-2 text-xs text-error">
+            {saveError}
+          </div>
+        )}
 
         {readOnly && (
           <div className="text-xs text-accent">
@@ -196,7 +271,7 @@ export function WorkflowEditor({
           <div className="border border-dashed border-border rounded-lg p-12 text-center text-fg-subtle">
             <div className="text-sm mb-2">这个工作流还没有步骤</div>
             {!readOnly && (
-              <div className="text-xs">点击下方"添加步骤"开始</div>
+              <div className="text-xs">点击下方「添加步骤」开始</div>
             )}
           </div>
         ) : (
@@ -206,7 +281,9 @@ export function WorkflowEditor({
               {!readOnly && (
                 <div className="absolute -left-8 top-3 flex flex-col gap-1">
                   <button
-                    onClick={() => move(idx, -1)}
+                    onClick={() => {
+                      void move(idx, -1);
+                    }}
                     disabled={idx === 0}
                     className="p-1 text-fg-subtle hover:text-fg transition-colors disabled:opacity-30"
                     title="上移"
@@ -214,7 +291,9 @@ export function WorkflowEditor({
                     <ArrowUp size={12} />
                   </button>
                   <button
-                    onClick={() => move(idx, 1)}
+                    onClick={() => {
+                      void move(idx, 1);
+                    }}
                     disabled={idx === detail.steps.length - 1}
                     className="p-1 text-fg-subtle hover:text-fg transition-colors disabled:opacity-30"
                     title="下移"
@@ -225,6 +304,7 @@ export function WorkflowEditor({
               )}
 
               <StepCard
+                key={`${step.id}:${step.name}:${step.system_prompt}:${step.user_prompt}`}
                 step={step}
                 readOnly={readOnly}
                 onUpdate={(patch) => handleStepUpdate(step.id, patch)}
@@ -246,7 +326,9 @@ export function WorkflowEditor({
         {/* 添加步骤 */}
         {!readOnly && (
           <button
-            onClick={handleAddStep}
+            onClick={() => {
+              void handleAddStep();
+            }}
             disabled={busy}
             className="w-full flex items-center justify-center gap-2 py-3 rounded-lg border border-dashed border-border hover:border-accent text-sm text-fg-muted hover:text-accent transition-colors disabled:opacity-50"
           >

@@ -1,25 +1,32 @@
 "use client";
 
 /**
- * 主页：Layout (Sidebar + TopBar + ChatView)
+ * 主页：Layout (Sidebar + TopBar + 主视图)
  *
  * 启动时拉模型列表填充 store。
  */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Sidebar } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { ChatView } from "@/components/ChatView";
 import { StatsView } from "@/components/StatsView";
 import { WorkflowsView } from "@/components/WorkflowsView";
+import { MemoryView } from "@/components/MemoryView";
 import { useStore } from "@/lib/store";
 import { fetchModels } from "@/lib/api";
+import {
+  mainViewHostClassName,
+  shouldKeepViewMounted,
+  viewUsesChatSidebar,
+} from "@/lib/layout";
 
 export default function Home() {
   const setModels = useStore((s) => s.setModels);
   const selectedModel = useStore((s) => s.selectedModel);
   const setSelectedModel = useStore((s) => s.setSelectedModel);
   const view = useStore((s) => s.view);
+  const [mountedWorkflow, setMountedWorkflow] = useState(view === "workflows");
 
   useEffect(() => {
     fetchModels()
@@ -37,23 +44,42 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setModels, setSelectedModel]);
 
-  // workflows view 占满整个区域（无外部 Sidebar），保持 chat / stats 现有结构
-  if (view === "workflows") {
-    return (
-      <div className="flex h-screen w-screen overflow-hidden bg-canvas flex-col">
-        <TopBar />
-        <WorkflowsView />
-      </div>
-    );
-  }
+  useEffect(() => {
+    let cancelled = false;
+    if (shouldKeepViewMounted(view) && view === "workflows" && !mountedWorkflow) {
+      queueMicrotask(() => {
+        if (!cancelled) setMountedWorkflow(true);
+      });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [mountedWorkflow, view]);
+
+  const hasChatSidebar = viewUsesChatSidebar(view);
+  const shouldRenderWorkflow = mountedWorkflow || view === "workflows";
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-canvas">
-      <Sidebar />
-      {/* min-h-0 让里面的 ChatView flex-1 真正在剩余空间内滚动 */}
+      {hasChatSidebar && <Sidebar />}
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
         <TopBar />
-        {view === "chat" ? <ChatView /> : <StatsView />}
+        <div className={mainViewHostClassName}>
+          {view === "chat" && <ChatView />}
+          {view === "stats" && <StatsView />}
+          {view === "memory" && <MemoryView />}
+          {shouldRenderWorkflow && (
+            <div
+              className={
+                view === "workflows"
+                  ? "flex h-full min-w-0 min-h-0"
+                  : "hidden"
+              }
+            >
+              <WorkflowsView />
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

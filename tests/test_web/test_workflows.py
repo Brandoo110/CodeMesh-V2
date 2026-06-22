@@ -112,6 +112,70 @@ class TestWorkflowsEndpoints(unittest.TestCase):
         self.assertEqual(r.json()["name"], "renamed")
         self.assertEqual(r.json()["model"], "deepseek")  # 不动
 
+    def test_prompt_draft_routes_plan_request_to_planner(self):
+        wf = self.client.post("/api/workflows", json={"name": "w"}).json()
+        wid = wf["id"]
+        planner = self.client.post(
+            f"/api/workflows/{wid}/steps",
+            json={"name": "1. Planner", "user_prompt": "先制定实现计划。"},
+        ).json()
+        self.client.post(
+            f"/api/workflows/{wid}/steps",
+            json={
+                "name": "2. Coder",
+                "user_prompt": "按计划写代码。",
+                "enable_tools": ["write_file"],
+            },
+        )
+
+        r = self.client.post(
+            f"/api/workflows/{wid}/prompt-draft",
+            json={
+                "user_request": "在最开始的 plan prompt 里增加移动端适配需求",
+                "run_context": "上次已经生成 HTML demo",
+            },
+        )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(data["start_step_id"], planner["id"])
+        self.assertEqual(data["changes"][0]["step_id"], planner["id"])
+        self.assertEqual(data["changes"][0]["field"], "user_prompt")
+        self.assertIn("移动端适配", data["changes"][0]["new_text"])
+
+        detail = self.client.get(f"/api/workflows/{wid}").json()
+        self.assertEqual(detail["steps"][0]["user_prompt"], "先制定实现计划。")
+
+    def test_prompt_draft_routes_bug_request_to_coder(self):
+        wf = self.client.post("/api/workflows", json={"name": "w"}).json()
+        wid = wf["id"]
+        self.client.post(
+            f"/api/workflows/{wid}/steps",
+            json={"name": "1. Planner", "user_prompt": "先制定实现计划。"},
+        )
+        coder = self.client.post(
+            f"/api/workflows/{wid}/steps",
+            json={
+                "name": "2. Coder",
+                "user_prompt": "按计划写代码。",
+                "enable_tools": ["write_file"],
+            },
+        ).json()
+
+        r = self.client.post(
+            f"/api/workflows/{wid}/prompt-draft",
+            json={
+                "user_request": "修一下 Reset 按钮的 bug",
+                "run_context": "上次已经生成 HTML demo",
+            },
+        )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(data["start_step_id"], coder["id"])
+        self.assertEqual(data["changes"][0]["step_id"], coder["id"])
+        self.assertIn("Reset", data["changes"][0]["new_text"])
+
     def test_delete_step_compacts_order(self):
         wf = self.client.post("/api/workflows", json={"name": "w"}).json()
         wid = wf["id"]
@@ -174,6 +238,34 @@ class TestWorkflowsEndpoints(unittest.TestCase):
     def test_get_run_nonexistent_404(self):
         r = self.client.get("/api/workflows/runs/nope")
         self.assertEqual(r.status_code, 404)
+
+    def test_get_run_detail_includes_final_reply_and_step_logs(self):
+        wf = asyncio.run(self.store.create_workflow("wf"))
+        step = asyncio.run(self.store.add_step(wf["id"], name="Coder"))
+        run = asyncio.run(self.store.create_run(wf["id"]))
+        asyncio.run(self.store.save_step_result(
+            run["id"],
+            step,
+            status="done",
+            output="写好了页面",
+            tool_calls=[{"name": "write_file", "ok": True}],
+            cost_rmb=0.02,
+            duration_ms=1000,
+        ))
+        asyncio.run(self.store.update_run(
+            run["id"],
+            status="done",
+            total_cost=0.03,
+            final_reply="最终回复",
+        ))
+
+        r = self.client.get(f"/api/workflows/runs/{run['id']}")
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(data["final_reply"], "最终回复")
+        self.assertEqual(data["step_results"][0]["output"], "写好了页面")
+        self.assertEqual(data["step_results"][0]["tool_calls"][0]["name"], "write_file")
 
 
 if __name__ == "__main__":

@@ -161,6 +161,7 @@ async def chat_stream(
         tool_calls: list[dict] = []
         usage_data: dict = {}
         error_msg: str | None = None
+        t0 = time.monotonic()
 
         try:
             async for event in harness.run_stream_full(req.task):
@@ -200,12 +201,14 @@ async def chat_stream(
         # 3. 持久化（流结束）
         if req.session_id and not error_msg:
             answer = "".join(full_answer)
+            duration_ms = int((time.monotonic() - t0) * 1000)
             await store.append_message(req.session_id, "user", req.task)
             await store.append_message(
                 req.session_id, "assistant", answer,
                 tool_calls=tool_calls if tool_calls else None,
                 model=str(usage_data.get("model", "")) or None,
                 cost_rmb=float(usage_data.get("cost_rmb", 0)) or None,
+                duration_ms=duration_ms,
             )
             await store.update_session(
                 req.session_id,

@@ -15,9 +15,11 @@
  * - 父组件传 step 是 source of truth，refresh 后会覆盖局部
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Trash2, ChevronDown, Play } from "lucide-react";
 import { useStore } from "@/lib/store";
+import { formatApiErrorDetail } from "@/lib/api";
+import { getStepOrderPrefix } from "@/lib/workflow-display";
 import type { Step } from "@/lib/workflow-types";
 import { ToolAllowlistEditor } from "./ToolAllowlistEditor";
 
@@ -31,44 +33,80 @@ interface Props {
   isRunningStep?: boolean;
 }
 
+type EditableStepPatch = Pick<
+  Step,
+  "name" | "model" | "system_prompt" | "user_prompt" | "enable_tools"
+>;
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : formatApiErrorDetail(error);
+}
+
 export function StepCard({ step, readOnly, onUpdate, onDelete, onRunStep, isRunningStep }: Props) {
   const [name, setName] = useState(step.name);
   const [systemPrompt, setSystemPrompt] = useState(step.system_prompt);
   const [userPrompt, setUserPrompt] = useState(step.user_prompt);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
-  // 父组件 refresh 后同步（例如保存成功后 step.id 不变但其他字段变了）
-  useEffect(() => {
-    setName(step.name);
-    setSystemPrompt(step.system_prompt);
-    setUserPrompt(step.user_prompt);
-  }, [step.id, step.name, step.system_prompt, step.user_prompt]);
+  const resetLocalField = (field: keyof EditableStepPatch) => {
+    if (field === "name") setName(step.name);
+    if (field === "system_prompt") setSystemPrompt(step.system_prompt);
+    if (field === "user_prompt") setUserPrompt(step.user_prompt);
+  };
 
   // 字段失焦保存（避免每次按键都 PUT）
-  const commit = (field: keyof Step, value: string | string[]) => {
+  const commit = async <K extends keyof EditableStepPatch>(
+    field: K,
+    value: EditableStepPatch[K],
+  ) => {
     if (readOnly) return;
     // 与原值相同就跳过
     if (step[field] === value) return;
-    onUpdate({ [field]: value });
+    setSaveError(null);
+    try {
+      await onUpdate({ [field]: value });
+    } catch (error) {
+      console.error(`Failed to update step ${field}:`, error);
+      resetLocalField(field);
+      setSaveError(`保存步骤失败：${describeError(error)}`);
+    }
   };
+
+  const handleDelete = async () => {
+    setSaveError(null);
+    try {
+      await onDelete();
+    } catch (error) {
+      console.error("Failed to delete step:", error);
+      setSaveError(`删除步骤失败：${describeError(error)}`);
+    }
+  };
+  const orderPrefix = getStepOrderPrefix(step.step_order, step.name);
 
   return (
     <article className="border border-border rounded-lg bg-surface overflow-hidden">
       {/* 头部 */}
       <header className="px-4 py-3 border-b border-border bg-surface-hover/40 flex items-center gap-3">
-        <span className="text-xs text-fg-subtle font-mono">
-          #{step.step_order}
-        </span>
+        {orderPrefix && (
+          <span className="text-xs text-fg-subtle font-mono">
+            {orderPrefix}
+          </span>
+        )}
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          onBlur={() => commit("name", name)}
+          onBlur={() => {
+            void commit("name", name);
+          }}
           disabled={readOnly}
           placeholder="步骤名"
           className="flex-1 bg-transparent text-sm font-medium text-fg outline-none placeholder:text-fg-subtle disabled:cursor-not-allowed"
         />
         <ModelInlineSelector
           value={step.model}
-          onChange={(m) => onUpdate({ model: m })}
+          onChange={(m) => {
+            void commit("model", m);
+          }}
           disabled={readOnly}
         />
         {!readOnly && onRunStep && (
@@ -84,7 +122,9 @@ export function StepCard({ step, readOnly, onUpdate, onDelete, onRunStep, isRunn
         )}
         {!readOnly && (
           <button
-            onClick={onDelete}
+            onClick={() => {
+              void handleDelete();
+            }}
             className="p-1 text-fg-subtle hover:text-error transition-colors"
             title="删除步骤"
           >
@@ -100,7 +140,9 @@ export function StepCard({ step, readOnly, onUpdate, onDelete, onRunStep, isRunn
           placeholder="这步该做什么、扮演什么角色…"
           value={systemPrompt}
           onChange={setSystemPrompt}
-          onBlur={() => commit("system_prompt", systemPrompt)}
+          onBlur={() => {
+            void commit("system_prompt", systemPrompt);
+          }}
           disabled={readOnly}
           minRows={3}
         />
@@ -109,15 +151,24 @@ export function StepCard({ step, readOnly, onUpdate, onDelete, onRunStep, isRunn
           placeholder="留空则隐式继承上一步输出"
           value={userPrompt}
           onChange={setUserPrompt}
-          onBlur={() => commit("user_prompt", userPrompt)}
+          onBlur={() => {
+            void commit("user_prompt", userPrompt);
+          }}
           disabled={readOnly}
           minRows={2}
         />
         <ToolAllowlistEditor
           value={step.enable_tools}
-          onChange={(t) => onUpdate({ enable_tools: t })}
+          onChange={(t) => {
+            void commit("enable_tools", t);
+          }}
           disabled={readOnly}
         />
+        {saveError && (
+          <div className="rounded-md bg-error/10 px-3 py-2 text-xs text-error">
+            {saveError}
+          </div>
+        )}
       </div>
     </article>
   );

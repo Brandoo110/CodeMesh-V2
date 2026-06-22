@@ -26,6 +26,7 @@ from execution.tools import (
     glob_files,
     grep_text,
     edit_file,
+    fetch_url,
 )
 
 
@@ -59,12 +60,13 @@ def _make_workspace() -> Path:
 # ────────────────────────── registry 基础 ──────────────────────────
 
 
-def test_registry_has_eleven_tools():
-    assert len(registry.names) == 11
+def test_registry_has_thirteen_tools():
+    assert len(registry.names) == 13
     assert set(registry.names) == {
         "bash_exec", "read_file", "write_file",
         "glob_files", "grep_text", "edit_file",
         "lsp_code",
+        "web_search", "fetch_url",
         "remember_fact", "recall_facts", "forget_fact",
         "invoke_skill",
     }
@@ -262,6 +264,21 @@ def test_grep_no_match():
     base = _make_workspace()
     out = _run(grep_text(r"this_string_does_not_appear_anywhere_xyz", root=str(base)))
     assert "no matches" in out
+
+
+# ────────────────────────── web tools ──────────────────────────
+
+
+def test_fetch_url_blocks_localhost():
+    out = _run(fetch_url("http://127.0.0.1:8000/private"))
+    assert "[ERROR]" in out
+    assert "blocked host" in out
+
+
+def test_fetch_url_blocks_file_scheme():
+    out = _run(fetch_url("file:///etc/hosts"))
+    assert "[ERROR]" in out
+    assert "only http/https" in out
 
 
 # ────────────────────────── runner ──────────────────────────

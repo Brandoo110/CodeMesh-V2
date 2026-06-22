@@ -4,9 +4,8 @@ CodeMesh Web UI 后端包。
 ----------------------------------------------------------------------
 为什么有这个包？
 ----------------------------------------------------------------------
-v4 末项目反思后判断："功能层冻结，启动讲述层"——但用户在 demo / 面试时
-拿 CLI 演示不直观，加 Web UI 让流式输出 / 工具调用 / planner timeline /
-stats dashboard 在浏览器里可视化。
+Web UI 让流式输出、工具调用、workflow、diff、stats 和 memory 状态能在
+浏览器里直接观察，而不是只能通过 CLI 日志阅读。
 
 ----------------------------------------------------------------------
 为什么是 FastAPI 而不是 NestJS？
@@ -14,10 +13,9 @@ stats dashboard 在浏览器里可视化。
 CodeMesh 是 Python 项目，FastAPI 同进程 `from harness import Harness`
 直接复用 harness.run / run_stream / 所有 adapter / hooks / memory 7 层。
 NestJS 要么多一层 BFF（过度工程），要么跨进程 spawn Python（冷启 + 状态丢失）。
-完整决策见 docs/decisions/0006-web-ui-stack-fastapi-nextjs.md。
 
 ----------------------------------------------------------------------
-"HTML 给人看不给 agent 吃"边界仍然适用（ADR-0002）
+"HTML 给人看不给 agent 吃"边界仍然适用
 ----------------------------------------------------------------------
 本包暴露的是给浏览器的 HTTP API。Agent 内部 tool returns 还是字符串，
 不会因为 web 层加进来而被污染——web 只是 harness 输出的另一个消费者。

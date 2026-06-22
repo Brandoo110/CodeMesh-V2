@@ -29,10 +29,10 @@ vector 得分把这五个都排进 top5，但**精度差**。
             默认 scorer 用 doubao 模型（最便宜）打 0-10 分
     返回 candidates 按分数降序的前 k 个
 
-【面试讲法】
+【设计说明】
 "Q: 为什么不用 BAAI 的 reranker 模型？"
 → 它要 GPU、要装 sentence-transformers、首次加载要下载几百 MB 模型。
-  对面试 demo 项目来说成本太高。LLM-as-reranker 拿 doubao 一次调 0.001 元，
+  对demo 项目来说成本太高。LLM-as-reranker 拿 doubao 一次调 0.001 元，
   20 个 candidate 一次性塞 prompt 几秒搞定，效果接近 cross-encoder。
 
 "Q: 怎么避免 reranker 自己也错？"

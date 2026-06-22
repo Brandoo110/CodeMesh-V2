@@ -20,9 +20,13 @@ from web.schemas import (
     StepReorderRequest,
     StepResultInfo,
     StepUpdateRequest,
+    WorkflowContinueRequest,
     WorkflowCreateRequest,
     WorkflowDetail,
     WorkflowInfo,
+    WorkflowPromptChange,
+    WorkflowPromptDraftRequest,
+    WorkflowPromptDraftResponse,
     WorkflowUpdateRequest,
 )
 from web.workflow_orchestrator import WorkflowOrchestrator
@@ -211,6 +215,41 @@ async def update_step(
     return StepInfo(**updated)
 
 
+@router.post("/{workflow_id}/prompt-draft", response_model=WorkflowPromptDraftResponse)
+async def draft_prompt_changes(
+    workflow_id: str,
+    req: WorkflowPromptDraftRequest,
+    store: WorkflowsStore = Depends(get_workflows_store),
+) -> WorkflowPromptDraftResponse:
+    """
+    把右侧继续修改输入转成可确认的 prompt 草案。
+
+    这里故意先做轻量本地意图路由，不额外调用模型：用户要的是“及时看到
+    Planner / Coder / Reviewer 哪些 prompt 会被改”，确认后再执行真正的
+    workflow。后续如果要升级成 LLM classifier，可以保持这个响应合同不变。
+    """
+    await _ensure_init(store)
+    wf = await store.get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+    if wf["is_template"]:
+        raise HTTPException(403, "built-in templates are read-only; fork before editing")
+    steps = await store.get_steps(workflow_id)
+    if not steps:
+        raise HTTPException(400, "workflow has no steps")
+
+    changes = _draft_prompt_changes(steps, req.user_request, req.run_context)
+    if not changes:
+        raise HTTPException(400, "no prompt changes could be drafted")
+    start_step_id = _earliest_changed_step_id(steps, changes)
+    changed_names = "、".join(change.step_name for change in changes)
+    return WorkflowPromptDraftResponse(
+        summary=f"已根据你的补充生成 {len(changes)} 处 prompt 修改草案：{changed_names}。",
+        start_step_id=start_step_id,
+        changes=changes,
+    )
+
+
 @router.delete("/{workflow_id}/steps/{step_id}")
 async def delete_step(
     workflow_id: str,
@@ -298,6 +337,7 @@ async def _stream_run_events(
     run_id: str,
     *,
     only_step_id: Optional[str] = None,
+    start_step_id: Optional[str] = None,
     seed_input: Optional[str] = None,
 ):
     """共享 SSE event generator：把 orchestrator 事件转 EventSource 帧。"""
@@ -305,6 +345,7 @@ async def _stream_run_events(
         async for event in orchestrator.run(
             workflow_id, run_id,
             only_step_id=only_step_id,
+            start_step_id=start_step_id,
             seed_input=seed_input,
         ):
             yield {
@@ -379,6 +420,45 @@ async def run_single_step(
     )
 
 
+@router.post("/{workflow_id}/continue")
+async def continue_workflow(
+    workflow_id: str,
+    req: WorkflowContinueRequest,
+    store: WorkflowsStore = Depends(get_workflows_store),
+):
+    """
+    基于上次执行结果继续迭代（SSE）。
+
+    不重跑 Planner；默认从最后一个具备写权限的 step 开始，继续执行后续
+    Reviewer / Summary 步骤。这样用户可以像对话一样提出后续修改要求。
+    """
+    await _ensure_init(store)
+    wf = await store.get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+    steps = await store.get_steps(workflow_id)
+    if not steps:
+        raise HTTPException(400, "workflow has no steps")
+
+    orchestrator = _get_orchestrator(store)
+    start_step_id = orchestrator.find_continue_start_step_id(
+        steps, req.start_step_id
+    )
+    if not start_step_id:
+        raise HTTPException(400, "no step available for continuation")
+
+    run = await store.create_run(workflow_id)
+    return EventSourceResponse(
+        _stream_run_events(
+            orchestrator,
+            workflow_id,
+            run["id"],
+            start_step_id=start_step_id,
+            seed_input=_build_continue_seed(req.user_request, req.run_context),
+        ),
+    )
+
+
 @router.post("/runs/{run_id}/cancel")
 async def cancel_run(
     run_id: str,
@@ -393,3 +473,192 @@ async def cancel_run(
     orchestrator = _get_orchestrator(store)
     orchestrator.cancel(run_id)
     return {"ok": True, "run_id": run_id}
+
+
+def _build_continue_seed(user_request: str, run_context: str) -> str:
+    context = run_context.strip() or "（没有可用的上次执行上下文）"
+    return (
+        "用户追加修改要求：\n"
+        f"{user_request.strip()}\n\n"
+        "上一次执行上下文：\n"
+        f"{context}\n\n"
+        "请基于当前文件继续迭代，只处理用户追加要求相关内容；"
+        "不要从头重写无关部分。完成后简短说明修改点和验证方式。"
+    )
+
+
+_PLANNER_HINTS = (
+    "planner",
+    "plan",
+    "规划",
+    "计划",
+    "需求",
+    "requirement",
+    "最开始",
+    "第一步",
+    "重新设计",
+    "方案",
+)
+_CODER_HINTS = (
+    "coder",
+    "code",
+    "代码",
+    "实现",
+    "修改",
+    "修复",
+    "bug",
+    "页面",
+    "ui",
+    "按钮",
+    "样式",
+)
+_REVIEWER_HINTS = (
+    "reviewer",
+    "review",
+    "审查",
+    "验收",
+    "检查",
+    "自检",
+    "测试标准",
+    "验证",
+)
+_WRITE_TOOLS = {"edit_file", "write_file", "delete_file"}
+
+
+def _draft_prompt_changes(
+    steps: list[dict],
+    user_request: str,
+    run_context: str,
+) -> list[WorkflowPromptChange]:
+    selected = _select_prompt_target_steps(steps, user_request)
+    changes: list[WorkflowPromptChange] = []
+    for role, step, reason in selected:
+        field = "user_prompt"
+        old_text = str(step.get(field) or "")
+        new_text = _append_prompt_instruction(
+            old_text,
+            role=role,
+            user_request=user_request,
+            run_context=run_context,
+        )
+        changes.append(WorkflowPromptChange(
+            step_id=step["id"],
+            step_name=step["name"],
+            field=field,
+            old_text=old_text,
+            new_text=new_text,
+            reason=reason,
+        ))
+    return changes
+
+
+def _select_prompt_target_steps(
+    steps: list[dict],
+    user_request: str,
+) -> list[tuple[str, dict, str]]:
+    text = user_request.lower()
+    targets: list[tuple[str, dict, str]] = []
+
+    if _contains_any(text, _PLANNER_HINTS):
+        step = _find_named_step(steps, ("planner", "plan", "规划", "计划")) or steps[0]
+        targets.append((
+            "planner",
+            step,
+            "用户提到计划、需求或最开始的任务定义，先更新 Planner prompt。",
+        ))
+
+    if _contains_any(text, _CODER_HINTS):
+        step = _find_named_step(steps, ("coder", "code", "实现", "开发")) or _find_last_writable_step(steps) or steps[-1]
+        targets.append((
+            "coder",
+            step,
+            "用户描述的是实现、bug、页面或按钮问题，更新 Coder prompt。",
+        ))
+
+    if _contains_any(text, _REVIEWER_HINTS):
+        step = _find_named_step(steps, ("reviewer", "review", "审查", "验收")) or steps[-1]
+        targets.append((
+            "reviewer",
+            step,
+            "用户提到审查、验收或验证标准，更新 Reviewer prompt。",
+        ))
+
+    if not targets:
+        step = _find_last_writable_step(steps) or steps[0]
+        targets.append((
+            "coder",
+            step,
+            "未命中特定角色关键词，默认把追加要求交给最近的可写步骤处理。",
+        ))
+
+    deduped: list[tuple[str, dict, str]] = []
+    seen: set[str] = set()
+    for target in targets:
+        step_id = target[1]["id"]
+        if step_id in seen:
+            continue
+        deduped.append(target)
+        seen.add(step_id)
+    return deduped
+
+
+def _append_prompt_instruction(
+    old_text: str,
+    *,
+    role: str,
+    user_request: str,
+    run_context: str,
+) -> str:
+    role_label = {
+        "planner": "请先把这条补充要求纳入计划和需求拆解。",
+        "coder": "请在实现时优先处理这条补充要求。",
+        "reviewer": "请在审查时重点验证这条补充要求是否被满足。",
+    }.get(role, "请处理这条补充要求。")
+    context = _truncate_for_prompt(run_context.strip(), 800)
+    parts = [
+        old_text.rstrip(),
+        "",
+        "【用户确认后追加】",
+        f"用户补充：{user_request.strip()}",
+        f"执行重点：{role_label}",
+    ]
+    if context:
+        parts.extend(["参考上次执行上下文：", context])
+    return "\n".join(part for part in parts if part != "")
+
+
+def _earliest_changed_step_id(
+    steps: list[dict],
+    changes: list[WorkflowPromptChange],
+) -> str:
+    changed = {change.step_id for change in changes}
+    for step in steps:
+        if step["id"] in changed:
+            return step["id"]
+    return changes[0].step_id
+
+
+def _find_named_step(steps: list[dict], names: tuple[str, ...]) -> Optional[dict]:
+    for step in steps:
+        step_name = str(step.get("name") or "").lower()
+        if any(name in step_name for name in names):
+            return step
+    return None
+
+
+def _find_last_writable_step(steps: list[dict]) -> Optional[dict]:
+    for step in reversed(steps):
+        tools = set(step.get("enable_tools") or [])
+        if "*" in tools or tools.intersection(_WRITE_TOOLS):
+            return step
+    return None
+
+
+def _contains_any(text: str, hints: tuple[str, ...]) -> bool:
+    return any(hint in text for hint in hints)
+
+
+def _truncate_for_prompt(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n...[已截断]"

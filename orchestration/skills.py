@@ -31,7 +31,7 @@ Anthropic 的设计：把所有 skill 的 (name, description) 放进 system prom
 
 项目级在用户级之前注册；同名时项目级覆盖用户级（项目意图优先）。
 
-【面试讲法】
+【设计说明】
 "Q: skill 和 prompt 有什么区别？"
 → prompt 是死的文字，每次都全量发；skill 是带 metadata 的可寻址条目，
   模型按需调用。模型本身决定"现在要不要拉 X skill"。

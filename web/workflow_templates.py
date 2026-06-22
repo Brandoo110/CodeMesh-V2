@@ -26,6 +26,12 @@ from web.workflows_store import WorkflowsStore
 # system prompt 用英文写——所有 LLM 对英文 system prompt 鲁棒性更高
 # （design plan §11 Q2 拍板）。UI 显示中文名 / 中文描述。
 
+READ_TOOLS = ["grep_text", "read_file", "glob_files", "lsp_code", "web_search", "fetch_url"]
+WRITE_TOOLS = [
+    "grep_text", "read_file", "edit_file", "write_file",
+    "glob_files", "lsp_code", "web_search", "fetch_url",
+]
+
 TEMPLATES: list[dict] = [
     {
         "name": "Aider 流水线（Architect + Editor）",
@@ -37,7 +43,7 @@ TEMPLATES: list[dict] = [
             {
                 "name": "1. 架构设计（Architect）",
                 "model": "deepseek",
-                "enable_tools": ["grep_text", "read_file", "glob_files", "lsp_code"],
+                "enable_tools": READ_TOOLS,
                 "system_prompt": (
                     "你是一名资深软件架构师。用 grep_text / read_file / glob_files / "
                     "lsp_code 工具探查代码库，输出一份设计方案，包含：(1) 要修改"
@@ -51,10 +57,7 @@ TEMPLATES: list[dict] = [
             {
                 "name": "2. 编写代码（Editor）",
                 "model": "gemini",
-                "enable_tools": [
-                    "grep_text", "read_file", "edit_file", "write_file",
-                    "glob_files", "lsp_code",
-                ],
+                "enable_tools": WRITE_TOOLS,
                 "system_prompt": (
                     "你是编码助手。根据上一步的架构方案具体实现代码。"
                     "用 edit_file 做精确修改，write_file 仅用于新建文件。"
@@ -74,8 +77,8 @@ TEMPLATES: list[dict] = [
         "steps": [
             {
                 "name": "1. Planner",
-                "model": "deepseek",
-                "enable_tools": ["grep_text", "read_file", "glob_files", "lsp_code"],
+                "model": "gemini",
+                "enable_tools": READ_TOOLS,
                 "system_prompt": (
                     "你负责规划。读懂用户任务，探查相关文件，输出一份分步计划，"
                     "包含每步要改的文件和动作。**不要写实现代码**。"
@@ -84,11 +87,8 @@ TEMPLATES: list[dict] = [
             },
             {
                 "name": "2. Coder",
-                "model": "gemini",
-                "enable_tools": [
-                    "grep_text", "read_file", "edit_file", "write_file",
-                    "glob_files", "lsp_code",
-                ],
+                "model": "deepseek",
+                "enable_tools": WRITE_TOOLS,
                 "system_prompt": (
                     "按上一步 Planner 给的计划具体实现代码。要精准——只在不"
                     "显然处加注释。如果有测试运行器，跑一下测试。"
@@ -97,13 +97,15 @@ TEMPLATES: list[dict] = [
             },
             {
                 "name": "3. Reviewer",
-                "model": "deepseek",
-                "enable_tools": ["grep_text", "read_file", "glob_files", "lsp_code"],
+                "model": "minimax",
+                "enable_tools": READ_TOOLS,
                 "system_prompt": (
                     "审查上一步 Coder 改的代码。检查 4 个维度：(1) 正确性、"
                     "(2) 可读性、(3) 边界情况、(4) 测试覆盖。"
-                    "把发现的问题列出来，每条以 '⚠' 开头；如果没问题，回复 "
-                    "'LGTM'。**你无法改代码**——工具是只读的。"
+                    "不要输出 <think>。请用自然语言说明当前交付是否达标；"
+                    "如果有阻塞问题，明确说明为什么还不能交付、缺什么、"
+                    "建议 Coder 如何补。"
+                    "**你无法改代码**——工具是只读的。"
                 ),
                 "user_prompt": "",
             },
@@ -119,10 +121,7 @@ TEMPLATES: list[dict] = [
             {
                 "name": "1a. DeepSeek 实现",
                 "model": "deepseek",
-                "enable_tools": [
-                    "grep_text", "read_file", "edit_file", "write_file",
-                    "glob_files", "lsp_code",
-                ],
+                "enable_tools": WRITE_TOOLS,
                 "system_prompt": (
                     "用可用的工具完成用户的任务。要自包含——不要引用"
                     "「另一个实现」。"
@@ -132,10 +131,7 @@ TEMPLATES: list[dict] = [
             {
                 "name": "1b. Gemini 实现",
                 "model": "gemini",
-                "enable_tools": [
-                    "grep_text", "read_file", "edit_file", "write_file",
-                    "glob_files", "lsp_code",
-                ],
+                "enable_tools": WRITE_TOOLS,
                 "system_prompt": (
                     "用可用的工具完成用户的任务。要自包含——不要引用"
                     "「另一个实现」。"
@@ -168,13 +164,16 @@ async def seed_templates(store: WorkflowsStore) -> int:
     不删旧版——用户基于模板 fork 出来的工作流不应被破坏。
     """
     existing = await store.list_workflows()
-    existing_template_names = {
-        w["name"] for w in existing if w["is_template"]
+    existing_templates = {
+        w["name"]: w for w in existing if w["is_template"]
     }
 
     created_count = 0
     for tpl in TEMPLATES:
-        if tpl["name"] in existing_template_names:
+        if tpl["name"] in existing_templates:
+            await _sync_existing_template_defaults(
+                store, existing_templates[tpl["name"]]["id"], tpl
+            )
             continue
         wf = await store.create_workflow(
             tpl["name"], tpl["description"], is_template=True,
@@ -190,3 +189,27 @@ async def seed_templates(store: WorkflowsStore) -> int:
             )
         created_count += 1
     return created_count
+
+
+async def _sync_existing_template_defaults(
+    store: WorkflowsStore,
+    workflow_id: str,
+    tpl: dict,
+) -> None:
+    """模板已存在时同步默认工具和模型，不碰用户 fork 出来的工作流。"""
+    existing_steps = await store.get_steps(workflow_id)
+    by_name = {step["name"]: step for step in existing_steps}
+    for step_def in tpl["steps"]:
+        step = by_name.get(step_def["name"])
+        if not step:
+            continue
+        patch = {}
+        if step["enable_tools"] != step_def["enable_tools"]:
+            patch["enable_tools"] = step_def["enable_tools"]
+        if step["model"] != step_def["model"]:
+            patch["model"] = step_def["model"]
+        if patch:
+            await store.update_step(
+                step["id"],
+                **patch,
+            )

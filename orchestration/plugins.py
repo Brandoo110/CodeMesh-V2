@@ -38,7 +38,7 @@ Plugins 加载机制（Harness 编排层）
   单个 plugin 加载失败（语法错 / register 抛错）不应该让整个 Harness 起不来。
   失败的 plugin 打印 warning 跳过；其他 plugin 继续。
 
-【面试讲法】
+【设计说明】
 "Q: 为什么不用 setuptools entry_points？"
 → entry_points 要求 plugin 是 pip 装包；本项目目标是"丢一个 .py 进 .claude/plugins/
   就能用"。entry_points 适合发到 PyPI 的成熟生态，不适合个人配置 / 团队约定。

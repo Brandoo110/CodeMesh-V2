@@ -12,7 +12,7 @@
 各厂商官网定价页。价格会变，所以常量里写清"截至 xxx"。
 生产环境可以把这张表做成外部配置，调价时改 YAML 不改代码。
 
-【面试点】
+【设计要点】
 "Q: 你怎么做多模型成本对比？"
 → 每次 API 返回都有 usage 字段（prompt_tokens、completion_tokens）。
   拿实际 token 数 × 各家单价，加总到 Langfuse trace。
@@ -41,6 +41,8 @@ PRICING: dict[str, ModelPricing] = {
     "doubao":   ModelPricing(input_per_m=0.8, output_per_m=2.0),    # doubao-pro
     # Gemini 2.5 Flash 官方价：$0.075/M in, $0.30/M out；按 ~7.2 汇率换算到人民币
     "gemini":   ModelPricing(input_per_m=0.55, output_per_m=2.2),
+    # MiniMax-M2.7：官网定价（直接人民币）
+    "minimax":  ModelPricing(input_per_m=0.3, output_per_m=1.2),
 }
 
 

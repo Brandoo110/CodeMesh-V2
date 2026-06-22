@@ -4,6 +4,7 @@
  * 与 lib/sse.ts 完全相同的 SSE 协议（sse-starlette 输出），但是端点不同：
  *   /api/workflows/{id}/run
  *   /api/workflows/{id}/steps/{sid}/run
+ *   /api/workflows/{id}/continue
  *
  * Event 类型：
  *   run_start    {run_id, workflow_id, total_steps}
@@ -13,12 +14,17 @@
  *   tool_end     {name, result, ok, step_id}
  *   usage        {cost_rmb, model, prompt, completion, step_id}
  *   step_end     {step_id, step_order, ok, cost_rmb, duration_ms, model_used}
- *   done         {ok, total_cost, run_id}
+ *   review_decision {reviewer_step_id, reviewer_name, status, target_step_id, target_name, reason, rework_prompt, cost_rmb, model}
+ *   rework_requested {reviewer_step_id, reviewer_name, target_step_id, target_name, reason}
+ *   final_start  {model}
+ *   final_end    {reply, cost_rmb, model}
+ *   done         {ok, total_cost, run_id, final_reply}
  *   error        {message}
  *   cancelled    {run_id}
  */
 
 import { ApiError } from "./api";
+import type { WorkflowContinueRequest } from "./workflow-types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
@@ -108,6 +114,19 @@ export async function* streamStepRun(
   const res = await fetch(url.toString(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+  });
+  yield* consumeSSE(res);
+}
+
+/** 基于上次运行结果继续迭代。 */
+export async function* streamWorkflowContinue(
+  workflowId: string,
+  req: WorkflowContinueRequest,
+): AsyncGenerator<StreamEvent> {
+  const res = await fetch(`${API_BASE}/api/workflows/${workflowId}/continue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
   });
   yield* consumeSSE(res);
 }

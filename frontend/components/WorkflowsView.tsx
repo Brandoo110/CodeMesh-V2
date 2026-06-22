@@ -6,7 +6,7 @@
  * 布局：
  *   ┌──────────────┬─────────────────────────────┬──────────────┐
  *   │ WorkflowList │     WorkflowEditor          │ WorkflowRun  │
- *   │   240px      │     flex 1                  │   320px      │
+ *   │   240px      │     flex 1                  │ 280-640px    │
  *   └──────────────┴─────────────────────────────┴──────────────┘
  *
  * Phase 6.2：WorkflowList 接通 + 中间编辑器空占位 + 右栏占位
@@ -22,13 +22,41 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useStore } from "@/lib/store";
-import { listWorkflows, getWorkflow } from "@/lib/workflow-api";
-import { streamWorkflowRun, streamStepRun } from "@/lib/workflow-sse";
-import type { WorkflowDetail, Step } from "@/lib/workflow-types";
+import {
+  draftWorkflowPromptChanges,
+  getRun,
+  getWorkflow,
+  listRuns,
+  listWorkflows,
+  updateStep,
+} from "@/lib/workflow-api";
+import {
+  streamWorkflowContinue,
+  streamWorkflowRun,
+  streamStepRun,
+} from "@/lib/workflow-sse";
+import { buildRunStatesFromDetail } from "@/lib/workflow-history";
+import {
+  applyPromptDraftChanges,
+  buildWorkflowContinueContext,
+  findContinueStartStepId,
+} from "@/lib/workflow-continue";
+import type {
+  Run,
+  RunDetail,
+  Step,
+  WorkflowDetail,
+  WorkflowPromptDraftResponse,
+} from "@/lib/workflow-types";
 import type { StreamEvent } from "@/lib/workflow-sse";
 import { WorkflowList } from "./WorkflowList";
 import { WorkflowEditor } from "./WorkflowEditor";
-import { WorkflowRunPanel, type StepRunState } from "./WorkflowRunPanel";
+import {
+  WorkflowRunPanel,
+  type ReviewDecisionRunEvent,
+  type ReworkRunEvent,
+  type StepRunState,
+} from "./WorkflowRunPanel";
 
 export function WorkflowsView() {
   const workflows = useStore((s) => s.workflows);
@@ -45,6 +73,13 @@ export function WorkflowsView() {
   const [isRunning, setIsRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [totalCost, setTotalCost] = useState(0);
+  const [finalReply, setFinalReply] = useState("");
+  const [isFinalizingReply, setIsFinalizingReply] = useState(false);
+  const [reviewDecisionEvents, setReviewDecisionEvents] = useState<ReviewDecisionRunEvent[]>([]);
+  const [reworkEvents, setReworkEvents] = useState<ReworkRunEvent[]>([]);
+  const [runHistory, setRunHistory] = useState<Run[]>([]);
+  const [loadingRunHistory, setLoadingRunHistory] = useState(false);
+  const [loadedHistoryRunId, setLoadedHistoryRunId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -66,6 +101,22 @@ export function WorkflowsView() {
     }
   }, [currentId, refresh]);
 
+  const reloadRuns = useCallback(async () => {
+    if (!currentId) {
+      setRunHistory([]);
+      return;
+    }
+    setLoadingRunHistory(true);
+    try {
+      const rows = await listRuns(currentId, 20);
+      setRunHistory(rows);
+    } catch (e) {
+      console.error("Failed to list workflow runs:", e);
+    } finally {
+      setLoadingRunHistory(false);
+    }
+  }, [currentId]);
+
   // 挂载时拉列表
   useEffect(() => {
     refresh();
@@ -73,16 +124,41 @@ export function WorkflowsView() {
 
   // 切换当前工作流时拉详情 + 清空运行状态
   useEffect(() => {
-    if (!currentId) {
-      setDetail(null);
-      return;
-    }
     let cancelled = false;
-    setLoadingDetail(true);
-    setRunStates(new Map());
-    setCurrentRunId(null);
-    setRunError(null);
-    setTotalCost(0);
+    if (!currentId) {
+      queueMicrotask(() => {
+        if (cancelled) return;
+        setDetail(null);
+        setRunStates(new Map());
+        setCurrentRunId(null);
+        setRunError(null);
+        setTotalCost(0);
+        setFinalReply("");
+        setIsFinalizingReply(false);
+        setReviewDecisionEvents([]);
+        setReworkEvents([]);
+        setRunHistory([]);
+        setLoadedHistoryRunId(null);
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setLoadingDetail(true);
+      setLoadingRunHistory(true);
+      setRunStates(new Map());
+      setCurrentRunId(null);
+      setRunError(null);
+      setTotalCost(0);
+      setFinalReply("");
+      setIsFinalizingReply(false);
+      setReviewDecisionEvents([]);
+      setReworkEvents([]);
+      setRunHistory([]);
+      setLoadedHistoryRunId(null);
+    });
     getWorkflow(currentId)
       .then((d) => {
         if (!cancelled) setDetail(d);
@@ -92,6 +168,16 @@ export function WorkflowsView() {
       })
       .finally(() => {
         if (!cancelled) setLoadingDetail(false);
+      });
+    listRuns(currentId, 20)
+      .then((rows) => {
+        if (!cancelled) setRunHistory(rows);
+      })
+      .catch((e) => {
+        console.error("Failed to list workflow runs:", e);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingRunHistory(false);
       });
     return () => {
       cancelled = true;
@@ -237,21 +323,76 @@ export function WorkflowsView() {
               }
               break;
 
+            case "review_decision":
+              setReviewDecisionEvents((prev) => [
+                ...prev,
+                {
+                  reviewerStepId: data.reviewer_step_id as string,
+                  reviewerName: (data.reviewer_name as string | undefined) || "Reviewer",
+                  status: data.status === "needs_rework" ? "needs_rework" : "done",
+                  targetStepId: data.target_step_id as string | undefined,
+                  targetName: data.target_name as string | undefined,
+                  reason: data.reason as string | undefined,
+                  model: data.model as string | undefined,
+                  costRmb: data.cost_rmb as number | undefined,
+                },
+              ]);
+              if (data.cost_rmb) {
+                setTotalCost((c) => c + (data.cost_rmb as number));
+              }
+              break;
+
+            case "rework_requested":
+              setReworkEvents((prev) => [
+                ...prev,
+                {
+                  reviewerStepId: data.reviewer_step_id as string,
+                  reviewerName: (data.reviewer_name as string | undefined) || "Reviewer",
+                  targetStepId: data.target_step_id as string,
+                  targetName: (data.target_name as string | undefined) || "Coder",
+                  reason: data.reason as string | undefined,
+                },
+              ]);
+              break;
+
+            case "final_start":
+              setIsFinalizingReply(true);
+              setFinalReply("");
+              break;
+
+            case "final_end":
+              setIsFinalizingReply(false);
+              setFinalReply((data.reply as string | undefined) || "");
+              if (data.cost_rmb) {
+                setTotalCost((c) => c + (data.cost_rmb as number));
+              }
+              break;
+
             case "done":
               setIsRunning(false);
+              setIsFinalizingReply(false);
+              if (typeof data.total_cost === "number") {
+                setTotalCost(data.total_cost);
+              }
+              if (typeof data.final_reply === "string") {
+                setFinalReply(data.final_reply);
+              }
               if (!data.ok) {
                 setRunError((data.error as string) || "执行失败");
               }
               reloadDetail();
+              reloadRuns();
               break;
 
             case "error":
               setRunError(data.message as string);
               setIsRunning(false);
+              setIsFinalizingReply(false);
               break;
 
             case "cancelled":
               setIsRunning(false);
+              setIsFinalizingReply(false);
               break;
           }
         }
@@ -261,7 +402,7 @@ export function WorkflowsView() {
         setIsRunning(false);
       }
     },
-    [reloadDetail],
+    [reloadDetail, reloadRuns],
   );
 
   /** 整体工作流执行：所有 steps 重置为 pending 再开始。 */
@@ -277,6 +418,10 @@ export function WorkflowsView() {
     );
     setRunStates(fresh);
     setTotalCost(0);
+    setFinalReply("");
+    setIsFinalizingReply(false);
+    setReviewDecisionEvents([]);
+    setReworkEvents([]);
     await consumeEvents(streamWorkflowRun(detail.id));
   }, [detail, consumeEvents]);
 
@@ -299,12 +444,106 @@ export function WorkflowsView() {
         });
         return next;
       });
+      setFinalReply("");
+      setIsFinalizingReply(false);
+      setReviewDecisionEvents([]);
+      setReworkEvents([]);
 
       await consumeEvents(
         streamStepRun(detail.id, stepId, seedInput || undefined),
       );
     },
     [detail, runStates, consumeEvents],
+  );
+
+  const handleDraftContinue = useCallback(
+    async (userRequest: string) => {
+      if (!detail) return;
+      const runContext = buildWorkflowContinueContext(
+        detail.steps,
+        runStates,
+        finalReply,
+      );
+
+      return draftWorkflowPromptChanges(detail.id, {
+        user_request: userRequest,
+        run_context: runContext,
+      });
+    },
+    [detail, runStates, finalReply],
+  );
+
+  const handleConfirmContinue = useCallback(
+    async (draft: WorkflowPromptDraftResponse, userRequest: string) => {
+      if (!detail) return;
+
+      for (const change of draft.changes) {
+        await updateStep(detail.id, change.step_id, {
+          [change.field]: change.new_text,
+        });
+      }
+
+      const patchedSteps = applyPromptDraftChanges(detail.steps, draft);
+      const patchedDetail = { ...detail, steps: patchedSteps };
+      setDetail(patchedDetail);
+      await refresh();
+
+      const startStepId = draft.start_step_id || findContinueStartStepId(patchedSteps);
+      if (!startStepId) return;
+      const startIdx = patchedSteps.findIndex((s: Step) => s.id === startStepId);
+      if (startIdx < 0) return;
+      const runContext = buildWorkflowContinueContext(
+        patchedSteps,
+        runStates,
+        finalReply,
+      );
+
+      setRunStates((prev) => {
+        const next = new Map(prev);
+        patchedSteps.slice(startIdx).forEach((s: Step) => {
+          next.set(s.id, {
+            status: "pending",
+            output: "",
+            toolCalls: [],
+          });
+        });
+        return next;
+      });
+      setTotalCost(0);
+      setFinalReply("");
+      setIsFinalizingReply(false);
+      setReviewDecisionEvents([]);
+      setReworkEvents([]);
+
+      await consumeEvents(streamWorkflowContinue(detail.id, {
+        user_request: userRequest,
+        run_context: runContext,
+        start_step_id: startStepId,
+      }));
+    },
+    [detail, runStates, finalReply, consumeEvents, refresh],
+  );
+
+  const handleLoadRun = useCallback(
+    async (runId: string) => {
+      if (!runId) return;
+      try {
+        const run = await getRun(runId);
+        setCurrentRunId(run.id);
+        setRunStates(buildRunStatesFromDetail(run));
+        setIsRunning(false);
+        setIsFinalizingReply(false);
+        setTotalCost(run.total_cost_rmb);
+        setRunError(run.error);
+        setFinalReply(run.final_reply || "");
+        setReviewDecisionEvents(buildHistoricalReviewDecisionEvents(run, detail?.steps ?? []));
+        setReworkEvents(buildHistoricalReworkEvents(run, detail?.steps ?? []));
+        setLoadedHistoryRunId(run.id);
+      } catch (e) {
+        setRunError((e as Error).message);
+      }
+    },
+    [detail],
   );
 
   const handleStopLocal = useCallback(() => {
@@ -325,13 +564,14 @@ export function WorkflowsView() {
       <WorkflowList workflows={workflows} onRefresh={refresh} />
 
       {/* 中：编辑器 */}
-      <main className="flex-1 overflow-y-auto bg-canvas">
+      <main className="min-w-0 flex-1 overflow-y-auto bg-canvas">
         {!currentId ? (
           <EmptyState />
         ) : loadingDetail ? (
           <LoadingState />
         ) : detail ? (
           <WorkflowEditor
+            key={`${detail.id}:${detail.name}:${detail.description}`}
             detail={detail}
             onChange={reloadDetail}
             onRun={handleRun}
@@ -348,14 +588,96 @@ export function WorkflowsView() {
       <WorkflowRunPanel
         steps={detail?.steps ?? []}
         runStates={runStates}
+        reviewDecisionEvents={reviewDecisionEvents}
+        reworkEvents={reworkEvents}
         isRunning={isRunning}
         runId={currentRunId}
         totalCost={totalCost}
         runError={runError}
+        finalReply={finalReply}
+        isFinalizingReply={isFinalizingReply}
+        runHistory={runHistory}
+        loadingRunHistory={loadingRunHistory}
+        loadedHistoryRunId={loadedHistoryRunId}
         onStop={handleStopLocal}
+        onPrepareContinue={handleDraftContinue}
+        onConfirmContinue={handleConfirmContinue}
+        onLoadRun={handleLoadRun}
       />
     </div>
   );
+}
+
+function buildHistoricalReworkEvents(
+  run: RunDetail,
+  steps: Step[],
+): ReworkRunEvent[] {
+  const stepById = new Map(steps.map((step) => [step.id, step]));
+  const events: ReworkRunEvent[] = [];
+
+  for (let idx = 1; idx < run.step_results.length; idx += 1) {
+    const prev = run.step_results[idx - 1];
+    const cur = run.step_results[idx];
+    if (cur.step_order >= prev.step_order) continue;
+
+    const reviewer = stepById.get(prev.step_id);
+    const target = stepById.get(cur.step_id);
+    events.push({
+      reviewerStepId: prev.step_id,
+      reviewerName: reviewer?.name || `Step ${prev.step_order}`,
+      targetStepId: cur.step_id,
+      targetName: target?.name || `Step ${cur.step_order}`,
+      reason: summarizeReworkReason(prev.output || ""),
+    });
+  }
+
+  return events;
+}
+
+function buildHistoricalReviewDecisionEvents(
+  run: RunDetail,
+  steps: Step[],
+): ReviewDecisionRunEvent[] {
+  const stepById = new Map(steps.map((step) => [step.id, step]));
+  const events: ReviewDecisionRunEvent[] = [];
+
+  for (let idx = 0; idx < run.step_results.length; idx += 1) {
+    const result = run.step_results[idx];
+    const step = stepById.get(result.step_id);
+    const isReviewer = step?.name.toLowerCase().includes("reviewer")
+      || step?.name.toLowerCase().includes("review")
+      || step?.name.includes("审查");
+    if (!isReviewer) continue;
+
+    const next = run.step_results[idx + 1];
+    const loopsBack = Boolean(next && next.step_order < result.step_order);
+    const target = loopsBack ? stepById.get(next.step_id) : undefined;
+    events.push({
+      reviewerStepId: result.step_id,
+      reviewerName: step?.name || `Step ${result.step_order}`,
+      status: loopsBack ? "needs_rework" : "done",
+      targetStepId: target?.id,
+      targetName: target?.name,
+      reason: loopsBack
+        ? summarizeReworkReason(result.output || "")
+        : "历史运行未保存隐藏决策详情，按步骤顺序推断为通过。",
+    });
+  }
+
+  return events;
+}
+
+function summarizeReworkReason(output: string): string {
+  const lines = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const issueLines = lines.filter((line) =>
+    ["⚠", "缺失", "缺少", "仍需", "需补", "需要补", "返工"].some((marker) =>
+      line.includes(marker),
+    ),
+  );
+  return (issueLines.length > 0 ? issueLines : lines).slice(0, 3).join("\n");
 }
 
 // ─────────────── 占位组件 ───────────────

@@ -112,7 +112,8 @@ def test_preflight_rejects_placeholder_key():
         os.environ["DEEPSEEK_API_KEY"] = "your-key-here"
         # 临时把其他真 key 全清掉
         cleared = {}
-        for k in ("GEMINI_API_KEY", "DASHSCOPE_API_KEY", "VOLC_API_KEY", "GOOGLE_API_KEY"):
+        for k in ("GEMINI_API_KEY", "DASHSCOPE_API_KEY", "VOLC_API_KEY",
+                  "GOOGLE_API_KEY", "MINIMAX_API_KEY"):
             if k in os.environ:
                 cleared[k] = os.environ.pop(k)
         try:
@@ -130,6 +131,38 @@ def test_preflight_rejects_placeholder_key():
             os.environ.pop("DEEPSEEK_API_KEY", None)
         else:
             os.environ["DEEPSEEK_API_KEY"] = saved
+
+
+def test_preflight_only_loads_cwd_env_file():
+    """临时目录有空 .env 时，不应误读项目根目录的真实 .env。"""
+    import typer
+    base = Path(tempfile.mkdtemp(prefix="cli-pre-cwd-"))
+    (base / ".env").write_text("")
+    cwd_was = Path.cwd()
+    key_names = (
+        "DEEPSEEK_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "VOLC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "MINIMAX_API_KEY",
+    )
+    cleared = {}
+    try:
+        os.chdir(base)
+        for k in key_names:
+            if k in os.environ:
+                cleared[k] = os.environ.pop(k)
+        try:
+            cli_mod._preflight()
+        except typer.Exit as e:
+            assert e.exit_code == 1
+            return
+        raise AssertionError("expected typer.Exit")
+    finally:
+        os.chdir(cwd_was)
+        for k, v in cleared.items():
+            os.environ[k] = v
 
 
 # ────────────────────────── stats 命令 ──────────────────────────

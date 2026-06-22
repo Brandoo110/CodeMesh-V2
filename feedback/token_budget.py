@@ -21,7 +21,7 @@ Token 计数与预算（Harness 反馈层）
 这个混合启发式在中英混排代码评测里跟 cl100k_base 误差 ±15%，
 够用做"避免超限"的预算计算。
 
-【面试点】
+【设计要点】
 "Q: 直接 `len(text)` 不行吗？"
 → 不行。token 数 ≠ char 数：tiktoken cl100k_base 算 'hello' = 1 token
   但 5 个字符；'你好' = 2 token 但 2 字符；中英混排误差差 4 倍。

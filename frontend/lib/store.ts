@@ -15,7 +15,7 @@ import { create } from "zustand";
 import type { ModelInfo } from "./types";
 import type { Workflow } from "./workflow-types";
 
-export type View = "chat" | "stats" | "workflows";
+export type View = "chat" | "stats" | "workflows" | "memory";
 
 interface StoreState {
   // 模型

@@ -44,7 +44,7 @@ Dreamer：真正的 L6 dreaming——4 阶段记忆巩固（CC 同款语义）
 - 减：不做 GrowthBook 远程开关（教学项目用不到）
 - 加：教学注释密度
 
-【面试故事】
+【设计背景】
 "我做完 dreamer 第一版后发现自己实际写的是 per-session 叙事，不是 CC dreaming
 本身——CC dreaming 是 consolidation。所以改名 session_journal，重新写了真 dreamer
 做 4 阶段巩固：扫 → grep 信号 → 让 LLM 给操作计划 → 机械执行 + 重建索引。

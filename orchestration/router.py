@@ -11,7 +11,7 @@
 这个决策直接决定接下来 Agent Loop 用哪个适配器。
 
 【为什么用 PydanticAI 而不是 LangGraph】
-这是本项目最核心的设计选择，面试必考。
+这是本项目最核心的设计选择，核心设计点。
 
 PydanticAI 的定位：给 LLM 输出套上 Pydantic 强类型约束。
   → 你定义一个 output_type（这里是 RouteDecision），PydanticAI 帮你：

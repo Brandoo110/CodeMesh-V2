@@ -45,15 +45,18 @@ console = Console()
 
 _FAKE_KEY_MARKERS = ("your-key-here", "sk-fake", "changeme", "xxxx")
 
-_KEY_ENVS = ("DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "VOLC_API_KEY", "GEMINI_API_KEY")
+_KEY_ENVS = (
+    "DEEPSEEK_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "VOLC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "MINIMAX_API_KEY",
+)
 
 
 def _preflight() -> None:
     """运行前检查 .env 是否配了至少一个可用 key。不过就打人话提示并退出。"""
-    load_dotenv()
-    # Google 自己的 SDK 有时用 GOOGLE_API_KEY、有时用 GEMINI_API_KEY，两个都兼容
-    if not os.getenv("GEMINI_API_KEY") and os.getenv("GOOGLE_API_KEY"):
-        os.environ["GEMINI_API_KEY"] = os.environ["GOOGLE_API_KEY"]
     env_file = Path.cwd() / ".env"
     if not env_file.exists():
         console.print(
@@ -62,6 +65,13 @@ def _preflight() -> None:
             "（GEMINI_API_KEY 最易获取）。"
         )
         raise typer.Exit(code=1)
+
+    # 只加载当前工作目录的 .env。python-dotenv 默认会按调用栈找文件，
+    # 测试切到临时目录时容易误读项目根目录的真实 key。
+    load_dotenv(dotenv_path=env_file)
+    # Google 自己的 SDK 有时用 GOOGLE_API_KEY、有时用 GEMINI_API_KEY，两个都兼容
+    if not os.getenv("GEMINI_API_KEY") and os.getenv("GOOGLE_API_KEY"):
+        os.environ["GEMINI_API_KEY"] = os.environ["GOOGLE_API_KEY"]
 
     valid = []
     for k in _KEY_ENVS:
@@ -76,8 +86,8 @@ def _preflight() -> None:
         console.print(
             "[red]没检测到有效的 API key。[/red]\n"
             "请在 [cyan].env[/cyan] 里填入以下任一：\n"
-            "  - DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / VOLC_API_KEY（国内合规主力）\n"
-            "  - GEMINI_API_KEY（学习/演示用，单 key 即可跑全套）"
+            "  - DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / VOLC_API_KEY / MINIMAX_API_KEY\n"
+            "  - GEMINI_API_KEY / GOOGLE_API_KEY（学习/演示用，单 key 即可跑全套）"
         )
         raise typer.Exit(code=1)
 

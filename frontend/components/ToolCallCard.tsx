@@ -3,13 +3,7 @@
 /**
  * 工具调用卡片：默认折叠显示一行，点击展开看 args + output。
  *
- * 视觉对齐 ui-design-plan.md §3.4.1：
- *   - 左侧 4px 模型色边
- *   - 折叠时一行 summary："🔧 grep_text [3 hits, 400ms ✓]"
- *   - 展开后 args (JSON) + output (限制 50 行预览)
- *
- * Phase 3 简版，args 直接 JSON.stringify；
- * Phase 4+ 可改 args 表格 / 高亮 / 重点字段 pretty-print。
+ * 简版实现：args 直接 JSON.stringify，output 由调用方截断。
  */
 
 import { useState } from "react";

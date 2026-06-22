@@ -8,13 +8,15 @@
  * （workflow 模型在 step 内选）。
  */
 
-import { Menu, MessageSquare, BarChart3, GitBranch } from "lucide-react";
+import { Menu, MessageSquare, BarChart3, GitBranch, Brain } from "lucide-react";
 import { useStore, type View } from "@/lib/store";
+import { viewUsesChatSidebar } from "@/lib/layout";
 import { ModelSelector } from "./ModelSelector";
 
 const VIEWS: { id: View; label: string; icon: typeof MessageSquare }[] = [
   { id: "chat", label: "对话", icon: MessageSquare },
   { id: "workflows", label: "工作流", icon: GitBranch },
+  { id: "memory", label: "记忆", icon: Brain },
   { id: "stats", label: "Stats", icon: BarChart3 },
 ];
 
@@ -22,18 +24,21 @@ export function TopBar() {
   const toggleSidebar = useStore((s) => s.toggleSidebar);
   const view = useStore((s) => s.view);
   const setView = useStore((s) => s.setView);
+  const hasChatSidebar = viewUsesChatSidebar(view);
 
   return (
     <header className="h-14 flex-shrink-0 border-b border-border bg-canvas flex items-center px-4">
       {/* 左：sidebar toggle + 标题（flex-1 占据剩余空间 1/2） */}
       <div className="flex-1 flex items-center gap-3">
-        <button
-          className="p-1.5 rounded-md hover:bg-surface text-fg-muted transition-colors"
-          onClick={toggleSidebar}
-          title="切换侧栏 (Cmd+\\)"
-        >
-          <Menu size={18} />
-        </button>
+        {hasChatSidebar && (
+          <button
+            className="p-1.5 rounded-md hover:bg-surface text-fg-muted transition-colors"
+            onClick={toggleSidebar}
+            title="切换侧栏 (Cmd+\\)"
+          >
+            <Menu size={18} />
+          </button>
+        )}
         <h1 className="text-sm font-medium text-fg">CodeMesh</h1>
       </div>
 

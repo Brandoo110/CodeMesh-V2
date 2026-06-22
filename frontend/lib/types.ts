@@ -41,6 +41,10 @@ export interface SessionInfo {
   message_count: number;
 }
 
+export interface SessionUpdateRequest {
+  title?: string;
+}
+
 /**
  * GET /api/sessions/{id}/messages 返回的消息（Phase 5）
  *
@@ -56,6 +60,55 @@ export interface StoredMessage {
   cost_rmb: number | null;
   duration_ms: number | null;
   created_at: string;
+}
+
+// ─────────────── Memory Panel ───────────────
+
+export type MemoryType = "user" | "feedback" | "project" | "reference";
+
+export interface LongTermFactInfo {
+  key: string;
+  value: unknown;
+}
+
+export interface LongTermFactCreateRequest {
+  key: string;
+  value: unknown;
+}
+
+export interface DreamStatusInfo {
+  can_dream: boolean;
+  reason: string;
+  memory_entries: number;
+  lock_present: boolean;
+  last_dream_at: string | null;
+}
+
+export interface MemorySummary {
+  facts_count: number;
+  auto_memory_count: number;
+  journal_count: number;
+  memory_db_path: string;
+  auto_memory_dir: string;
+  journal_dir: string;
+  dream: DreamStatusInfo;
+}
+
+export interface AutoMemoryInfo {
+  name: string;
+  description: string;
+  type: MemoryType | string;
+  path: string;
+  updated_at: string;
+  preview: string;
+  indexed: boolean;
+}
+
+export interface JournalInfo {
+  name: string;
+  path: string;
+  created_at: string;
+  preview: string;
 }
 
 // ─────────────── 前端内部 ───────────────

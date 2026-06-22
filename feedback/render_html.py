@@ -14,7 +14,7 @@ CodeMesh 的所有产物——stats、planner 输出、edit diff、架构图—�
   - 文件落盘 + 滚动清理
 
 【为什么手写 SVG 而不是 matplotlib / plotly】
-1. 零 PyPI 依赖：面试项目少一行 requirements.txt 就少一个解释成本
+1. 零 PyPI 依赖：prototype少一行 requirements.txt 就少一个解释成本
 2. 单文件自包含：HTML 工件能直接发简历 / 公众号，不需要 server / runtime
 3. 数据量小（几十条 calls）：matplotlib 杀鸡用牛刀，plotly 启动 ~MB JS
 4. 可控样式：暗色主题、emerald 色一致
@@ -23,7 +23,7 @@ CodeMesh 的所有产物——stats、planner 输出、edit diff、架构图—�
 **不**把 tool returns 改成 HTML——那是给 agent 吃的中间态，HTML 标签会污染
 token 经济。HTML 工件是给**人**看的最终产物（dashboard / report / diagram）。
 
-【面试点】
+【设计要点】
 "Q: 你为什么不用 matplotlib？"
 → 单文件自包含 + 零依赖。SVG 原生支持 CSS 主题，导出简历也不会因缺 PIL 跑不出图。
 "Q: 模板字符串拼 SVG 不会失控？"

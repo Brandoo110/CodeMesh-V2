@@ -15,7 +15,7 @@ FastAPI 用 Pydantic 类型做：
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -63,6 +63,10 @@ class SessionCreateRequest(BaseModel):
     title: Optional[str] = Field(default="新对话", description="标题；不传默认'新对话'")
 
 
+class SessionUpdateRequest(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+
+
 # ─────────────── Workflows (v5) ───────────────
 
 class WorkflowInfo(BaseModel):
@@ -84,6 +88,37 @@ class WorkflowCreateRequest(BaseModel):
 class WorkflowUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = Field(None, max_length=1000)
+
+
+class WorkflowContinueRequest(BaseModel):
+    """POST /api/workflows/{id}/continue：用户基于上次结果追加修改要求。"""
+    user_request: str = Field(..., min_length=1, max_length=8000)
+    run_context: str = Field(default="", max_length=20000)
+    start_step_id: Optional[str] = Field(
+        None,
+        description="可选指定从哪个 step 继续；不传时自动选最后一个可写 step",
+    )
+
+
+class WorkflowPromptDraftRequest(BaseModel):
+    """POST /api/workflows/{id}/prompt-draft：把用户追问转成 prompt 修改草案。"""
+    user_request: str = Field(..., min_length=1, max_length=8000)
+    run_context: str = Field(default="", max_length=20000)
+
+
+class WorkflowPromptChange(BaseModel):
+    step_id: str
+    step_name: str
+    field: Literal["system_prompt", "user_prompt"]
+    old_text: str
+    new_text: str
+    reason: str
+
+
+class WorkflowPromptDraftResponse(BaseModel):
+    summary: str
+    start_step_id: str
+    changes: list[WorkflowPromptChange]
 
 
 class StepInfo(BaseModel):
@@ -134,6 +169,7 @@ class RunInfo(BaseModel):
     completed_at: Optional[datetime] = None
     total_cost_rmb: float = 0.0
     error: Optional[str] = None
+    final_reply: Optional[str] = None
 
 
 class StepResultInfo(BaseModel):
@@ -157,3 +193,50 @@ class StepResultInfo(BaseModel):
 class RunDetail(RunInfo):
     """GET /api/workflows/runs/{id} 返回，含 step_results。"""
     step_results: list[StepResultInfo] = Field(default_factory=list)
+
+
+# ─────────────── Memory Panel ───────────────
+
+class LongTermFactInfo(BaseModel):
+    key: str
+    value: Any
+
+
+class LongTermFactCreateRequest(BaseModel):
+    key: str = Field(..., min_length=1, max_length=200)
+    value: Any
+
+
+class AutoMemoryInfo(BaseModel):
+    name: str
+    description: str = ""
+    type: Literal["user", "feedback", "project", "reference"] | str = "user"
+    path: str
+    updated_at: str
+    preview: str = ""
+    indexed: bool = False
+
+
+class JournalInfo(BaseModel):
+    name: str
+    path: str
+    created_at: str
+    preview: str = ""
+
+
+class DreamStatusInfo(BaseModel):
+    can_dream: bool
+    reason: str
+    memory_entries: int
+    lock_present: bool = False
+    last_dream_at: Optional[str] = None
+
+
+class MemorySummary(BaseModel):
+    facts_count: int
+    auto_memory_count: int
+    journal_count: int
+    memory_db_path: str
+    auto_memory_dir: str
+    journal_dir: str
+    dream: DreamStatusInfo

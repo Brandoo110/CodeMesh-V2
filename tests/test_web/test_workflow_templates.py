@@ -54,6 +54,24 @@ class TestSeedTemplates(unittest.TestCase):
         tpls = [w for w in wfs if w["is_template"]]
         self.assertEqual(len(tpls), 3)
 
+    def test_seed_syncs_existing_template_tool_allowlist(self):
+        run(seed_templates(self.store))
+        wfs = run(self.store.list_workflows())
+        triangle = next(w for w in wfs if "三角审查" in w["name"])
+        steps = run(self.store.get_steps(triangle["id"]))
+        planner = steps[0]
+        run(self.store.update_step(
+            planner["id"],
+            enable_tools=["grep_text", "read_file", "glob_files", "lsp_code"],
+        ))
+
+        n = run(seed_templates(self.store))
+
+        self.assertEqual(n, 0)
+        updated_steps = run(self.store.get_steps(triangle["id"]))
+        self.assertIn("web_search", updated_steps[0]["enable_tools"])
+        self.assertIn("fetch_url", updated_steps[0]["enable_tools"])
+
     def test_templates_have_correct_step_count(self):
         run(seed_templates(self.store))
         wfs = run(self.store.list_workflows())
@@ -81,6 +99,62 @@ class TestSeedTemplates(unittest.TestCase):
         self.assertNotIn("edit_file", reviewer["enable_tools"])
         self.assertNotIn("write_file", reviewer["enable_tools"])
         self.assertIn("read_file", reviewer["enable_tools"])
+        self.assertIn("web_search", reviewer["enable_tools"])
+        self.assertIn("fetch_url", reviewer["enable_tools"])
+
+    def test_planner_steps_can_use_web_search(self):
+        """规划类步骤可查公开网页，但仍不写文件。"""
+        run(seed_templates(self.store))
+        wfs = run(self.store.list_workflows())
+        triangle = next(w for w in wfs if "三角审查" in w["name"])
+        steps = run(self.store.get_steps(triangle["id"]))
+        planner = steps[0]
+
+        self.assertIn("Planner", planner["name"])
+        self.assertIn("web_search", planner["enable_tools"])
+        self.assertIn("fetch_url", planner["enable_tools"])
+        self.assertNotIn("write_file", planner["enable_tools"])
+
+    def test_reviewer_prompt_uses_natural_review_not_rework_contract(self):
+        """Reviewer 做自然语言审查，返工决策交给隐藏 decision loop。"""
+        run(seed_templates(self.store))
+        wfs = run(self.store.list_workflows())
+        triangle = next(w for w in wfs if "三角审查" in w["name"])
+        steps = run(self.store.get_steps(triangle["id"]))
+        reviewer = steps[2]
+
+        self.assertNotIn("REWORK_REQUIRED", reviewer["system_prompt"])
+        self.assertIn("自然语言", reviewer["system_prompt"])
+        self.assertIn("还不能交付", reviewer["system_prompt"])
+
+    def test_triangle_template_uses_requested_default_models(self):
+        """三角审查模板默认：Gemini 规划、DeepSeek 编码、MiniMax 审查。"""
+        run(seed_templates(self.store))
+        wfs = run(self.store.list_workflows())
+        triangle = next(w for w in wfs if "三角审查" in w["name"])
+        steps = run(self.store.get_steps(triangle["id"]))
+
+        self.assertEqual(steps[0]["model"], "gemini")
+        self.assertEqual(steps[1]["model"], "deepseek")
+        self.assertEqual(steps[2]["model"], "minimax")
+
+    def test_seed_syncs_existing_template_models(self):
+        """已存在的内置模板也要同步默认 model，但不影响用户 fork。"""
+        run(seed_templates(self.store))
+        wfs = run(self.store.list_workflows())
+        triangle = next(w for w in wfs if "三角审查" in w["name"])
+        steps = run(self.store.get_steps(triangle["id"]))
+        run(self.store.update_step(steps[0]["id"], model="deepseek"))
+        run(self.store.update_step(steps[1]["id"], model="gemini"))
+        run(self.store.update_step(steps[2]["id"], model="deepseek"))
+
+        n = run(seed_templates(self.store))
+
+        self.assertEqual(n, 0)
+        updated_steps = run(self.store.get_steps(triangle["id"]))
+        self.assertEqual(updated_steps[0]["model"], "gemini")
+        self.assertEqual(updated_steps[1]["model"], "deepseek")
+        self.assertEqual(updated_steps[2]["model"], "minimax")
 
     def test_compare_summary_step_has_no_tools(self):
         """多模型对比模板的综合点评步骤应禁用所有工具。"""

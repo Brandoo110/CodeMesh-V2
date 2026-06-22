@@ -47,7 +47,10 @@ class TestChatStreamEndpoint(unittest.TestCase):
                 pass
 
         class FakeHarness:
-            pass
+            # chat.py 用 try/finally 保存/恢复 preferred_model；fake 也要有这两个
+            preferred_model: "str | None" = None
+            def set_preferred_model(self, m):
+                self.preferred_model = m
         fake = FakeHarness()
         fake.run_stream_full = make_fake_stream(events)
         fake.short_term = FakeShortTerm()  # chat_stream ephemeral 路径会 .clear()

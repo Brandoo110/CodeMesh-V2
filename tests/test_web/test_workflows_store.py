@@ -157,6 +157,18 @@ class TestWorkflowsStore(unittest.TestCase):
         self.assertIsNotNone(loaded["completed_at"])
         self.assertAlmostEqual(loaded["total_cost_rmb"], 0.05)
 
+    def test_update_run_persists_final_reply(self):
+        wf = run(self.store.create_workflow("wf"))
+        r = run(self.store.create_run(wf["id"]))
+        run(self.store.update_run(
+            r["id"],
+            status="done",
+            total_cost=0.05,
+            final_reply="用户可读最终回复",
+        ))
+        loaded = run(self.store.get_run(r["id"]))
+        self.assertEqual(loaded["final_reply"], "用户可读最终回复")
+
     def test_step_result_json_roundtrip(self):
         """tool_calls / file_diffs 两个 JSON 字段必须能完整往返。"""
         wf = run(self.store.create_workflow("wf"))

@@ -109,7 +109,7 @@ class LongTermMemory:
     async def list_all(self) -> dict[str, Any]:
         """
         把整张 kv 表读出来。Harness 在 run() 前会调一次，把内容拼进 system prompt。
-        条数大时（>200）应该改成分页，但目前作为面试演示，直接全量读。
+        条数大时（>200）应该改成分页，但目前作为demo，直接全量读。
         """
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT key, value FROM kv ORDER BY key") as cursor:

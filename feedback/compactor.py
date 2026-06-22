@@ -41,7 +41,7 @@ Compactor：上下文压缩（Harness 反馈层 / 记忆层升级）
 - 减：preCompactDiscoveredTools / SystemCompactBoundaryMessage 元数据（教学项目用不到）
 - 加：教学注释密度（每段都讲 why）
 
-【面试故事】
+【设计背景】
 "我对照 HKUDS/OpenHarness 的 services/compact 实现，做了 200 行 Python 简化版。
 OH 完整翻译了 CC 的 microcompact + autoCompact，但有些只在 Anthropic 服务端可用的
 原语（cache_edits）我没抄，因为 CodeMesh 走 OpenAI 兼容协议跨国内厂商。

@@ -18,7 +18,7 @@ Agent 社区里一个成熟的模式：
 差异：LangGraph 的状态在图节点间流转，每步都能回看全部状态；
 我们的简化版是顺序执行 + 共享 short_term memory，够用不够优雅。
 
-面试高阶讲法：
+进阶设计说明：
 "Q: 为什么不直接上 LangGraph？"
 → 渐进式引入。先用 PydanticAI 把 planner 做 minimum viable，
   跑起来发现"状态回看"不够用、需要"条件分支"了，再引 LangGraph 不迟。

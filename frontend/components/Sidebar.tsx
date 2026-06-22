@@ -9,14 +9,16 @@
  * 删除：hover 项右侧 trash 按钮（防误删用 confirm）。
  */
 
-import { Plus, MessageSquare, Settings, Trash2 } from "lucide-react";
-import { useEffect } from "react";
+import { Plus, MessageSquare, Settings, Trash2, Pencil } from "lucide-react";
+import { useEffect, useState } from "react";
 import {
   listSessions as fetchSessions,
   createSession,
   deleteSession,
+  updateSession,
 } from "@/lib/api";
 import { useStore } from "@/lib/store";
+import type { SessionInfo } from "@/lib/types";
 
 function shortTime(iso: string): string {
   // ISO → 月/日 时:分（去年的显示年份）
@@ -36,6 +38,8 @@ export function Sidebar() {
   const setSessions = useStore((s) => s.setSessions);
   const currentSessionId = useStore((s) => s.currentSessionId);
   const setCurrentSessionId = useStore((s) => s.setCurrentSessionId);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draftTitle, setDraftTitle] = useState("");
 
   // 启动时拉 sessions
   useEffect(() => {
@@ -66,6 +70,39 @@ export function Sidebar() {
     }
   }
 
+  function startRename(e: React.MouseEvent, session: SessionInfo) {
+    e.stopPropagation();
+    setEditingId(session.id);
+    setDraftTitle(session.title);
+  }
+
+  async function commitRename(id: string) {
+    const nextTitle = draftTitle.trim();
+    const current = sessions.find((s) => s.id === id);
+    if (!current) return;
+
+    if (!nextTitle || nextTitle === current.title) {
+      setEditingId(null);
+      setDraftTitle("");
+      return;
+    }
+
+    try {
+      const updated = await updateSession(id, { title: nextTitle });
+      setSessions(sessions.map((s) => (s.id === id ? updated : s)));
+    } catch (err) {
+      console.error("updateSession failed:", err);
+    } finally {
+      setEditingId(null);
+      setDraftTitle("");
+    }
+  }
+
+  function cancelRename() {
+    setEditingId(null);
+    setDraftTitle("");
+  }
+
   if (!sidebarOpen) return null;
 
   return (
@@ -93,6 +130,7 @@ export function Sidebar() {
         ) : (
           sessions.map((s) => {
             const active = s.id === currentSessionId;
+            const editing = s.id === editingId;
             return (
               <div
                 key={s.id}
@@ -102,16 +140,47 @@ export function Sidebar() {
                     ? "bg-surface-hover border-l-2 border-l-accent"
                     : "hover:bg-surface-hover"
                 }`}
-                onClick={() => setCurrentSessionId(s.id)}
+                onClick={() => {
+                  if (!editing) setCurrentSessionId(s.id);
+                }}
               >
                 <MessageSquare size={14} className="text-fg-muted flex-shrink-0" />
                 <div className="flex-1 min-w-0">
-                  <div className="text-sm text-fg truncate">{s.title}</div>
+                  {editing ? (
+                    <input
+                      value={draftTitle}
+                      autoFocus
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => setDraftTitle(e.target.value)}
+                      onBlur={() => void commitRename(s.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void commitRename(s.id);
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          cancelRename();
+                        }
+                      }}
+                      className="w-full rounded border border-accent bg-canvas px-1.5 py-0.5 text-sm text-fg outline-none"
+                    />
+                  ) : (
+                    <div className="text-sm text-fg truncate">{s.title}</div>
+                  )}
                   <div className="text-xs text-fg-subtle truncate">
                     {shortTime(s.updated_at)}
                     {s.message_count > 0 && ` · ${s.message_count} 条`}
                   </div>
                 </div>
+                {!editing && (
+                  <button
+                    className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-canvas text-fg-subtle hover:text-fg transition-opacity"
+                    onClick={(e) => startRename(e, s)}
+                    title="重命名"
+                  >
+                    <Pencil size={12} />
+                  </button>
+                )}
                 <button
                   className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-canvas text-fg-subtle hover:text-error transition-opacity"
                   onClick={(e) => handleDelete(e, s.id)}

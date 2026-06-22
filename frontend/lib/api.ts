@@ -7,14 +7,74 @@
  *   3. 后续 Phase 3 加 SSE wrapper
  */
 
-import type { ChatRequest, ChatResponse, ModelInfo, SessionInfo, StoredMessage } from "./types";
+import type {
+  ChatRequest,
+  ChatResponse,
+  AutoMemoryInfo,
+  DreamStatusInfo,
+  JournalInfo,
+  LongTermFactCreateRequest,
+  LongTermFactInfo,
+  MemorySummary,
+  MemoryType,
+  ModelInfo,
+  SessionInfo,
+  SessionUpdateRequest,
+  StoredMessage,
+} from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
+type ErrorObject = Record<string, unknown>;
+
+function isErrorObject(value: unknown): value is ErrorObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatValidationItem(item: unknown): string {
+  if (isErrorObject(item) && "msg" in item) {
+    const msg = String(item.msg || "Invalid value");
+    const loc = Array.isArray(item.loc)
+      ? item.loc.map(String).join(".")
+      : typeof item.loc === "string"
+        ? item.loc
+        : "";
+    return loc ? `${loc}: ${msg}` : msg;
+  }
+  return formatApiErrorDetail(item);
+}
+
+export function formatApiErrorDetail(detail: unknown): string {
+  if (typeof detail === "string") return detail || "Request failed";
+  if (detail == null) return "Request failed";
+
+  if (Array.isArray(detail)) {
+    const rendered = detail.map(formatValidationItem).filter(Boolean);
+    return rendered.length > 0 ? rendered.join("; ") : "Request failed";
+  }
+
+  if (isErrorObject(detail)) {
+    if ("detail" in detail) return formatApiErrorDetail(detail.detail);
+    if ("message" in detail) return formatApiErrorDetail(detail.message);
+    if ("error" in detail) return formatApiErrorDetail(detail.error);
+
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return "Request failed";
+    }
+  }
+
+  return String(detail);
+}
+
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
-    super(message);
+  status: number;
+
+  constructor(status: number, detail: unknown) {
+    super(formatApiErrorDetail(detail));
     this.name = "ApiError";
+    this.status = status;
   }
 }
 
@@ -31,10 +91,10 @@ async function request<T>(
   });
 
   if (!res.ok) {
-    let detail = res.statusText;
+    let detail: unknown = res.statusText;
     try {
       const body = await res.json();
-      detail = body.detail || JSON.stringify(body);
+      detail = body.detail ?? body;
     } catch {
       // body 不是 JSON，用 statusText 兜底
     }
@@ -72,6 +132,56 @@ export async function deleteSession(id: string): Promise<void> {
   await request(`/api/sessions/${id}`, { method: "DELETE" });
 }
 
+export async function updateSession(
+  id: string,
+  req: SessionUpdateRequest,
+): Promise<SessionInfo> {
+  return request<SessionInfo>(`/api/sessions/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(req),
+  });
+}
+
 export async function getSessionMessages(id: string): Promise<StoredMessage[]> {
   return request<StoredMessage[]>(`/api/sessions/${id}/messages`);
+}
+
+export async function getMemorySummary(): Promise<MemorySummary> {
+  return request<MemorySummary>("/api/memory/summary");
+}
+
+export async function listMemoryFacts(): Promise<LongTermFactInfo[]> {
+  return request<LongTermFactInfo[]>("/api/memory/facts");
+}
+
+export async function createMemoryFact(
+  req: LongTermFactCreateRequest,
+): Promise<LongTermFactInfo> {
+  return request<LongTermFactInfo>("/api/memory/facts", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
+export async function deleteMemoryFact(key: string): Promise<void> {
+  await request(`/api/memory/facts/${encodeURIComponent(key)}`, { method: "DELETE" });
+}
+
+export async function listAutoMemories(type?: MemoryType | "all"): Promise<AutoMemoryInfo[]> {
+  const q = type && type !== "all" ? `?type=${encodeURIComponent(type)}` : "";
+  return request<AutoMemoryInfo[]>(`/api/memory/auto${q}`);
+}
+
+export async function listJournals(): Promise<JournalInfo[]> {
+  return request<JournalInfo[]>("/api/memory/journal");
+}
+
+export async function getDreamStatus(): Promise<DreamStatusInfo> {
+  return request<DreamStatusInfo>("/api/memory/dream/status");
+}
+
+export async function rebuildMemoryIndex(): Promise<{ path: string }> {
+  return request<{ path: string }>("/api/memory/dream/rebuild-index", {
+    method: "POST",
+  });
 }

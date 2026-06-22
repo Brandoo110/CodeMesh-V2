@@ -4,7 +4,7 @@ Stats HTML 报告渲染（Harness 反馈层）
 
 【这模块解决什么】
 `codemesh stats` 现在只能在终端里 print Rich Table，但"国内多模型成本对比"是
-项目核心卖点之一——给面试官 / 公众号文章看一张终端表格远远不够。
+项目核心卖点之一——给用户和维护者看一张终端表格远远不够。
 
 这模块基于 `feedback/render_html.py` 把 calls.jsonl 渲染成单文件 dashboard：
   - KPI 行：调用数 / 总 token / 总成本 / 窗口大小
@@ -13,7 +13,7 @@ Stats HTML 报告渲染（Harness 反馈层）
   - sparkline：每日成本趋势
   - 详细表格：每个模型一行
 
-【面试点】
+【设计要点】
 "Q: 为什么不直接读 jsonl 写报告？"
 → 数据源（call_log.jsonl）和聚合（aggregate）已经有了，这层只是"把同样数据
   换个展示形态"。零新数据流，纯渲染。

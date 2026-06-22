@@ -17,7 +17,7 @@
 
 模型看到后就不用瞎猜文件在哪。
 
-【面试点】
+【设计要点】
 "Q: Hybrid search 做不做？"
 → 纯向量检索对精确匹配（函数名、错误信息）不如关键词 BM25。
   生产做法是 vector + BM25 融合，Reciprocal Rank Fusion 加权打分。

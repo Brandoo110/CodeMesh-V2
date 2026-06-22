@@ -59,7 +59,7 @@ class TestModelsEndpoint(unittest.TestCase):
             "GEMINI_API_KEY":    "a" * 30,
             "MINIMAX_API_KEY":   "a" * 30,
         }
-        with patch.dict(os.environ, fake_env, clear=False):
+        with patch.dict(os.environ, fake_env, clear=True):
             r = self.client.get("/api/models")
             ids = {m["id"] for m in r.json()}
             self.assertEqual(ids, {"deepseek", "qwen", "doubao", "gemini", "minimax"})
@@ -71,9 +71,10 @@ class TestModelsEndpoint(unittest.TestCase):
             "DASHSCOPE_API_KEY": "",
             "VOLC_API_KEY":      "",
             "GEMINI_API_KEY":    "",
+            "GOOGLE_API_KEY":     "",
             "MINIMAX_API_KEY":   "",
         }
-        with patch.dict(os.environ, empty_env, clear=False):
+        with patch.dict(os.environ, empty_env, clear=True):
             r = self.client.get("/api/models")
             self.assertEqual(r.status_code, 200)
             self.assertEqual(r.json(), [])

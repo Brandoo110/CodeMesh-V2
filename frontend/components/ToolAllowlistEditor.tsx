@@ -3,7 +3,7 @@
 /**
  * 工具白名单编辑器（v5 Phase 6.3）。
  *
- * 8 个工具 × 4 个预设 = 真正的差异化护城河 #1：
+ * 13 个工具 × 4 个预设 = 真正的差异化护城河 #1：
  * 让每个 step 自己决定能用哪些工具（Reviewer 只读 / Coder 写 / Full 全开 / 禁用）。
  *
  * 后端协议：
@@ -22,19 +22,27 @@ interface Props {
 
 // 对齐 web/execution/tools.py 实际注册的工具名
 const TOOLS = [
+  "bash_exec",
   "grep_text",
   "read_file",
   "edit_file",
   "write_file",
   "glob_files",
-  "run_bash",
   "lsp_code",
-  "delete_file",
+  "web_search",
+  "fetch_url",
+  "invoke_skill",
+  "remember_fact",
+  "recall_facts",
+  "forget_fact",
 ];
 
 const PRESETS: Record<string, string[]> = {
-  Reviewer: ["grep_text", "read_file", "glob_files", "lsp_code"],
-  Coder: ["grep_text", "read_file", "edit_file", "write_file", "glob_files", "lsp_code"],
+  Reviewer: ["grep_text", "read_file", "glob_files", "lsp_code", "web_search", "fetch_url"],
+  Coder: [
+    "grep_text", "read_file", "edit_file", "write_file", "glob_files",
+    "lsp_code", "web_search", "fetch_url",
+  ],
   Full: TOOLS,
 };
 
@@ -95,9 +103,9 @@ export function ToolAllowlistEditor({ value, onChange, disabled }: Props) {
             className="px-2 py-0.5 text-xs rounded border border-border bg-canvas hover:bg-canvas/70 text-fg-muted hover:text-fg transition-colors disabled:opacity-50"
             title={
               name === "Reviewer"
-                ? "只读：grep / read / glob / lsp"
+                ? "只读 + 联网：grep / read / glob / lsp / web"
                 : name === "Coder"
-                  ? "写入：reviewer + edit / write"
+                  ? "写入 + 联网：reviewer + edit / write"
                   : "全部工具"
             }
           >

@@ -18,6 +18,10 @@ Claude Code 标准三件套（v2 加）：
   - grep_text  : 在文件里搜文本（带可选 file_pattern 过滤）
   - edit_file  : 精确替换文件中的一段字符串（增量编辑，比 write_file 安全）
 
+联网工具（v5 低优先级补强）：
+  - web_search : 查公开网页搜索结果
+  - fetch_url  : 抓取公开 http/https 页面正文（阻止 localhost / 内网地址）
+
 【工具设计原则】
   1. 输入参数简单（字符串为主），模型才能稳定生成
   2. 返回字符串，便于拼回 messages
@@ -39,8 +43,16 @@ v2 改成 Registry 模式：
 
 import asyncio
 import fnmatch
+import html
+import ipaddress
 import re
 import shutil
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional, Union
 
@@ -601,6 +613,253 @@ async def grep_text(
         filt = f" with file_pattern={file_pattern!r}" if file_pattern else ""
         return f"(no matches for {pattern!r}{filt})"
     return "\n".join(hits)
+
+
+# ───────────────── Web tools ─────────────────
+
+
+_FETCH_USER_AGENT = (
+    "CodeMesh/0.1 (+https://github.com/Brandoo110/CodeMesh; local agent tool)"
+)
+_MAX_FETCH_BYTES = 1_000_000
+_BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain"}
+
+
+class _VisibleTextParser(HTMLParser):
+    """把 HTML 粗略转成可读文本；够 agent 消化网页正文，不追求浏览器级渲染。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self._in_title = False
+        self._skip_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._skip_depth += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag in {"p", "br", "div", "section", "article", "li", "tr", "h1", "h2", "h3"}:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "svg"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+        elif tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        text = data.strip()
+        if not text:
+            return
+        if self._in_title:
+            self.title += text + " "
+        elif self._skip_depth == 0:
+            self._parts.append(text)
+
+    def text(self) -> str:
+        return _normalize_web_text(" ".join(self._parts))
+
+
+def _normalize_web_text(text: str) -> str:
+    unescaped = html.unescape(text)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in unescaped.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _is_blocked_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return True
+    return any((
+        ip.is_loopback,
+        ip.is_private,
+        ip.is_link_local,
+        ip.is_multicast,
+        ip.is_reserved,
+        ip.is_unspecified,
+    ))
+
+
+def _validate_public_http_url(url: str) -> tuple[bool, str]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False, "only http/https URLs are allowed"
+    if parsed.username or parsed.password:
+        return False, "URLs with credentials are not allowed"
+    host = parsed.hostname
+    if not host:
+        return False, "URL host is required"
+    host_l = host.lower().rstrip(".")
+    if host_l in _BLOCKED_HOSTNAMES or host_l.endswith(".localhost"):
+        return False, f"blocked host: {host}"
+
+    try:
+        ipaddress.ip_address(host_l)
+        if _is_blocked_ip(host_l):
+            return False, f"blocked host: {host}"
+        return True, ""
+    except ValueError:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except OSError as e:
+        return False, f"could not resolve host: {e}"
+
+    for info in infos:
+        addr = info[4][0]
+        if _is_blocked_ip(addr):
+            return False, f"blocked host: {host} resolved to private address"
+    return True, ""
+
+
+def _download_url(url: str, timeout_seconds: int) -> tuple[str, str, str]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _FETCH_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,application/json;q=0.8,*/*;q=0.1",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        final_url = resp.geturl()
+        content_type = resp.headers.get("content-type", "")
+        raw = resp.read(_MAX_FETCH_BYTES + 1)
+    if len(raw) > _MAX_FETCH_BYTES:
+        raw = raw[:_MAX_FETCH_BYTES]
+    charset = "utf-8"
+    match = re.search(r"charset=([\w.-]+)", content_type, re.IGNORECASE)
+    if match:
+        charset = match.group(1)
+    return final_url, content_type, raw.decode(charset, errors="replace")
+
+
+@registry.register(
+    name="fetch_url",
+    description=(
+        "Fetch the readable text from a public http/https URL. Blocks localhost, "
+        "private network addresses, link-local addresses, and file:// URLs."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Public http/https URL to fetch"},
+            "max_chars": {
+                "type": "integer",
+                "description": "Maximum characters to return. Default 6000.",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Network timeout in seconds. Default 10.",
+            },
+        },
+        "required": ["url"],
+    },
+)
+async def fetch_url(
+    url: str,
+    max_chars: int = 6000,
+    timeout_seconds: int = 10,
+) -> str:
+    """抓取公开网页正文；错误返回字符串，避免 agent loop 崩掉。"""
+    ok, reason = _validate_public_http_url(url)
+    if not ok:
+        return f"[ERROR] {reason}"
+
+    max_chars = max(500, min(int(max_chars or 6000), 20_000))
+    timeout_seconds = max(1, min(int(timeout_seconds or 10), 30))
+    try:
+        final_url, content_type, body = await asyncio.to_thread(
+            _download_url, url, timeout_seconds
+        )
+    except urllib.error.HTTPError as e:
+        return f"[ERROR] HTTP {e.code}: {e.reason}"
+    except Exception as e:
+        return f"[ERROR] {type(e).__name__}: {e}"
+
+    lowered_type = content_type.lower()
+    if "html" in lowered_type:
+        parser = _VisibleTextParser()
+        parser.feed(body)
+        title = _normalize_web_text(parser.title).strip()
+        text = parser.text()
+    elif any(t in lowered_type for t in ("text/", "json", "xml")) or not content_type:
+        title = ""
+        text = _normalize_web_text(body)
+    else:
+        return f"[ERROR] unsupported content-type: {content_type}"
+
+    if not text:
+        return f"(no readable text fetched from {final_url})"
+    text = text[:max_chars]
+    parts = [f"URL: {final_url}"]
+    if title:
+        parts.append(f"Title: {title}")
+    parts.append("Content:")
+    parts.append(text)
+    return "\n".join(parts)
+
+
+@registry.register(
+    name="web_search",
+    description=(
+        "Search the public web for recent or external information. Returns "
+        "short result snippets with URLs. Use fetch_url on a returned URL when "
+        "you need the page content."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query"},
+            "max_results": {
+                "type": "integer",
+                "description": "Number of results to return, 1-10. Default 5.",
+            },
+        },
+        "required": ["query"],
+    },
+)
+async def web_search(query: str, max_results: int = 5) -> str:
+    """公开网页搜索；无 API key 版本，使用 Bing RSS 结果。"""
+    q = query.strip()
+    if not q:
+        return "[ERROR] query is required"
+    max_results = max(1, min(int(max_results or 5), 10))
+    search_url = "https://www.bing.com/search?format=rss&" + urllib.parse.urlencode({"q": q})
+
+    try:
+        _, _, xml_body = await asyncio.to_thread(_download_url, search_url, 10)
+    except Exception as e:
+        return f"[ERROR] web search failed: {type(e).__name__}: {e}"
+
+    try:
+        root = ET.fromstring(xml_body)
+    except ET.ParseError as e:
+        return f"[ERROR] web search returned invalid XML: {e}"
+
+    results: list[dict[str, str]] = []
+    for item in root.findall("./channel/item"):
+        title = _normalize_web_text(item.findtext("title") or "")
+        url = (item.findtext("link") or "").strip()
+        snippet = _normalize_web_text(item.findtext("description") or "")
+        if title and url:
+            results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= max_results:
+            break
+
+    if not results:
+        return f"(no web results for {q!r})"
+
+    lines = [f"Web search results for: {q}"]
+    for idx, item in enumerate(results[:max_results], start=1):
+        lines.append(f"{idx}. {item['title']}")
+        lines.append(f"   URL: {item['url']}")
+        if item.get("snippet"):
+            lines.append(f"   Snippet: {item['snippet']}")
+    return "\n".join(lines)
 
 
 @registry.register(
