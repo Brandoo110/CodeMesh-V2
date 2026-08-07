@@ -139,16 +139,9 @@ async def run_agent_loop(
         # 注意：有 tool_calls 时 content 可能是 None，需要防御
         assistant_entry: dict = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
-            # OpenAI 协议要求把 tool_calls 原样带上，下一轮工具结果才能对上号
+            # 原样保留 provider 扩展字段，例如 Gemini 的 thought_signature。
             assistant_entry["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
+                tc.model_dump(exclude_none=True)
                 for tc in msg.tool_calls
             ]
         convo.append(assistant_entry)

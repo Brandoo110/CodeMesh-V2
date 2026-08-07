@@ -18,6 +18,8 @@ Agent Loop 单元测试（不联网）
 import asyncio
 from types import SimpleNamespace
 
+from openai.types.chat import ChatCompletionMessageFunctionToolCall
+
 from execution.loop import run_agent_loop
 
 
@@ -40,12 +42,16 @@ class _FakeResponse:
         self.choices = [_FakeChoice(_FakeMessage(content, tool_calls))]
 
 
-def _tool_call(tc_id: str, name: str, arguments: str):
-    """构造一个长得像 OpenAI tool_call 的 SimpleNamespace。"""
-    return SimpleNamespace(
-        id=tc_id,
-        function=SimpleNamespace(name=name, arguments=arguments),
-    )
+def _tool_call(tc_id: str, name: str, arguments: str, extra_content=None):
+    """构造一个长得像 OpenAI tool_call 的测试对象。"""
+    payload = {
+        "id": tc_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+    if extra_content is not None:
+        payload["extra_content"] = extra_content
+    return ChatCompletionMessageFunctionToolCall.model_validate(payload)
 
 
 class _FakeCompletions:
@@ -144,6 +150,38 @@ def test_loop_executes_one_tool_then_finishes():
         assert any(m.get("role") == "tool" for m in msgs2)
     finally:
         os.unlink(path)
+
+
+def test_loop_preserves_provider_tool_call_metadata():
+    """Gemini 的 thought_signature 必须随 tool_call 原样回填下一轮。"""
+    signature = {"google": {"thought_signature": "signed-reasoning-state"}}
+    responses = [
+        _FakeResponse(
+            content=None,
+            tool_calls=[
+                _tool_call(
+                    "call_1",
+                    "glob_files",
+                    '{"pattern": "demo/*"}',
+                    extra_content=signature,
+                )
+            ],
+        ),
+        _FakeResponse(content="done"),
+    ]
+    adapter = _FakeAdapter(responses)
+
+    out = _run(run_agent_loop(
+        adapter=adapter,
+        messages=[{"role": "user", "content": "inspect demo"}],
+    ))
+
+    assert out == "done"
+    assistant_msg = next(
+        msg for msg in adapter.calls[1]["messages"]
+        if msg.get("role") == "assistant"
+    )
+    assert assistant_msg["tool_calls"][0]["extra_content"] == signature
 
 
 def test_loop_handles_multiple_tool_calls_in_one_turn():
