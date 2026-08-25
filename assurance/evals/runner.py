@@ -22,6 +22,19 @@ ARM_ORDER: Final[tuple[str, ...]] = (
     "single_strong_reviewer",
     "specialized_council",
 )
+REVIEWER_ROLE_ORDER: Final[tuple[str, ...]] = (
+    "rules",
+    "general",
+    "intent",
+    "architecture",
+    "operability",
+)
+_REVIEWER_ROLES: Final[frozenset[str]] = frozenset(REVIEWER_ROLE_ORDER)
+_ARM_ROLE_SETS: Final[dict[str, tuple[str, ...]]] = {
+    "rules_only": ("rules",),
+    "single_strong_reviewer": ("general",),
+    "specialized_council": ("intent", "architecture", "operability"),
+}
 _STATUSES: Final[frozenset[str]] = frozenset(
     {"success", "failure", "timeout", "blocked", "schema_invalid"}
 )
@@ -65,6 +78,13 @@ def _validate_unique_strings(value: object, label: str) -> None:
         raise ValueError(f"{label} must be unique")
 
 
+def _validate_strings(value: object, label: str) -> None:
+    if type(value) is not tuple:
+        raise ValueError(f"{label} must be a tuple")
+    for item in value:
+        _require_text(item, label)
+
+
 def _validate_optional_text(value: object, label: str) -> None:
     if value is not None:
         _require_text(value, label)
@@ -94,6 +114,7 @@ class EvalFinding:
     blocking: bool
     evidence_refs: tuple[str, ...]
     predicted_issue_ids: tuple[str, ...]
+    reviewer_role: str = "general"
 
     def __post_init__(self) -> None:
         _require_text(self.finding_id, "finding_id")
@@ -102,6 +123,8 @@ class EvalFinding:
             raise ValueError("severity is invalid")
         if type(self.blocking) is not bool:
             raise ValueError("blocking must be bool")
+        if self.reviewer_role not in _REVIEWER_ROLES:
+            raise ValueError("reviewer_role is invalid")
         _validate_unique_strings(self.evidence_refs, "evidence_refs")
         _validate_unique_strings(self.predicted_issue_ids, "predicted_issue_ids")
 
@@ -122,6 +145,8 @@ class ArmRunResult:
     cost_usd: int | float | None = None
     latency_seconds: int | float | None = None
     error_code: str | None = None
+    executed_roles: tuple[str, ...] = ()
+    model_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.case_id, "case_id")
@@ -142,6 +167,29 @@ class ArmRunResult:
         _validate_optional_number(self.cost_usd, "cost_usd")
         _validate_optional_number(self.latency_seconds, "latency_seconds")
         _validate_optional_text(self.error_code, "error_code")
+        _validate_unique_strings(self.executed_roles, "executed_roles")
+        if any(role not in _REVIEWER_ROLES for role in self.executed_roles):
+            raise ValueError("executed_roles contains an invalid role")
+        if tuple(
+            sorted(self.executed_roles, key=REVIEWER_ROLE_ORDER.index)
+        ) != self.executed_roles:
+            raise ValueError("executed_roles must be canonical")
+        _validate_strings(self.model_refs, "model_refs")
+        if len(self.model_refs) != len(self.executed_roles):
+            raise ValueError("model_refs must align with executed_roles")
+        expected_roles = _ARM_ROLE_SETS[self.arm]
+        if self.status == "success" and self.executed_roles != expected_roles:
+            raise ValueError("success result has an invalid executed_roles set")
+        if self.status != "success" and not set(self.executed_roles) <= set(
+            expected_roles
+        ):
+            raise ValueError("non-success result has an invalid executed_roles set")
+        if any(
+            type(finding) is not EvalFinding
+            or finding.reviewer_role not in self.executed_roles
+            for finding in self.findings
+        ):
+            raise ValueError("finding reviewer_role is not executed by this arm")
         if self.status == "success" and self.error_code is not None:
             raise ValueError("success result must not contain error_code")
         if self.status != "success" and self.error_code is None:
@@ -296,6 +344,7 @@ class ComparisonRunner:
                         blocking=finding.blocking,
                         evidence_refs=finding.evidence_refs,
                         predicted_issue_ids=finding.predicted_issue_ids,
+                        reviewer_role=finding.reviewer_role,
                     )
                 )
             if len({finding.finding_id for finding in findings}) != len(findings):
@@ -313,6 +362,8 @@ class ComparisonRunner:
                 cost_usd=result.cost_usd,
                 latency_seconds=result.latency_seconds,
                 error_code=result.error_code,
+                executed_roles=result.executed_roles,
+                model_refs=result.model_refs,
             )
             if rebuilt.case_id != case.case_id or rebuilt.arm != arm:
                 return _schema_invalid(case.case_id, arm)

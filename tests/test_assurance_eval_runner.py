@@ -34,11 +34,18 @@ HIDDEN_ISSUE_LABELS = (
 
 
 def _success(payload, arm):
+    roles = {
+        "rules_only": ("rules",),
+        "single_strong_reviewer": ("general",),
+        "specialized_council": ("intent", "architecture", "operability"),
+    }[arm]
     return ArmRunResult(
         case_id=payload["case_id"],
         arm=arm,
         status="success",
         predicted_outcome="PASS",
+        executed_roles=roles,
+        model_refs=tuple(f"model-{role}" for role in roles),
     )
 
 
@@ -139,7 +146,11 @@ class AssuranceEvalRunnerTests(unittest.TestCase):
     def test_bad_arm_results_and_evidence_fail_closed_per_arm(self):
         def wrong_case(payload):
             return ArmRunResult(
-                case_id="ca_v0_999", arm="rules_only", status="success"
+                case_id="ca_v0_999",
+                arm="rules_only",
+                status="success",
+                executed_roles=("rules",),
+                model_refs=("model-rules",),
             )
 
         def bad_evidence(payload):
@@ -156,6 +167,8 @@ class AssuranceEvalRunnerTests(unittest.TestCase):
                 arm="single_strong_reviewer",
                 status="success",
                 findings=(finding,),
+                executed_roles=("general",),
+                model_refs=("model-general",),
             )
 
         result = ComparisonRunner(
@@ -195,6 +208,7 @@ class AssuranceEvalRunnerTests(unittest.TestCase):
                 blocking=False,
                 evidence_refs=(payload["evidence_refs"][0],),
                 predicted_issue_ids=("issue_x",),
+                reviewer_role="architecture",
             )
             object.__setattr__(finding, "severity", "evil")
             result = ArmRunResult(
@@ -202,6 +216,8 @@ class AssuranceEvalRunnerTests(unittest.TestCase):
                 arm="specialized_council",
                 status="success",
                 findings=(finding,),
+                executed_roles=("intent", "architecture", "operability"),
+                model_refs=("model-intent", "model-architecture", "model-operability"),
             )
             object.__setattr__(result, "arm", "evil-arm")
             return result
@@ -245,6 +261,7 @@ class AssuranceEvalRunnerTests(unittest.TestCase):
             blocking=False,
             evidence_refs=("ev1",),
             predicted_issue_ids=("issue1",),
+            reviewer_role="rules",
         )
         with self.assertRaises(FrozenInstanceError):
             finding.claim = "changed"
@@ -279,13 +296,53 @@ class AssuranceEvalRunnerTests(unittest.TestCase):
             output_tokens=2,
             cost_usd=0.1,
             latency_seconds=0.2,
+            executed_roles=("rules",),
+            model_refs=("model-rules",),
         )
         self.assertEqual(valid.findings, (finding,))
+
+    def test_model_refs_may_repeat_when_aligned_with_executed_roles(self):
+        role_sets = {
+            "rules_only": ("rules",),
+            "single_strong_reviewer": ("general",),
+            "specialized_council": ("intent", "architecture", "operability"),
+        }
+        shared_model = "gpt-5.6-luna"
+
+        for arm, roles in role_sets.items():
+            result = ArmRunResult(
+                "ca_v0_001",
+                arm,
+                "success",
+                predicted_outcome="PASS",
+                executed_roles=roles,
+                model_refs=(shared_model,) * len(roles),
+            )
+            self.assertEqual(result.model_refs, (shared_model,) * len(roles))
 
     def test_comparison_models_enforce_digest_and_arm_order(self):
         digest = "sha256:" + ("a" * 64)
         arms = tuple(
-            ArmRunResult("ca_v0_001", arm, "success") for arm in ARM_ORDER
+            ArmRunResult(
+                "ca_v0_001",
+                arm,
+                "success",
+                executed_roles={
+                    "rules_only": ("rules",),
+                    "single_strong_reviewer": ("general",),
+                    "specialized_council": ("intent", "architecture", "operability"),
+                }[arm],
+                model_refs={
+                    "rules_only": ("model-rules",),
+                    "single_strong_reviewer": ("model-general",),
+                    "specialized_council": (
+                        "model-intent",
+                        "model-architecture",
+                        "model-operability",
+                    ),
+                }[arm],
+            )
+            for arm in ARM_ORDER
         )
         comparison = CaseComparison("ca_v0_001", digest, arms)
         self.assertEqual(comparison.arms, arms)

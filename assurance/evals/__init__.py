@@ -16,6 +16,14 @@ from .runner import (
     ComparisonRun,
     ComparisonRunner,
     EvalFinding,
+    REVIEWER_ROLE_ORDER,
+)
+from .adapters import (
+    COUNCIL_ROLES,
+    InvocationFact,
+    ModelArmAdapter,
+    ROLE_ORDER,
+    derive_finding_id,
 )
 
 __all__ = [
@@ -32,4 +40,10 @@ __all__ = [
     "ComparisonRun",
     "ComparisonRunner",
     "EvalFinding",
+    "REVIEWER_ROLE_ORDER",
+    "COUNCIL_ROLES",
+    "InvocationFact",
+    "ModelArmAdapter",
+    "ROLE_ORDER",
+    "derive_finding_id",
 ]
