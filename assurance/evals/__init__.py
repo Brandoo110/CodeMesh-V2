@@ -26,6 +26,13 @@ from .adapters import (
     derive_finding_id,
 )
 from .rules_adapter import RULE_VERSION, RulesOnlyAdapter, run_rules_only
+from .result_artifact import (
+    MODEL_REF,
+    PROVIDER,
+    PUBLIC_ISSUE_TAXONOMY,
+    build_result_artifact,
+    replay_result_artifact,
+)
 
 __all__ = [
     "DATASET_ID",
@@ -50,4 +57,9 @@ __all__ = [
     "RULE_VERSION",
     "RulesOnlyAdapter",
     "run_rules_only",
+    "MODEL_REF",
+    "PROVIDER",
+    "PUBLIC_ISSUE_TAXONOMY",
+    "build_result_artifact",
+    "replay_result_artifact",
 ]
