@@ -1,219 +1,139 @@
-# CodeMesh
+# CodeMesh V2
 
-CodeMesh is a local-first coding agent runtime for OpenAI-compatible models. It combines Claude Code-style code tools with Dify-style linear workflows, so coding tasks can be routed, executed, reviewed, observed, and resumed from a web interface or CLI.
+> AI writes the change. CodeMesh makes it handover-ready.
 
-The project is designed around a small harness architecture: model adapters, tool execution, memory, observability, permissions, and workflow orchestration are separate layers instead of one large prompt script.
+CodeMesh V2 is a local-first **Change Handover & Acceptance Workbench**. It does not try to replace Codex, Claude Code, or another coding agent. It sits after code generation and turns a change into an auditable acceptance case: what changed, what evidence supports it, which risks remain, who approved it, and whether the approval still applies to the current code.
 
-## Highlights
+The product focuses on questions that ordinary bug checks do not answer:
 
-- Multi-model routing across DeepSeek, Qwen, Doubao, Gemini, and MiniMax.
-- Claude Code-style tools: shell execution, file read/write/edit, glob, grep, AST/LSP navigation, lightweight web search, URL fetch, skills, and memory tools.
-- FastAPI + Next.js web UI for chat, model selection, sessions, stats, workflows, run history, diffs, and memory inspection.
-- Linear coding workflows with per-step model selection, system prompts, and tool allowlists.
-- Review decision loop for Planner/Coder/Reviewer style workflows, including one bounded rework pass.
-- Local memory: SQLite facts, auto-extracted markdown memory cards, session journals, and background consolidation.
-- Cost and usage tracking in RMB through adapter usage metadata and local call logs.
-- Safety controls through command sandboxing, permissions, hooks, and per-step tool restrictions.
-- Test suite built with deterministic fakes and no real API calls for normal unit tests.
+- Does the implementation still match the original intent and acceptance boundary?
+- Did the change introduce architectural debt, a second source of truth, or an undocumented public contract?
+- Is the change operable in production, with rollback, telemetry, ownership, and bounded failure behavior?
+- Can every review conclusion be traced to immutable evidence?
+- Has the code changed since the evidence or human approval was produced?
 
-## Architecture
+## Product model
 
-CodeMesh is organized as four runtime layers plus the web UI:
+Every review revolves around two objects:
 
-```text
-User task
-  |
-  v
-harness.py
-  |
-  +-- orchestration/  route, plan, hooks, permissions, plugins, adapters
-  +-- execution/      agent loop, tool registry, sandbox, AST/LSP tools
-  +-- memory/         short-term, working state, SQLite long-term facts, auto memory
-  +-- feedback/       cost, logs, validation, compaction, journal, dreaming, reports
-  +-- web/            FastAPI routes, sessions, workflows, memory API
-  +-- frontend/       Next.js UI for chat, stats, workflows, diffs, memory
-```
+- **Change Acceptance Case** — the immutable subject digest, evidence, policy decisions, reviewer findings, human decisions, and event timeline for one change.
+- **Change Passport** — a compact handover result that says whether the exact subject is ready, blocked, or stale, with links to the supporting evidence and decision receipts.
 
-### Request Flow
+CodeMesh treats model output as review evidence, not authority. Deterministic policy gates own hard constraints; specialist agents inspect different risk dimensions; a human owns the final acceptance decision.
 
-1. `Harness.run()` receives a user task.
-2. The router returns a structured model and complexity decision.
-3. Memory, skills, and optional retrieval context are injected into the system prompt.
-4. Simple tasks run as a single streamed model call.
-5. Complex tasks enter the agent loop, where the model can call tools repeatedly.
-6. Tool results are returned to the model as normal messages.
-7. Cost, usage, traces, local logs, journals, and memory extraction run after the task.
+## Current capabilities
 
-### Workflow Runtime
+The P1-P5 implementation includes:
 
-The workflow engine is implemented in `web/workflow_orchestrator.py`.
+- Immutable change subjects, normalized digests, and stale-approval invalidation.
+- Local evidence collection for Git snapshots, task documents, commands, generic artifacts, and author-agent receipts.
+- Artifact integrity checks and an evidence manifest bound to the subject digest.
+- Deterministic risk classification and policy gates.
+- Three comparison paths: rules-only, one strong reviewer, and a specialist review council.
+- Specialist roles for intent, architecture, and operability review.
+- Per-agent model routing with tier aliases, priorities, fallback budgets, and execution receipts.
+- An adjudicator that can consolidate existing findings but cannot invent new evidence or independently produce `PASS`.
+- A local SQLite-backed API and web interface for case queues, evidence, timelines, human decisions, council reports, and Change Passports.
 
-Each step gets an isolated `Harness` instance with:
-
-- a preferred model,
-- a step-specific system prompt,
-- a tool allowlist,
-- inherited output from the previous step,
-- file diff snapshots before and after execution.
-
-This makes the common coding workflow explicit:
+## Review flow
 
 ```text
-Planner -> Coder -> Reviewer -> optional rework -> final reply
+Change + task policy
+        |
+        v
+Immutable subject digest
+        |
+        v
+Evidence collection + manifest
+        |
+        +--> deterministic risk and policy gates
+        |
+        +--> rules-only baseline
+        +--> single strong reviewer
+        +--> specialist review council
+        |
+        v
+Adjudication of existing findings
+        |
+        v
+Human decision
+        |
+        v
+Change Passport
 ```
 
-## Repository Layout
+Any subject change invalidates evidence and decisions that were bound to the old digest.
+
+## Repository layout
 
 ```text
 .
-├── cli.py                         # Typer CLI entrypoint
-├── harness.py                     # Runtime assembly and task execution
-├── pyproject.toml                 # Python package metadata
-├── execution/                     # Tool loop, tool registry, sandbox, AST/LSP helpers
-├── feedback/                      # Cost, logs, validation, compaction, memory consolidation
-├── memory/                        # Short-term, working, long-term, and auto memory
-├── orchestration/                 # Router, planner, hooks, plugins, permissions, adapters
-├── rag/                           # Optional non-code RAG module
-├── web/                           # FastAPI backend
-├── frontend/                      # Next.js frontend
-└── tests/                         # Unit and web route tests
+├── assurance/   # V2 contracts, collectors, policy, reviewers, routing, reports
+├── web/         # FastAPI application, local store, and assurance routes
+├── frontend/    # Next.js workbench UI
+├── tests/       # Deterministic assurance-domain tests
+├── orchestration/, execution/, memory/, feedback/
+│                # V1 runtime retained as reusable infrastructure
+└── pyproject.toml
 ```
 
-## Requirements
+V2 keeps selected local runtime infrastructure from [CodeMesh V1](https://github.com/Brandoo110/CodeMesh), but it is a different product with a different acceptance-workbench objective.
+
+## Local setup
+
+Requirements:
 
 - Python 3.10+
 - Node.js 20+
-- pnpm or npm for the frontend
-- At least one model API key for real runs
+- pnpm
 
-Supported model providers use OpenAI-compatible APIs:
-
-- `DEEPSEEK_API_KEY`
-- `DASHSCOPE_API_KEY`
-- `VOLC_API_KEY`
-- `MINIMAX_API_KEY`
-- `GEMINI_API_KEY` or `GOOGLE_API_KEY`
-
-## Installation
+Install the backend and frontend dependencies:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-
 pip install -e ".[web,skills,tokens]"
-```
 
-Create local environment config:
-
-```bash
-cp .env.example .env
-```
-
-Then add at least one provider key to `.env`.
-
-## CLI Usage
-
-```bash
-codemesh run "explain the harness architecture"
-codemesh run "refactor this module and add tests" --stream
-codemesh run "compare model outputs for this task" --compare
-codemesh stats
-codemesh stats --html
-```
-
-Optional RAG support is available for non-code text collections:
-
-```bash
-pip install -e ".[rag]"
-codemesh index .
-codemesh run "answer with retrieved context" --rag
-```
-
-For source-code navigation, CodeMesh primarily uses agentic search through grep, glob, file reads, and AST/LSP tools instead of vector search.
-
-## Web UI
-
-Install frontend dependencies:
-
-```bash
 cd frontend
 pnpm install
+cd ..
 ```
 
-Run backend and frontend in two terminals:
+Run the two local services in separate terminals:
 
 ```bash
 make ui-backend
 make ui-frontend
 ```
 
-Default local URLs:
+Then open `http://localhost:3010`. The frontend talks to the local API at `http://localhost:8010`.
 
-- Backend: `http://localhost:8010`
-- Frontend: `http://localhost:3010`
+## Focused verification
 
-Main views:
-
-- Chat: streamed coding assistant with model selection and sessions.
-- Stats: local token, cost, and model usage dashboard.
-- Workflows: multi-step coding workflows with run history, tool calls, and diffs.
-- Memory: local facts, auto memory cards, journals, and consolidation status.
-
-## Local Data
-
-Runtime data is stored under `~/.codemesh/`:
-
-```text
-~/.codemesh/
-├── calls.jsonl
-├── memory.db
-├── web_sessions.db
-├── workflows.db
-├── auto_memory/
-└── journal/
-```
-
-These files are local runtime state and are not part of the repository.
-
-## Testing
-
-Normal tests do not call real model APIs.
-
-Run backend and core tests:
+The assurance tests are deterministic and do not require real model API calls:
 
 ```bash
-for f in tests/test_*.py tests/test_web/test_*.py; do
-  [ "$f" = "tests/test_adapters.py" ] && continue
-  mod="${f%.py}"
-  python -m "${mod//\//.}"
-done
+.venv/bin/python -m pytest tests/test_assurance_contracts.py
+.venv/bin/python -m pytest tests/test_assurance_state_machine.py
+.venv/bin/python -m pytest tests/test_assurance_model_routing.py
+.venv/bin/python -m pytest tests/test_assurance_council_report.py
 ```
 
-Run frontend checks:
+Frontend type-check:
 
 ```bash
 cd frontend
-pnpm build
-node --test lib/*.test.ts
+pnpm exec tsc --noEmit --allowImportingTsExtensions
 ```
 
-Adapter smoke tests can call real providers and may consume API quota:
+## Evidence boundary
 
-```bash
-python -m tests.test_adapters
-```
+Repository tests and local smoke checks establish implementation-level evidence only. They do not prove that a particular GitHub change, CI run, deployment, or production system has passed acceptance. CodeMesh keeps those evidence layers explicit instead of collapsing them into one green status.
 
-## Design Notes
+## Project status
 
-CodeMesh keeps the implementation intentionally explicit:
-
-- Tool errors are returned as strings so the model can reason over them.
-- The agent loop has a hard iteration limit to avoid runaway tool use.
-- File edits prefer targeted replacement over blind overwrite.
-- Workflows use per-step tool allowlists to separate planning, writing, and review.
-- Memory extraction writes structured markdown cards; consolidation rewrites the index only when gates pass.
-- Web UI state is local-first and backed by SQLite.
+P1-P5 form the first runnable V2 product slice. P6 adds the fixed evaluation dataset and promotion gates used to compare rules, a single reviewer, and the specialist council.
 
 ## License
 
-No open-source license has been added yet.
+No open-source license has been added. This repository is currently intended for private development.

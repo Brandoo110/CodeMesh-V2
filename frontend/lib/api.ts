@@ -21,6 +21,8 @@ import type {
   SessionInfo,
   SessionUpdateRequest,
   StoredMessage,
+  AssuranceDecisionRequest,
+  AssuranceProjection,
 } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
@@ -184,4 +186,53 @@ export async function rebuildMemoryIndex(): Promise<{ path: string }> {
   return request<{ path: string }>("/api/memory/dream/rebuild-index", {
     method: "POST",
   });
+}
+
+export async function listAssuranceChanges(): Promise<AssuranceProjection[]> {
+  return request<AssuranceProjection[]>("/api/assurance/changes");
+}
+
+export async function getAssuranceChange(id: string): Promise<AssuranceProjection> {
+  return request<AssuranceProjection>(`/api/assurance/changes/${encodeURIComponent(id)}`);
+}
+
+export async function submitAssuranceDecision(
+  id: string,
+  decision: AssuranceDecisionRequest,
+  idempotencyKey: string,
+): Promise<AssuranceProjection> {
+  return request<AssuranceProjection>(
+    `/api/assurance/changes/${encodeURIComponent(id)}/decisions`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(decision),
+    },
+  );
+}
+
+export async function downloadAssurancePassport(
+  id: string,
+  format: "json" | "markdown",
+): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/api/assurance/changes/${encodeURIComponent(id)}/passport?format=${format}`,
+  );
+  if (!res.ok) {
+    let detail: unknown = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail ?? body;
+    } catch {
+      // 非 JSON 错误体。
+    }
+    throw new ApiError(res.status, detail);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `codemesh-${id}-passport.${format === "json" ? "json" : "md"}`;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }

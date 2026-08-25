@@ -13,6 +13,7 @@ import { ChatView } from "@/components/ChatView";
 import { StatsView } from "@/components/StatsView";
 import { WorkflowsView } from "@/components/WorkflowsView";
 import { MemoryView } from "@/components/MemoryView";
+import { AssuranceView } from "@/components/AssuranceView";
 import { useStore } from "@/lib/store";
 import { fetchModels } from "@/lib/api";
 import {
@@ -68,6 +69,7 @@ export default function Home() {
           {view === "chat" && <ChatView />}
           {view === "stats" && <StatsView />}
           {view === "memory" && <MemoryView />}
+          {view === "assurance" && <AssuranceView />}
           {shouldRenderWorkflow && (
             <div
               className={

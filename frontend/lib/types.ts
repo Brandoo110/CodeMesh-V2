@@ -143,3 +143,141 @@ export interface Message {
   timestamp: number;   // Date.now()
   pending?: boolean;   // assistant 等待回答时
 }
+
+// ─────────────── Assurance Workbench (V2 P5) ───────────────
+
+export interface AssuranceCaseState {
+  case_id: string;
+  subject_digest: string;
+  state: string;
+  evidence_refs: string[];
+  finding_refs: string[];
+  execution_receipt_refs: string[];
+  policy_decision_refs: string[];
+  human_decision_refs: string[];
+  conditions: string[];
+  conflicts: string[];
+  missing_evidence: string[];
+  invalidation_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AssuranceMetadata {
+  change_id: string;
+  title: string;
+  summary: string;
+  owner: string;
+  owner_role: string;
+  author: string;
+  risk: "low" | "medium" | "high" | "critical";
+  priority: number;
+  value: number;
+  release_status: string;
+  intent_coverage?: string;
+  architecture_impact?: string;
+  operational_readiness?: string;
+  knowledge_notes?: string;
+  ownership_notes?: string;
+}
+
+export interface AssuranceEvidence {
+  evidence_id: string;
+  subject_digest: string;
+  kind: string;
+  producer: string;
+  artifact_digest: string;
+  source_ref: string;
+  trace_id: string | null;
+  status: string;
+  trust_level: string;
+  collected_at: string;
+}
+
+export interface AssuranceFinding {
+  finding_id: string;
+  subject_digest: string;
+  reviewer_role: "intent" | "architecture" | "operability";
+  claim: string;
+  evidence_refs: string[];
+  basis: string;
+  severity: string;
+  confidence: number;
+  rubric_hash: string;
+  model_ref: string;
+  status: string;
+  evidence_status: "backed" | "missing";
+}
+
+export interface AssuranceReceiptStep {
+  sequence: number;
+  planned_role: string;
+  actual_role: string | null;
+  model_ref: string | null;
+  provider: string | null;
+  tool_grants: string[];
+  routing_rule: string;
+  fallback_reason: string | null;
+  token_budget: number | null;
+  timeout_seconds: number;
+  result: string;
+  schema_status: string;
+}
+
+export interface AssuranceReceipt {
+  receipt_id: string;
+  run_id: string;
+  overall_result: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  started_at: string;
+  completed_at: string;
+  steps: AssuranceReceiptStep[];
+}
+
+export interface AssuranceTimelineItem {
+  type: "event" | "decision" | "receipt_step" | string;
+  id: string;
+  sequence: number;
+  at: string;
+  kind?: string;
+  outcome?: string;
+  routing_rule?: string;
+  result?: string;
+  reason?: string | null;
+}
+
+export interface AssuranceProjection {
+  case: AssuranceCaseState;
+  binding: {
+    policy_version: string;
+    rubric_version: string;
+    waiver_id: string | null;
+    waiver_expires_at: string | null;
+  };
+  metadata: AssuranceMetadata | null;
+  evidence: AssuranceEvidence[];
+  findings: AssuranceFinding[];
+  receipt: AssuranceReceipt | null;
+  decisions: Array<Record<string, unknown> & { kind: "policy" | "human" }>;
+  timeline: AssuranceTimelineItem[];
+  revision: number;
+  gate: string;
+  digest_freshness: boolean;
+  attention_reason: string | null;
+}
+
+export interface AssuranceDecisionRequest {
+  decision_id: string;
+  subject_digest: string;
+  owner: string;
+  owner_role: string;
+  decision: "approve" | "reject" | "approve_with_conditions" | "waiver";
+  reason: string;
+  conditions: string[];
+  waiver_id: string | null;
+  expires_at: string | null;
+  decided_at: string;
+  high_risk_confirmed: boolean;
+}

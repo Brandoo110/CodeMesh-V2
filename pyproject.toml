@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "codemesh"
 version = "0.3.0"
-description = "Local-first multi-model coding agent runtime"
+description = "Local-first change handover and acceptance workbench"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Junjie Li" }]
@@ -57,4 +57,4 @@ py-modules = ["harness", "cli"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["memory*", "execution*", "feedback*", "orchestration*", "rag*", "web*"]
+include = ["memory*", "execution*", "feedback*", "orchestration*", "rag*", "web*", "assurance*"]

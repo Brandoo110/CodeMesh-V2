@@ -8,7 +8,7 @@
  * （workflow 模型在 step 内选）。
  */
 
-import { Menu, MessageSquare, BarChart3, GitBranch, Brain } from "lucide-react";
+import { Menu, MessageSquare, BarChart3, GitBranch, Brain, ShieldCheck } from "lucide-react";
 import { useStore, type View } from "@/lib/store";
 import { viewUsesChatSidebar } from "@/lib/layout";
 import { ModelSelector } from "./ModelSelector";
@@ -17,6 +17,7 @@ const VIEWS: { id: View; label: string; icon: typeof MessageSquare }[] = [
   { id: "chat", label: "对话", icon: MessageSquare },
   { id: "workflows", label: "工作流", icon: GitBranch },
   { id: "memory", label: "记忆", icon: Brain },
+  { id: "assurance", label: "验收", icon: ShieldCheck },
   { id: "stats", label: "Stats", icon: BarChart3 },
 ];
 
