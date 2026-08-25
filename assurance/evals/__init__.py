@@ -25,6 +25,7 @@ from .adapters import (
     ROLE_ORDER,
     derive_finding_id,
 )
+from .rules_adapter import RULE_VERSION, RulesOnlyAdapter, run_rules_only
 
 __all__ = [
     "DATASET_ID",
@@ -46,4 +47,7 @@ __all__ = [
     "ModelArmAdapter",
     "ROLE_ORDER",
     "derive_finding_id",
+    "RULE_VERSION",
+    "RulesOnlyAdapter",
+    "run_rules_only",
 ]
