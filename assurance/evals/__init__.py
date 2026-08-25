@@ -9,6 +9,14 @@ from .dataset import (
     reviewer_payload,
     validate_dataset,
 )
+from .runner import (
+    ARM_ORDER,
+    ArmRunResult,
+    CaseComparison,
+    ComparisonRun,
+    ComparisonRunner,
+    EvalFinding,
+)
 
 __all__ = [
     "DATASET_ID",
@@ -18,4 +26,10 @@ __all__ = [
     "load_public_cases",
     "reviewer_payload",
     "validate_dataset",
+    "ARM_ORDER",
+    "ArmRunResult",
+    "CaseComparison",
+    "ComparisonRun",
+    "ComparisonRunner",
+    "EvalFinding",
 ]
