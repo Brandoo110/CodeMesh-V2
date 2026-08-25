@@ -40,6 +40,15 @@ from .scorers import (
     normalize_predicted_issue_ids,
     verify_score_report,
 )
+from .promotion import (
+    NOT_PROMOTED,
+    PROMOTION_SCHEMA_VERSION,
+    PROMOTED,
+    THRESHOLDS,
+    build_promotion_decision,
+    derive_promotion_state,
+    verify_promotion_decision,
+)
 
 __all__ = [
     "DATASET_ID",
@@ -74,4 +83,11 @@ __all__ = [
     "build_score_report",
     "normalize_predicted_issue_ids",
     "verify_score_report",
+    "NOT_PROMOTED",
+    "PROMOTION_SCHEMA_VERSION",
+    "PROMOTED",
+    "THRESHOLDS",
+    "build_promotion_decision",
+    "derive_promotion_state",
+    "verify_promotion_decision",
 ]
