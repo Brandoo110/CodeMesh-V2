@@ -33,6 +33,13 @@ from .result_artifact import (
     build_result_artifact,
     replay_result_artifact,
 )
+from .scorers import (
+    HIDDEN_TO_PUBLIC_TAXONOMY,
+    RULE_TO_PUBLIC_TAXONOMY,
+    build_score_report,
+    normalize_predicted_issue_ids,
+    verify_score_report,
+)
 
 __all__ = [
     "DATASET_ID",
@@ -62,4 +69,9 @@ __all__ = [
     "PUBLIC_ISSUE_TAXONOMY",
     "build_result_artifact",
     "replay_result_artifact",
+    "HIDDEN_TO_PUBLIC_TAXONOMY",
+    "RULE_TO_PUBLIC_TAXONOMY",
+    "build_score_report",
+    "normalize_predicted_issue_ids",
+    "verify_score_report",
 ]
