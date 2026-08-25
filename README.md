@@ -116,7 +116,7 @@ Seed the deterministic P6 demo into the local Workbench database, then run the t
 python -m web.assurance_demo
 ```
 
-The seed is local-only and non-destructive: it adds two fixed acceptance cases, is idempotent, and refuses to overwrite a conflicting fixed case. See [P6_DEMO.md](P6_DEMO.md) for the five-minute walkthrough and evidence boundary.
+The seed is local-only and non-destructive: it adds two fixed acceptance cases, is idempotent, and refuses to overwrite a conflicting fixed case. See [P6_DEMO.md](P6_DEMO.md) for the five-minute walkthrough and [P6_EVALUATION_REPORT.md](P6_EVALUATION_REPORT.md) for the three-arm results, promotion decision, and claim boundaries.
 
 ## Focused verification
 
