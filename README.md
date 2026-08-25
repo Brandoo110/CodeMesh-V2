@@ -108,6 +108,16 @@ make ui-frontend
 
 Then open `http://localhost:3010`. The frontend talks to the local API at `http://localhost:8010`.
 
+### Offline product demo
+
+Seed the deterministic P6 demo into the local Workbench database, then run the two services above:
+
+```bash
+python -m web.assurance_demo
+```
+
+The seed is local-only and non-destructive: it adds two fixed acceptance cases, is idempotent, and refuses to overwrite a conflicting fixed case. See [P6_DEMO.md](P6_DEMO.md) for the five-minute walkthrough and evidence boundary.
+
 ## Focused verification
 
 The assurance tests are deterministic and do not require real model API calls:
