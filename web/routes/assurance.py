@@ -25,6 +25,7 @@ from assurance.state_machine import (
     StaleSubjectError,
 )
 from assurance.store import AssuranceStoreError, StoreConflictError
+from web.assurance_case_view import resolve_action
 from web.assurance_store import (
     AssuranceWebConflictError,
     AssuranceWebError,
@@ -299,20 +300,34 @@ def decide_change(
 ) -> dict[str, Any]:
     projection = _case_projection(repository, change_id)
     _require_current_digest(projection, request.subject_digest)
-    if not projection["digest_freshness"]:
-        _fail(409, "STALE_SUBJECT", "case evidence is bound to an old digest")
-    if projection["case"]["state"] == "INVALIDATED":
-        _fail(409, "CASE_INVALIDATED", "invalidated cases cannot be signed")
-    approval = request.decision != "reject"
+    action = resolve_action(projection["allowed_actions"], request.decision)
+    if action is None:
+        _fail(
+            409,
+            "ACTION_NOT_ALLOWED",
+            f"action {request.decision!r} is not allowed for this CaseView",
+            "ACTION_NOT_ALLOWED",
+        )
     metadata = projection.get("metadata") or {}
-    if approval and request.owner == metadata.get("author"):
+    if action["self_approval_forbidden"] and request.owner == metadata.get("author"):
         _fail(403, "SELF_APPROVAL_FORBIDDEN", "authors cannot approve their own change")
-    if approval and metadata.get("risk") in {"high", "critical"}:
-        if not request.high_risk_confirmed:
-            _fail(403, "HIGH_RISK_CONFIRMATION_REQUIRED", "confirm high-risk approval")
-    policy_refs = tuple(projection["case"]["policy_decision_refs"])
-    if approval and not policy_refs:
-        _fail(409, "POLICY_DECISION_REQUIRED", "approval requires a policy decision")
+    required_role = action["required_human_role"]
+    if required_role is not None and request.owner_role != required_role:
+        _fail(
+            403,
+            "POLICY_ROLE_REQUIRED",
+            f"policy requires human role {required_role}",
+            "HUMAN_ROLE_MISMATCH",
+        )
+    if (
+        action["high_risk_confirmation_required"]
+        and not request.high_risk_confirmed
+    ):
+        _fail(
+            403,
+            "HIGH_RISK_CONFIRMATION_REQUIRED",
+            "confirm high-risk approval",
+        )
     latest_policy = next(
         (
             decision
@@ -321,27 +336,6 @@ def decide_change(
         ),
         None,
     )
-    if approval and latest_policy is not None:
-        policy_outcome = latest_policy["outcome"]
-        if policy_outcome in {"BLOCKED", "STALE"}:
-            _fail(
-                409,
-                "POLICY_BLOCKS_APPROVAL",
-                f"policy outcome {policy_outcome} does not allow approval",
-                f"POLICY_{policy_outcome}",
-            )
-        required_role = latest_policy.get("required_human_role")
-        if (
-            policy_outcome == "NEEDS_HUMAN"
-            and required_role is not None
-            and request.owner_role != required_role
-        ):
-            _fail(
-                403,
-                "POLICY_ROLE_REQUIRED",
-                f"policy requires human role {required_role}",
-                "HUMAN_ROLE_MISMATCH",
-            )
     decision_policy_refs = (
         (latest_policy["decision_id"],) if latest_policy is not None else ()
     )

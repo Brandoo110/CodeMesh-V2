@@ -164,10 +164,8 @@ def test_blocking_policy_cannot_be_overridden_by_ordinary_approval(
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "POLICY_BLOCKS_APPROVAL"
-    assert response.json()["detail"]["reason_codes"] == [
-        f"POLICY_{policy_outcome}"
-    ]
+    assert response.json()["detail"]["code"] == "ACTION_NOT_ALLOWED"
+    assert response.json()["detail"]["reason_codes"] == ["ACTION_NOT_ALLOWED"]
     projection = repository.get_change("case-policy-boundary")
     assert projection["case"]["state"] == "EVIDENCE_COLLECTED"
     assert projection["case"]["human_decision_refs"] == []

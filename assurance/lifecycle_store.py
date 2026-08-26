@@ -448,20 +448,25 @@ class SQLiteAssuranceLifecycleStore(SQLiteAssuranceStore):
     ) -> tuple[StoredReleaseObservation, ...]:
         conn = self._connect()
         try:
-            self._ensure_lifecycle_initialized(conn)
-            self._load_case(conn, case_id)
-            rows = conn.execute(
-                "SELECT * FROM assurance_release_observations WHERE case_id = ?"
-                " ORDER BY stored_at ASC, observation_id ASC",
-                (case_id,),
-            ).fetchall()
-            return tuple(self._observation_from_row(row) for row in rows)
+            return self._list_release_observations_in_transaction(conn, case_id)
         except sqlite3.Error as exc:
             raise StorePersistenceError(
                 f"failed to list release observations for {case_id!r}: {exc}"
             ) from exc
         finally:
             conn.close()
+
+    def _list_release_observations_in_transaction(
+        self, conn: sqlite3.Connection, case_id: str
+    ) -> tuple[StoredReleaseObservation, ...]:
+        self._ensure_lifecycle_initialized(conn)
+        self._load_case(conn, case_id)
+        rows = conn.execute(
+            "SELECT * FROM assurance_release_observations WHERE case_id = ?"
+            " ORDER BY stored_at ASC, observation_id ASC",
+            (case_id,),
+        ).fetchall()
+        return tuple(self._observation_from_row(row) for row in rows)
 
     @staticmethod
     def _validate_remediation_inputs(

@@ -10,8 +10,10 @@ from assurance.contracts import (
     AcceptanceCase, Evidence, ExecutionReceipt, Finding,
     HumanDecision, PolicyDecision,
 )
+from assurance.lifecycle_store import SQLiteAssuranceLifecycleStore
 from assurance.state_machine import AcceptanceBinding, AcceptanceEvent
-from assurance.store import CaseNotFoundError, SQLiteAssuranceStore
+from assurance.store import CaseNotFoundError
+from web.assurance_case_view import build_case_view
 
 
 class AssuranceWebError(Exception):
@@ -36,7 +38,7 @@ def _now_iso() -> str:
 class AssuranceWebRepository:
     def __init__(self, db_path: Path | None = None) -> None:
         self._db_path = Path(db_path or Path.home() / ".codemesh" / "assurance.sqlite")
-        self._store = SQLiteAssuranceStore(self._db_path)
+        self._store = SQLiteAssuranceLifecycleStore(self._db_path)
 
     def initialize(self) -> None:
         self._store.initialize()
@@ -144,7 +146,11 @@ class AssuranceWebRepository:
                 raise AssuranceWebConflictError(
                     "approval requires a policy decision"
                 )
-            if approval and latest_policy.outcome in {"BLOCKED", "STALE"}:
+            if approval and latest_policy.outcome in {
+                "BLOCKED",
+                "STALE",
+                "PASS_WITH_WAIVER",
+            }:
                 raise AssuranceWebConflictError(
                     f"policy outcome {latest_policy.outcome} does not allow approval"
                 )
@@ -239,9 +245,18 @@ class AssuranceWebRepository:
         web = self._load_web_case_in_transaction(
             unit_of_work.connection, case_id
         )
-        return self._render_projection(state, binding, decisions, web)
+        release_observations = (
+            self._store._list_release_observations_in_transaction(
+                unit_of_work.connection, case_id
+            )
+        )
+        return self._render_projection(
+            state, binding, decisions, web, release_observations
+        )
 
-    def _render_projection(self, state, binding, decisions, web) -> dict:
+    def _render_projection(
+        self, state, binding, decisions, web, release_observations
+    ) -> dict:
         evidence = self._decode_models((web or {}).get("evidence_json", "[]"), Evidence)
         findings = self._decode_models((web or {}).get("findings_json", "[]"), Finding)
         receipt = self._decode_receipt(web)
@@ -257,20 +272,40 @@ class AssuranceWebRepository:
             data["kind"] = "policy" if isinstance(decision, PolicyDecision) else "human"
             decisions_out.append(data)
         gate, attention = self._gate_and_attention(state, decisions)
-        return {
+        metadata = json.loads(web["metadata_json"]) if web is not None else None
+        revision = len(state.applied_events) + len(decisions)
+        digest_freshness = self._digest_freshness(
+            state.case, binding, evidence, findings, receipt
+        )
+        projection = {
             "case": state.case.model_dump(mode="json"),
             "binding": binding.model_dump(mode="json"),
-            "metadata": json.loads(web["metadata_json"]) if web is not None else None,
+            "metadata": metadata,
             "evidence": [item.model_dump(mode="json") for item in evidence],
             "findings": findings_out,
             "receipt": receipt.model_dump(mode="json") if receipt is not None else None,
             "decisions": decisions_out,
             "timeline": self._timeline(state, decisions, receipt),
-            "revision": len(state.applied_events) + len(decisions),
+            "revision": revision,
             "gate": gate,
-            "digest_freshness": self._digest_freshness(state.case, binding, evidence, findings, receipt),
+            "digest_freshness": digest_freshness,
             "attention_reason": attention,
         }
+        projection.update(
+            build_case_view(
+                case_id=state.case.case_id,
+                subject_digest=state.case.subject_digest,
+                revision=revision,
+                acceptance_state=state.case.state,
+                decisions=decisions,
+                release_observations=tuple(
+                    item.observation for item in release_observations
+                ),
+                digest_freshness=digest_freshness,
+                risk=(metadata or {}).get("risk"),
+            )
+        )
+        return projection
 
     def _timeline(self, state, decisions, receipt) -> list:
         timeline = []
