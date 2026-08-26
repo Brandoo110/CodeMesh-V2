@@ -1,0 +1,21 @@
+{
+  "claimed_trust_level": "observed",
+  "collected_at": "2026-08-26T08:30:00+00:00",
+  "findings": [
+    {
+      "claim": "The change is missing a required deployment guard.",
+      "file_path": "deploy/service.yaml",
+      "finding_id": "harness-finding-001",
+      "rule_id": "HARNESS-DEPLOY-001",
+      "severity": "high",
+      "start_line": 18,
+      "status": "open"
+    }
+  ],
+  "provider": "harness",
+  "run_id": "harness-run-001",
+  "schema_version": "v1",
+  "source_ref": "harness:run:harness-run-001",
+  "status": "success",
+  "subject_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}

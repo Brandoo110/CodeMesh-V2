@@ -1,0 +1,21 @@
+{
+  "claimed_trust_level": "deterministic",
+  "collected_at": "2026-08-26T08:30:00+00:00",
+  "findings": [
+    {
+      "claim": "The service has no owner rotation evidence for this change.",
+      "file_path": null,
+      "finding_id": "cortex-finding-001",
+      "rule_id": "CORTEX-OWNER-001",
+      "severity": "medium",
+      "start_line": null,
+      "status": "open"
+    }
+  ],
+  "provider": "cortex",
+  "run_id": "cortex-run-001",
+  "schema_version": "v1",
+  "source_ref": "cortex:run:cortex-run-001",
+  "status": "success",
+  "subject_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}

@@ -1,0 +1,26 @@
+{
+  "analysisDate": "2026-08-26T08:30:00+00:00",
+  "analysisId": "sonar-analysis-001",
+  "issues": [
+    {
+      "component": "demo:src/app.py",
+      "key": "sonar-issue-001",
+      "line": 12,
+      "message": "Unvalidated input reaches a sensitive operation.",
+      "rule": "python:S123",
+      "severity": "CRITICAL",
+      "status": "OPEN"
+    },
+    {
+      "component": "demo:src/legacy.py",
+      "key": "sonar-issue-002",
+      "line": 7,
+      "message": "Legacy issue retained for audit history.",
+      "rule": "python:S456",
+      "severity": "MINOR",
+      "status": "RESOLVED"
+    }
+  ],
+  "project": "codemesh-demo",
+  "status": "SUCCESS"
+}

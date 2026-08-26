@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "automationDetails": {
+        "id": "codeql-run-001"
+      },
+      "invocations": [
+        {
+          "endTimeUtc": "2026-08-26T08:30:00Z",
+          "executionSuccessful": true
+        }
+      ],
+      "results": [
+        {
+          "baselineState": "new",
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/app.py"
+                },
+                "region": {
+                  "startLine": 42
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unsanitized data flows into a database query."
+          },
+          "partialFingerprints": {
+            "primaryLocationLineHash": "sql-injection:42"
+          },
+          "ruleId": "py/sql-injection"
+        },
+        {
+          "baselineState": "existing",
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/legacy.py"
+                },
+                "region": {
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "A legacy flow requires manual review."
+          },
+          "partialFingerprints": {
+            "primaryLocationLineHash": "legacy-flow:9"
+          },
+          "ruleId": "py/legacy-flow"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "name": "CodeQL",
+          "version": "2.17.0"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}
