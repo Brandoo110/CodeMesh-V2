@@ -6,7 +6,7 @@
 
 本轮结论是 **Multi-Agent 不进入默认路径**：Single 与 Council 的 precision / macro recall 都是 `1.0 / 1.0`，Council 没有新增 recall 或 unsupported-claim 收益，却比 Single 多一次 false block；真实模型 token、cost 和 latency 不可得，成本门必须 fail closed。因此默认 topology 保持 `single_strong_reviewer+policy_gate`，Council 只允许在 high-risk 或 cross-role conflict 场景实验使用，并继续经过 Policy Gate 和 Human Review。
 
-P6-06 人工时间实验材料已经冻结，但 `results.csv` 仍只有表头。当前不能声称 CodeMesh 降低了人工理解时间或提高了主观信任，Phase 6 也尚未最终关闭。
+P6-06 人工时间实验材料曾被提前准备，但产品决策确认它不应成为 MVP Gate：CodeMesh 的目标就是把分散的 Diff、Evidence、评审和责任组织成更容易接管的 Acceptance Case，当前无需为了验证这个方向性前提组织三人实验。`results.csv` 保持只有表头，human review time 明确记为 `not_measured`；因此仍不能声称已量化降低人工理解时间或提高主观信任。Phase 6 已在这一边界下关闭。
 
 ## 可审计交付物
 
@@ -17,8 +17,8 @@ P6-06 人工时间实验材料已经冻结，但 `results.csv` 仍只有表头�
 | P6-03 | hidden-gold evaluator 与 metrics-only score | `change_assurance_v0_luna_scores.json`；commit `525c29f` |
 | P6-04 | 固定阈值、可重算的晋级决定 | `change_assurance_v0_luna_promotion.json`；commit `8a8da80` |
 | P6-05 | 离线双 Case 主 Demo、五分钟走查 | `P6_DEMO.md`；commit `954e3f0` |
-| P6-06A | Diff / Single / Acceptance Case 三种同事实人工实验材料 | `experiments/p6_human_time/`；commit `9d57fa5` |
-| P6-06B-E | 三条真实人工记录与探索性总结 | **等待参与者** |
+| P6-06A | Diff / Single / Acceptance Case 三种同事实人工实验材料 | `experiments/p6_human_time/`；commit `9d57fa5`；保留为后续可选研究材料 |
+| P6-06B-E | 三条真实人工记录与探索性总结 | **取消；不作为 MVP Gate，human time=`not_measured`** |
 
 正式 result artifact 保存 12 个 case × 3 个 arm 和 48 条角色原始响应。模型角色是 General、Intent、Architecture、Operability，`model_ref=gpt-5.6-luna`，provider 为 `openai-codex-desktop`。Reviewer 只读取 public payload；hidden gold 只在 scorer 侧加载。
 
@@ -85,7 +85,7 @@ can_override_stale_or_evidence_gate = false
 
 Demo 的 `evidence_level=deterministic_offline_demo`、`external_services=false`。它不依赖真实模型、网络、GitHub、CI 或生产服务。
 
-## P6-06 人工时间实验
+## P6-06 人工时间实验（取消，不作为 MVP Gate）
 
 三种条件使用字节完全一致的 task brief、Diff 和 green-test packet：
 
@@ -95,7 +95,9 @@ Demo 的 `evidence_level=deterministic_offline_demo`、`external_services=false`
 
 记录字段包括理解耗时、8 题正确率、原始 Evidence 打开次数、trust 1-5 和遗漏条件。推荐 3 位未接触本项目的参与者各只看一个条件；同一人重复会产生学习效应。`n=3` 只允许描述观察，不做显著性、因果或泛化结论。
 
-当前状态：**材料完成、人工观测为 0**。Agent dry-run、自动答案或研究者代答不计入 `human_reported`。
+当前状态：**取消执行，人工观测为 0，human review time=`not_measured`**。已有材料保留为将来需要验证具体 UI、目标用户或商业化指标时的可选研究包；当前不招募参与者，也不生成结果。Agent dry-run、自动答案或研究者代答仍不得计入 `human_reported`。
+
+取消理由：本阶段需要证明的是 Multi-Agent 架构、评测方法、晋级决策和可运行产品闭环，而不是为方向性产品假设制作低样本统计结论。若未来要公开宣称“降低人工理解时间 25%”等具体数字，必须重新启动真实用户研究；当前简历与产品文档不使用这类量化表述。
 
 ## 简历与面试陈述边界
 
@@ -121,5 +123,5 @@ Demo 的 `evidence_level=deterministic_offline_demo`、`external_services=false`
 - [x] 主 Demo 无隐藏真实服务依赖；
 - [x] 指标、决策和证据边界已写入报告与 canonical devlog；
 - [x] 简历陈述限制已固定；
-- [ ] 三条真实 `human_reported` 走查完成；
-- [ ] P6-06 与 Phase 6 Gate 最终关闭。
+- [x] P6-06 人工时间明确记为 `not_measured`，不伪造数据、不作量化提速声明；
+- [x] Phase 6 Gate 在 P6-06 取消边界下关闭。

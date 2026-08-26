@@ -1,5 +1,7 @@
 # P6-06A 人工时间实验材料
 
+> **状态：已取消，不属于 CodeMesh V2 MVP Gate。** 2026-08-26 的产品决策认为当前无需为“结构化 Acceptance Case 比分散材料更容易接管”这一方向性前提组织三人实验。材料保留供未来需要验证具体 UI 或量化商业指标时复用；`results.csv` 保持空表，human review time 记为 `not_measured`。
+
 这是一个离线、固定事实的内部走查材料包，不包含任何伪造的人类观测。三次走查分别使用 A、B、C 条件；建议招募 3 位参与者，每位参与者随机只看一个 condition。不要让同一人重复多个 condition；若因资源限制重复，必须标记为较弱的探索性观察，因为会有学习效应。
 
 ## 分配与边界
@@ -40,4 +42,4 @@
 
 ## 完成标准
 
-实验只有在 `results.csv` 中有恰好 3 条真实的 `human_reported` 记录、每条来自不同 participant_alias 且各自只看一个随机 condition 时才算完成。空表是材料初始化状态，不代表实验完成；不要为了填表伪造数据。
+若未来重新启动实验，只有在 `results.csv` 中有恰好 3 条真实的 `human_reported` 记录、每条来自不同 participant_alias 且各自只看一个随机 condition 时才算完成。当前实验已取消，空表是刻意保留的 `not_measured` 状态；不要为了填表伪造数据。
