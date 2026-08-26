@@ -2,8 +2,10 @@
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from pydantic import ValidationError
 
@@ -57,6 +59,64 @@ def _canonical_json(model) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+class _SQLiteAssuranceUnitOfWork:
+    """One-connection view of the assurance ledger inside a transaction."""
+
+    def __init__(
+        self, store: "SQLiteAssuranceStore", connection: sqlite3.Connection
+    ) -> None:
+        self._store = store
+        self.connection = connection
+
+    def create_case(
+        self, case: AcceptanceCase, binding: AcceptanceBinding
+    ) -> AcceptanceMachineState:
+        return self._store._create_case_in_transaction(
+            self.connection, case, binding
+        )
+
+    def load_case(self, case_id: str) -> AcceptanceMachineState:
+        return self._store._load_case(self.connection, case_id)
+
+    def get_binding(self, case_id: str) -> AcceptanceBinding:
+        return self._store._get_binding_in_transaction(
+            self.connection, case_id
+        )
+
+    def list_decisions(
+        self, case_id: str
+    ) -> tuple[PolicyDecision | HumanDecision, ...]:
+        state = self.load_case(case_id)
+        return self._store._load_decisions(
+            self.connection, case_id, state.case.subject_digest
+        )
+
+    def append_event(
+        self, case_id: str, event: AcceptanceEvent
+    ) -> AcceptanceMachineState:
+        return self._store._append_event_in_transaction(
+            self.connection, case_id, event
+        )
+
+    def append_policy_decision(
+        self, case_id: str, decision: PolicyDecision
+    ) -> PolicyDecision:
+        if type(decision) is not PolicyDecision:
+            raise TypeError("decision must be an exact PolicyDecision")
+        return self._store._append_decision_in_transaction(
+            self.connection, case_id, "policy", decision
+        )
+
+    def append_human_decision(
+        self, case_id: str, decision: HumanDecision
+    ) -> HumanDecision:
+        if type(decision) is not HumanDecision:
+            raise TypeError("decision must be an exact HumanDecision")
+        return self._store._append_decision_in_transaction(
+            self.connection, case_id, "human", decision
+        )
 
 
 class SQLiteAssuranceStore:
@@ -116,8 +176,54 @@ class SQLiteAssuranceStore:
         finally:
             conn.close()
 
+    @contextmanager
+    def _transaction(
+        self, *, write: bool = True
+    ) -> Iterator[_SQLiteAssuranceUnitOfWork]:
+        """Yield one ledger Unit of Work and commit or roll back as a unit."""
+        conn = self._connect()
+        try:
+            self._ensure_initialized(conn)
+            conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            yield _SQLiteAssuranceUnitOfWork(self, conn)
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.rollback()
+            raise StorePersistenceError(
+                f"failed atomic assurance transaction: {exc}"
+            ) from exc
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def create_case(
         self, case: AcceptanceCase, binding: AcceptanceBinding
+    ) -> AcceptanceMachineState:
+        conn = self._connect()
+        try:
+            self._ensure_initialized(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._create_case_in_transaction(conn, case, binding)
+            conn.commit()
+            return state
+        except sqlite3.Error as exc:
+            conn.rollback()
+            raise StorePersistenceError(
+                f"failed to create case {case.case_id!r}: {exc}"
+            ) from exc
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _create_case_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        case: AcceptanceCase,
+        binding: AcceptanceBinding,
     ) -> AcceptanceMachineState:
         if type(case) is not AcceptanceCase:
             raise StoreConflictError("case must be an exact AcceptanceCase")
@@ -131,56 +237,39 @@ class SQLiteAssuranceStore:
             raise StoreConflictError(
                 "case and binding subject digests must match"
             )
-        conn = self._connect()
-        try:
-            self._ensure_initialized(conn)
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT case_id, subject_digest, initial_case_json,"
-                " binding_json, created_at FROM assurance_cases"
-                " WHERE case_id = ?",
-                (case.case_id,),
-            ).fetchone()
-            case_json = _canonical_json(case)
-            binding_json = _canonical_json(binding)
-            if row is not None:
-                stored_case = self._case_from_row(row)
-                stored_binding = self._binding_from_row(row)
-                if (
-                    _canonical_json(stored_case) != case_json
-                    or _canonical_json(stored_binding) != binding_json
-                ):
-                    raise StoreConflictError(
-                        f"case_id {case.case_id!r} already exists"
-                        " with different content"
-                    )
-                conn.commit()
-                return self._load_case(conn, case.case_id)
-            conn.execute(
-                "INSERT INTO assurance_cases"
-                " (case_id, subject_digest, initial_case_json,"
-                " binding_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    case.case_id,
-                    case.subject_digest,
-                    case_json,
-                    binding_json,
-                    case.created_at.isoformat(),
-                ),
-            )
-            state = self._load_case(conn, case.case_id)
-            conn.commit()
-            return state
-        except sqlite3.Error as exc:
-            conn.rollback()
-            raise StorePersistenceError(
-                f"failed to create case {case.case_id!r}: {exc}"
-            ) from exc
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        row = conn.execute(
+            "SELECT case_id, subject_digest, initial_case_json,"
+            " binding_json, created_at FROM assurance_cases"
+            " WHERE case_id = ?",
+            (case.case_id,),
+        ).fetchone()
+        case_json = _canonical_json(case)
+        binding_json = _canonical_json(binding)
+        if row is not None:
+            stored_case = self._case_from_row(row)
+            stored_binding = self._binding_from_row(row)
+            if (
+                _canonical_json(stored_case) != case_json
+                or _canonical_json(stored_binding) != binding_json
+            ):
+                raise StoreConflictError(
+                    f"case_id {case.case_id!r} already exists"
+                    " with different content"
+                )
+            return self._load_case(conn, case.case_id)
+        conn.execute(
+            "INSERT INTO assurance_cases"
+            " (case_id, subject_digest, initial_case_json,"
+            " binding_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                case.case_id,
+                case.subject_digest,
+                case_json,
+                binding_json,
+                case.created_at.isoformat(),
+            ),
+        )
+        return self._load_case(conn, case.case_id)
 
     def load_case(self, case_id: str) -> AcceptanceMachineState:
         conn = self._connect()
@@ -198,14 +287,7 @@ class SQLiteAssuranceStore:
         conn = self._connect()
         try:
             self._ensure_initialized(conn)
-            row = conn.execute(
-                "SELECT case_id, subject_digest, binding_json"
-                " FROM assurance_cases WHERE case_id = ?",
-                (case_id,),
-            ).fetchone()
-            if row is None:
-                raise CaseNotFoundError(f"case {case_id!r} not found")
-            return self._binding_from_row(row)
+            return self._get_binding_in_transaction(conn, case_id)
         except sqlite3.Error as exc:
             raise StorePersistenceError(
                 f"failed to load binding for case {case_id!r}: {exc}"
@@ -213,43 +295,28 @@ class SQLiteAssuranceStore:
         finally:
             conn.close()
 
+    def _get_binding_in_transaction(
+        self, conn: sqlite3.Connection, case_id: str
+    ) -> AcceptanceBinding:
+        row = conn.execute(
+            "SELECT case_id, subject_digest, binding_json"
+            " FROM assurance_cases WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+        if row is None:
+            raise CaseNotFoundError(f"case {case_id!r} not found")
+        return self._binding_from_row(row)
+
     def append_event(
         self, case_id: str, event: AcceptanceEvent
     ) -> AcceptanceMachineState:
-        if type(event) is not AcceptanceEvent:
-            raise TypeError("event must be an exact AcceptanceEvent")
         conn = self._connect()
         try:
             self._ensure_initialized(conn)
             conn.execute("BEGIN IMMEDIATE")
-            state = self._load_case(conn, case_id)
-            event_json = _canonical_json(event)
-            for existing in state.applied_events:
-                if existing.event_id == event.event_id:
-                    if _canonical_json(existing) == event_json:
-                        conn.commit()
-                        return state
-                    raise StoreConflictError(
-                        f"event_id {event.event_id!r} already exists"
-                        " with different content"
-                    )
-            new_state = apply_acceptance_event(state, event)
-            sequence = len(state.applied_events) + 1
-            conn.execute(
-                "INSERT INTO assurance_case_events"
-                " (case_id, sequence, event_id, subject_digest,"
-                " event_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    case_id,
-                    sequence,
-                    event.event_id,
-                    event.subject_digest,
-                    event_json,
-                    _now_iso(),
-                ),
-            )
+            state = self._append_event_in_transaction(conn, case_id, event)
             conn.commit()
-            return new_state
+            return state
         except sqlite3.Error as exc:
             conn.rollback()
             raise StorePersistenceError(
@@ -261,6 +328,41 @@ class SQLiteAssuranceStore:
             raise
         finally:
             conn.close()
+
+    def _append_event_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        case_id: str,
+        event: AcceptanceEvent,
+    ) -> AcceptanceMachineState:
+        if type(event) is not AcceptanceEvent:
+            raise TypeError("event must be an exact AcceptanceEvent")
+        state = self._load_case(conn, case_id)
+        event_json = _canonical_json(event)
+        for existing in state.applied_events:
+            if existing.event_id == event.event_id:
+                if _canonical_json(existing) == event_json:
+                    return state
+                raise StoreConflictError(
+                    f"event_id {event.event_id!r} already exists"
+                    " with different content"
+                )
+        new_state = apply_acceptance_event(state, event)
+        sequence = len(state.applied_events) + 1
+        conn.execute(
+            "INSERT INTO assurance_case_events"
+            " (case_id, sequence, event_id, subject_digest,"
+            " event_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                case_id,
+                sequence,
+                event.event_id,
+                event.subject_digest,
+                event_json,
+                _now_iso(),
+            )
+        )
+        return new_state
 
     def append_policy_decision(
         self, case_id: str, decision: PolicyDecision
@@ -420,47 +522,11 @@ class SQLiteAssuranceStore:
         try:
             self._ensure_initialized(conn)
             conn.execute("BEGIN IMMEDIATE")
-            state = self._load_case(conn, case_id)
-            existing = self._load_decisions(
-                conn, case_id, state.case.subject_digest
-            )
-            if decision.subject_digest != state.case.subject_digest:
-                raise StoreConflictError(
-                    f"decision subject does not match case {case_id!r}"
-                )
-            decision_json = _canonical_json(decision)
-            for stored in existing:
-                same_kind = (
-                    isinstance(stored, PolicyDecision)
-                    if kind == "policy"
-                    else isinstance(stored, HumanDecision)
-                )
-                if not same_kind or stored.decision_id != decision.decision_id:
-                    continue
-                if _canonical_json(stored) == decision_json:
-                    conn.commit()
-                    return stored
-                raise StoreConflictError(
-                    f"decision_id {decision.decision_id!r} already exists"
-                    f" for case {case_id!r} with different content"
-                )
-            conn.execute(
-                "INSERT INTO assurance_decisions"
-                " (case_id, sequence, decision_kind, decision_id,"
-                " subject_digest, decision_json, recorded_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    case_id,
-                    len(existing) + 1,
-                    kind,
-                    decision.decision_id,
-                    decision.subject_digest,
-                    decision_json,
-                    _now_iso(),
-                ),
+            stored = self._append_decision_in_transaction(
+                conn, case_id, kind, decision
             )
             conn.commit()
-            return decision
+            return stored
         except sqlite3.Error as exc:
             conn.rollback()
             raise StorePersistenceError(
@@ -472,6 +538,53 @@ class SQLiteAssuranceStore:
             raise
         finally:
             conn.close()
+
+    def _append_decision_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        case_id: str,
+        kind: str,
+        decision,
+    ):
+        state = self._load_case(conn, case_id)
+        existing = self._load_decisions(
+            conn, case_id, state.case.subject_digest
+        )
+        if decision.subject_digest != state.case.subject_digest:
+            raise StoreConflictError(
+                f"decision subject does not match case {case_id!r}"
+            )
+        decision_json = _canonical_json(decision)
+        for stored in existing:
+            same_kind = (
+                isinstance(stored, PolicyDecision)
+                if kind == "policy"
+                else isinstance(stored, HumanDecision)
+            )
+            if not same_kind or stored.decision_id != decision.decision_id:
+                continue
+            if _canonical_json(stored) == decision_json:
+                return stored
+            raise StoreConflictError(
+                f"decision_id {decision.decision_id!r} already exists"
+                f" for case {case_id!r} with different content"
+            )
+        conn.execute(
+            "INSERT INTO assurance_decisions"
+            " (case_id, sequence, decision_kind, decision_id,"
+            " subject_digest, decision_json, recorded_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                case_id,
+                len(existing) + 1,
+                kind,
+                decision.decision_id,
+                decision.subject_digest,
+                decision_json,
+                _now_iso(),
+            ),
+        )
+        return decision
 
     def _load_decisions(
         self,

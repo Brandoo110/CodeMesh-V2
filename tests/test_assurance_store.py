@@ -1409,6 +1409,7 @@ def test_store_public_api_is_minimal():
         "create_case",
         "get_binding",
         "initialize",
+        "list_cases",
         "list_decisions",
         "load_case",
         "schema_version",

@@ -55,14 +55,23 @@ class AssuranceWebRepository:
     def create_change(self, case, binding, metadata, idempotency_key, payload) -> dict:
         self._require_exact(case, AcceptanceCase, "case")
         self._require_exact(binding, AcceptanceBinding, "binding")
-        replayed, cached = self._begin_mutation("create_change", idempotency_key, payload)
-        if replayed:
-            return cached
-        state = self._store.create_case(case, binding)
-        self._touch_web_case(case.case_id, state.case.updated_at, metadata=metadata)
-        result = self._projection(case.case_id)
-        self._record_mutation("create_change", idempotency_key, payload, result)
-        return result
+
+        def change(unit_of_work) -> None:
+            state = unit_of_work.create_case(case, binding)
+            self._touch_web_case(
+                unit_of_work.connection,
+                case.case_id,
+                state.case.updated_at,
+                metadata=metadata,
+            )
+
+        return self._mutate(
+            "create_change",
+            case.case_id,
+            idempotency_key,
+            payload,
+            change,
+        )
 
     def list_changes(self) -> list[dict]:
         return [self._projection(s.case.case_id) for s in self._store.list_cases()]
@@ -75,18 +84,20 @@ class AssuranceWebRepository:
         self._require_exact(event, AcceptanceEvent, "event")
         if evidence is not None:
             self._require_exact(evidence, Evidence, "evidence")
-        self._require_case(case_id)
-        replayed, cached = self._begin_mutation("collect", idempotency_key, payload)
-        if replayed:
-            return cached
-        state = self._store.append_event(case_id, event)
         stored_evidence = (evidence,) if evidence is not None else ()
-        self._touch_web_case(
-            case_id, state.case.updated_at, evidence=stored_evidence
+
+        def change(unit_of_work) -> None:
+            state = unit_of_work.append_event(case_id, event)
+            self._touch_web_case(
+                unit_of_work.connection,
+                case_id,
+                state.case.updated_at,
+                evidence=stored_evidence,
+            )
+
+        return self._mutate(
+            "collect", case_id, idempotency_key, payload, change
         )
-        result = self._projection(case_id)
-        self._record_mutation("collect", idempotency_key, payload, result)
-        return result
 
     def review(self, case_id, event, findings, receipt, policy_decision, idempotency_key, payload) -> dict:
         self._require_exact(event, AcceptanceEvent, "event")
@@ -98,30 +109,106 @@ class AssuranceWebRepository:
             findings = tuple(findings)
         for finding in findings:
             self._require_exact(finding, Finding, "finding")
-        self._require_case(case_id)
-        replayed, cached = self._begin_mutation("review", idempotency_key, payload)
-        if replayed:
-            return cached
-        self._store.append_policy_decision(case_id, policy_decision)
-        state = self._store.append_event(case_id, event)
-        self._touch_web_case(case_id, state.case.updated_at, findings=findings, receipt=receipt)
-        result = self._projection(case_id)
-        self._record_mutation("review", idempotency_key, payload, result)
-        return result
+
+        def change(unit_of_work) -> None:
+            unit_of_work.append_policy_decision(case_id, policy_decision)
+            state = unit_of_work.append_event(case_id, event)
+            self._touch_web_case(
+                unit_of_work.connection,
+                case_id,
+                state.case.updated_at,
+                findings=findings,
+                receipt=receipt,
+            )
+
+        return self._mutate(
+            "review", case_id, idempotency_key, payload, change
+        )
 
     def decide(self, case_id, human_decision, event, idempotency_key, payload) -> dict:
         self._require_exact(human_decision, HumanDecision, "human_decision")
         self._require_exact(event, AcceptanceEvent, "event")
-        self._require_case(case_id)
-        replayed, cached = self._begin_mutation("decide", idempotency_key, payload)
-        if replayed:
-            return cached
-        self._store.append_human_decision(case_id, human_decision)
-        state = self._store.append_event(case_id, event)
-        self._touch_web_case(case_id, state.case.updated_at)
-        result = self._projection(case_id)
-        self._record_mutation("decide", idempotency_key, payload, result)
-        return result
+
+        def change(unit_of_work) -> None:
+            decisions = unit_of_work.list_decisions(case_id)
+            latest_policy = next(
+                (
+                    decision
+                    for decision in reversed(decisions)
+                    if isinstance(decision, PolicyDecision)
+                ),
+                None,
+            )
+            approval = human_decision.decision != "reject"
+            if approval and latest_policy is None:
+                raise AssuranceWebConflictError(
+                    "approval requires a policy decision"
+                )
+            if approval and latest_policy.outcome in {"BLOCKED", "STALE"}:
+                raise AssuranceWebConflictError(
+                    f"policy outcome {latest_policy.outcome} does not allow approval"
+                )
+            if (
+                approval
+                and latest_policy.outcome == "NEEDS_HUMAN"
+                and latest_policy.required_human_role is not None
+                and human_decision.owner_role
+                != latest_policy.required_human_role
+            ):
+                raise AssuranceWebConflictError(
+                    "human decision role does not satisfy policy requirement"
+                )
+            if approval and event.policy_decision_refs != (
+                latest_policy.decision_id,
+            ):
+                raise AssuranceWebConflictError(
+                    "approval event must reference the latest policy decision"
+                )
+            unit_of_work.append_human_decision(case_id, human_decision)
+            state = unit_of_work.append_event(case_id, event)
+            self._touch_web_case(
+                unit_of_work.connection, case_id, state.case.updated_at
+            )
+
+        return self._mutate(
+            "decide", case_id, idempotency_key, payload, change
+        )
+
+    def _mutate(
+        self, operation, case_id, idempotency_key, payload, change
+    ) -> dict:
+        mutation_payload = {"case_id": case_id, "payload": payload}
+        try:
+            with self._store._transaction() as unit_of_work:
+                replayed, cached = self._begin_mutation(
+                    unit_of_work.connection,
+                    operation,
+                    idempotency_key,
+                    mutation_payload,
+                )
+                if replayed:
+                    cached_case_id = cached.get("case", {}).get("case_id")
+                    if cached_case_id != case_id:
+                        raise AssuranceWebError(
+                            "idempotency result does not match its case"
+                        )
+                    return cached
+                change(unit_of_work)
+                result = self._projection_in_transaction(
+                    unit_of_work, case_id
+                )
+                self._record_mutation(
+                    unit_of_work.connection,
+                    operation,
+                    idempotency_key,
+                    mutation_payload,
+                    result,
+                )
+                return result
+        except CaseNotFoundError as exc:
+            raise AssuranceWebNotFoundError(
+                f"case {case_id!r} not found"
+            ) from exc
 
     def get_evidence(self, case_id: str, evidence_id: str) -> dict:
         self._require_case(case_id)
@@ -142,10 +229,19 @@ class AssuranceWebRepository:
         return {"canonical": self._passport_canonical(projection), "markdown": self._passport_markdown(projection)}
 
     def _projection(self, case_id: str) -> dict:
-        state = self._store.load_case(case_id)
-        binding = self._store.get_binding(case_id)
-        decisions = self._store.list_decisions(case_id)
-        web = self._load_web_case(case_id)
+        with self._store._transaction(write=False) as unit_of_work:
+            return self._projection_in_transaction(unit_of_work, case_id)
+
+    def _projection_in_transaction(self, unit_of_work, case_id: str) -> dict:
+        state = unit_of_work.load_case(case_id)
+        binding = unit_of_work.get_binding(case_id)
+        decisions = unit_of_work.list_decisions(case_id)
+        web = self._load_web_case_in_transaction(
+            unit_of_work.connection, case_id
+        )
+        return self._render_projection(state, binding, decisions, web)
+
+    def _render_projection(self, state, binding, decisions, web) -> dict:
         evidence = self._decode_models((web or {}).get("evidence_json", "[]"), Evidence)
         findings = self._decode_models((web or {}).get("findings_json", "[]"), Finding)
         receipt = self._decode_receipt(web)
@@ -263,43 +359,55 @@ class AssuranceWebRepository:
         labels += [f"MISSING:{m}" for m in p["case"]["missing_evidence"]]
         return labels
 
-    def _begin_mutation(self, operation, idempotency_key, payload) -> tuple[bool, dict | None]:
-        conn = self._connect()
+    def _begin_mutation(
+        self, conn, operation, idempotency_key, payload
+    ) -> tuple[bool, dict | None]:
         try:
             row = conn.execute("SELECT operation, payload_digest, result_json FROM assurance_web_idempotency WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
             if row is None:
                 return False, None
             if row["operation"] != operation or row["payload_digest"] != self._payload_digest(payload):
                 raise AssuranceWebConflictError(f"idempotency key {idempotency_key!r} was reused with a different operation or payload")
-            return True, json.loads(row["result_json"])
+            try:
+                cached = json.loads(row["result_json"])
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise AssuranceWebError(
+                    f"invalid cached idempotency result for {idempotency_key!r}"
+                ) from exc
+            if not isinstance(cached, dict):
+                raise AssuranceWebError(
+                    f"invalid cached idempotency result for {idempotency_key!r}"
+                )
+            return True, cached
         except sqlite3.Error as exc:
             raise AssuranceWebError(f"idempotency check failed for {idempotency_key!r}: {exc}") from exc
-        finally:
-            conn.close()
 
-    def _record_mutation(self, operation, idempotency_key, payload, result) -> None:
-        conn = self._connect()
+    def _record_mutation(
+        self, conn, operation, idempotency_key, payload, result
+    ) -> None:
         try:
-            conn.execute("BEGIN IMMEDIATE")
             conn.execute("INSERT INTO assurance_web_idempotency (idempotency_key, operation, payload_digest, result_json, created_at) VALUES (?, ?, ?, ?, ?)", (idempotency_key, operation, self._payload_digest(payload), json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(",", ":")), _now_iso()))
-            conn.commit()
         except sqlite3.IntegrityError as exc:
-            conn.rollback()
             raise AssuranceWebConflictError(f"idempotency key {idempotency_key!r} was created concurrently") from exc
         except sqlite3.Error as exc:
-            conn.rollback()
             raise AssuranceWebError(f"failed to record idempotency result for {idempotency_key!r}: {exc}") from exc
-        finally:
-            conn.close()
 
     def _payload_digest(self, payload) -> str:
         canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def _touch_web_case(self, case_id, updated_at, *, metadata=_UNSET, evidence=(), findings=(), receipt=_UNSET) -> None:
-        conn = self._connect()
+    def _touch_web_case(
+        self,
+        conn,
+        case_id,
+        updated_at,
+        *,
+        metadata=_UNSET,
+        evidence=(),
+        findings=(),
+        receipt=_UNSET,
+    ) -> None:
         try:
-            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT metadata_json, evidence_json, findings_json, receipt_json FROM assurance_web_cases WHERE case_id = ?", (case_id,)).fetchone()
             data = {"metadata_json": "{}", "evidence_json": "[]", "findings_json": "[]", "receipt_json": None}
             if row is not None:
@@ -321,12 +429,8 @@ class AssuranceWebRepository:
                 conn.execute("INSERT INTO assurance_web_cases (case_id, metadata_json, evidence_json, findings_json, receipt_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (case_id, data["metadata_json"], data["evidence_json"], data["findings_json"], data["receipt_json"], updated_at_iso))
             else:
                 conn.execute("UPDATE assurance_web_cases SET metadata_json = ?, evidence_json = ?, findings_json = ?, receipt_json = ?, updated_at = ? WHERE case_id = ?", (data["metadata_json"], data["evidence_json"], data["findings_json"], data["receipt_json"], updated_at_iso, case_id))
-            conn.commit()
         except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError) as exc:
-            conn.rollback()
             raise AssuranceWebError(f"failed to update web case {case_id!r}: {exc}") from exc
-        finally:
-            conn.close()
 
     def _merge_by_id(self, stored, new_models, id_field) -> list:
         result = list(stored)
@@ -340,15 +444,9 @@ class AssuranceWebRepository:
                 result.append(data)
         return result
 
-    def _load_web_case(self, case_id) -> dict | None:
-        conn = self._connect()
-        try:
-            row = conn.execute("SELECT metadata_json, evidence_json, findings_json, receipt_json FROM assurance_web_cases WHERE case_id = ?", (case_id,)).fetchone()
-            return dict(row) if row is not None else None
-        except sqlite3.Error as exc:
-            raise AssuranceWebError(f"failed to load web case {case_id!r}: {exc}") from exc
-        finally:
-            conn.close()
+    def _load_web_case_in_transaction(self, conn, case_id) -> dict | None:
+        row = conn.execute("SELECT metadata_json, evidence_json, findings_json, receipt_json FROM assurance_web_cases WHERE case_id = ?", (case_id,)).fetchone()
+        return dict(row) if row is not None else None
 
     def _decode_models(self, raw, model_cls) -> tuple:
         try:

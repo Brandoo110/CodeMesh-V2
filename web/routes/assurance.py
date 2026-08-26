@@ -313,6 +313,38 @@ def decide_change(
     policy_refs = tuple(projection["case"]["policy_decision_refs"])
     if approval and not policy_refs:
         _fail(409, "POLICY_DECISION_REQUIRED", "approval requires a policy decision")
+    latest_policy = next(
+        (
+            decision
+            for decision in reversed(projection["decisions"])
+            if decision["kind"] == "policy"
+        ),
+        None,
+    )
+    if approval and latest_policy is not None:
+        policy_outcome = latest_policy["outcome"]
+        if policy_outcome in {"BLOCKED", "STALE"}:
+            _fail(
+                409,
+                "POLICY_BLOCKS_APPROVAL",
+                f"policy outcome {policy_outcome} does not allow approval",
+                f"POLICY_{policy_outcome}",
+            )
+        required_role = latest_policy.get("required_human_role")
+        if (
+            policy_outcome == "NEEDS_HUMAN"
+            and required_role is not None
+            and request.owner_role != required_role
+        ):
+            _fail(
+                403,
+                "POLICY_ROLE_REQUIRED",
+                f"policy requires human role {required_role}",
+                "HUMAN_ROLE_MISMATCH",
+            )
+    decision_policy_refs = (
+        (latest_policy["decision_id"],) if latest_policy is not None else ()
+    )
     if request.decision in {"approve_with_conditions", "waiver"}:
         if not request.conditions:
             _fail(422, "CONDITIONS_REQUIRED", "conditional approval requires conditions")
@@ -337,20 +369,20 @@ def decide_change(
     if request.decision == "reject":
         kind = "REJECT"
         facts = {
-            "policy_decision_refs": policy_refs,
+            "policy_decision_refs": decision_policy_refs,
             "human_decision_refs": (request.decision_id,),
         }
     elif request.decision == "approve":
         kind = "ACCEPT"
         facts = {
-            "policy_decision_refs": policy_refs,
+            "policy_decision_refs": decision_policy_refs,
             "human_decision_refs": (request.decision_id,),
         }
     else:
         kind = "CONDITIONALLY_ACCEPT"
         facts = {
             "conditions": request.conditions,
-            "policy_decision_refs": policy_refs,
+            "policy_decision_refs": decision_policy_refs,
             "human_decision_refs": (request.decision_id,),
         }
     event = AcceptanceEvent(
