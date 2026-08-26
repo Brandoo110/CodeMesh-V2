@@ -35,6 +35,11 @@ from web.assurance_store import (
 )
 
 router = APIRouter(prefix="/assurance", tags=["assurance"])
+# The mutation endpoints below are historical fixture seams.  They are kept
+# available only when the application explicitly opts into this router.
+fixture_mutation_router = APIRouter(
+    prefix="/assurance", tags=["assurance-fixtures"], include_in_schema=False
+)
 IdempotencyKey = Annotated[
     str, Header(alias="Idempotency-Key", min_length=1)
 ]
@@ -167,7 +172,7 @@ def _unique(*groups: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(result)
 
 
-@router.post("/changes", status_code=201)
+@fixture_mutation_router.post("/changes", status_code=201)
 def create_change(
     request: ChangeCreateRequest,
     idempotency_key: IdempotencyKey,
@@ -212,7 +217,7 @@ def get_change(
     return _case_projection(repository, change_id)
 
 
-@router.post("/changes/{change_id}/collect")
+@fixture_mutation_router.post("/changes/{change_id}/collect")
 def collect_evidence(
     change_id: str,
     request: CollectRequest,
@@ -251,7 +256,7 @@ def collect_evidence(
     )
 
 
-@router.post("/changes/{change_id}/review")
+@fixture_mutation_router.post("/changes/{change_id}/review")
 def review_change(
     change_id: str,
     request: ReviewRequest,
