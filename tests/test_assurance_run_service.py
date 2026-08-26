@@ -8,11 +8,17 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 import assurance.run_service as run_service_module
+from pydantic import SecretStr
 
 from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandSpec
+from assurance.fixed_reviewer_invoker import (
+    FixedOpenAICompatibleReviewerInvoker,
+    FixedReviewerEndpoint,
+)
 from assurance.run_service import (
     AssuranceRunBundle,
     AssuranceRunConfig,
@@ -107,7 +113,12 @@ class _Reviewer:
                 status=self.status,
                 provider=route.provider,
                 model_ref=route.model_ref,
-                error_code=self.status,
+                error_code={
+                    "failure": "REVIEWER_PROVIDER_FAILURE",
+                    "timeout": "REVIEWER_TIMEOUT",
+                    "cancelled": "REVIEWER_CANCELLED",
+                    "budget_exceeded": "REVIEWER_BUDGET_EXCEEDED",
+                }[self.status],
             )
         questions = ()
         if self.questions:
@@ -133,7 +144,7 @@ class _Reviewer:
             raw_response=json.dumps(payload, separators=(",", ":")).encode(),
             started_at=prompt.input.evaluated_at,
             completed_at=prompt.input.evaluated_at,
-            schema_status="valid",
+            schema_status="unverified",
             usage_status="unavailable",
         )
 
@@ -167,6 +178,7 @@ def _service(
     command_specs=None,
     freshness_ttl_seconds=300,
     clock=None,
+    reviewer_route=None,
 ):
     root = _repository(tmp_path)
     store = ArtifactStore(tmp_path / "artifacts")
@@ -193,7 +205,8 @@ def _service(
             rubric_version="single_general.v0",
             allowed_commands=command_specs,
             freshness_ttl_seconds=freshness_ttl_seconds,
-            reviewer_route=ReviewerRoute(
+            reviewer_route=reviewer_route
+            or ReviewerRoute(
                 provider="fake",
                 model_ref="fake-model",
                 timeout_seconds=30,
@@ -658,7 +671,7 @@ def test_invalid_reviewer_json_is_fail_closed(tmp_path):
                 raw_response=b"not-json",
                 started_at=prompt.input.evaluated_at,
                 completed_at=prompt.input.evaluated_at,
-                schema_status="valid",
+                schema_status="unverified",
             )
 
     service, intent = _service(tmp_path, reviewer=_InvalidJsonReviewer())
@@ -673,6 +686,202 @@ def test_invalid_reviewer_json_is_fail_closed(tmp_path):
     assert "error_message" not in result.bundle.reviewer.model_dump()
     assert result.bundle.execution_receipt.overall_result == "failure"
     assert result.bundle.policy.decision.outcome == "BLOCKED"
+
+
+def test_fixed_invoker_unverified_invalid_json_persists_raw_and_blocks(tmp_path):
+    route = ReviewerRoute(
+        provider="openai-compatible",
+        model_ref="reviewer-model",
+        timeout_seconds=5,
+        token_budget=64,
+        routing_rule="single_general.v0:fixed",
+    )
+    seen = []
+
+    async def handler(request):
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-invalid",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "reviewer-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "not-json"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    service, intent = _service(tmp_path, reviewer_route=route)
+    invoker = FixedOpenAICompatibleReviewerInvoker(
+        FixedReviewerEndpoint(
+            route=route,
+            base_url="https://reviewer.example/v1",
+            api_key=SecretStr("test-secret"),
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    service._reviewer_invoker = invoker
+
+    result = asyncio.run(
+        service.run(intent, idempotency_key="run-fixed-invalid-json")
+    )
+    asyncio.run(invoker.aclose())
+
+    assert len(seen) == 1
+    assert result.bundle.reviewer.status == "invalid_json"
+    assert result.bundle.reviewer.schema_status == "invalid"
+    assert result.bundle.reviewer.raw_response_artifact_digest is not None
+    assert service._artifact_store.verify(
+        result.bundle.reviewer.raw_response_artifact_digest
+    )
+    assert result.bundle.execution_receipt.overall_result == "failure"
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+
+
+def test_unverified_transport_is_normalized_before_persisting_valid(tmp_path):
+    class _UnverifiedReviewer(_Reviewer):
+        async def invoke(self, prompt, *, run_id, route):
+            self.calls += 1
+            payload = {
+                "schema_version": "v1",
+                "subject_digest": prompt.input.subject.subject_digest,
+                "rubric_hash": prompt.rubric_hash,
+                "findings": [],
+                "questions": [],
+            }
+            return ReviewerInvocationResponse(
+                status="success",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                raw_response=json.dumps(payload, separators=(",", ":")).encode(),
+                started_at=prompt.input.evaluated_at,
+                completed_at=prompt.input.evaluated_at,
+                schema_status="unverified",
+                usage_status="unavailable",
+            )
+
+    service, intent = _service(tmp_path, reviewer=_UnverifiedReviewer())
+    result = asyncio.run(service.run(intent, idempotency_key="run-unverified"))
+
+    assert result.bundle.reviewer.status == "success"
+    assert result.bundle.reviewer.schema_status == "valid"
+    assert all(step.schema_status == "valid" for step in result.bundle.execution_receipt.steps)
+    assert result.bundle.reviewer.schema_status != "unverified"
+    assert all(
+        step.schema_status != "unverified"
+        for step in result.bundle.execution_receipt.steps
+    )
+
+
+def test_reviewer_response_missing_error_code_is_not_overwritten(tmp_path):
+    class _MissingReviewer(_Reviewer):
+        async def invoke(self, prompt, *, run_id, route):
+            self.calls += 1
+            return ReviewerInvocationResponse(
+                status="failure",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                error_code="REVIEWER_RESPONSE_MISSING",
+            )
+
+    service, intent = _service(tmp_path, reviewer=_MissingReviewer())
+    result = asyncio.run(service.run(intent, idempotency_key="run-missing-response"))
+
+    assert result.bundle.reviewer.status == "failure"
+    assert result.bundle.reviewer.error_code == "REVIEWER_RESPONSE_MISSING"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"status": "success", "schema_status": "valid"},
+        {"status": "success", "error_code": "REVIEWER_PROVIDER_FAILURE"},
+        {"status": "success", "raw_response": b""},
+        {
+            "status": "failure",
+            "error_code": "REVIEWER_PROVIDER_FAILURE",
+            "raw_response": b"unexpected",
+        },
+        {
+            "status": "failure",
+            "error_code": "REVIEWER_PROVIDER_FAILURE",
+            "schema_status": "invalid",
+        },
+        {"status": "timeout", "error_code": "REVIEWER_PROVIDER_FAILURE"},
+        {
+            "status": "failure",
+            "error_code": "REVIEWER_PROVIDER_FAILURE",
+            "usage_status": "unavailable",
+            "input_tokens": 1,
+        },
+        {
+            "status": "success",
+            "usage_status": "measured",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cost_usd": None,
+        },
+    ),
+)
+def test_contradictory_transport_facts_fail_before_pass_or_commit(tmp_path, updates):
+    class _ContradictoryReviewer:
+        async def invoke(self, prompt, *, run_id, route):
+            values = {
+                "status": "success",
+                "provider": route.provider,
+                "model_ref": route.model_ref,
+                "raw_response": b"{}",
+                "schema_status": "unverified",
+                "usage_status": "unavailable",
+            }
+            values.update(updates)
+            return ReviewerInvocationResponse(**values)
+
+    service, intent = _service(tmp_path, reviewer=_ContradictoryReviewer())
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            service.run(intent, idempotency_key="run-contradictory-transport")
+        )
+
+    assert not any(call[0] == "commit" for call in service._committer.calls)
+
+
+@pytest.mark.parametrize("forge_kind", ("model_copy", "model_construct", "mapping"))
+def test_coerce_revalidates_forged_instance_and_mapping_before_commit(
+    tmp_path, forge_kind
+):
+    class _ForgedReviewer:
+        async def invoke(self, prompt, *, run_id, route):
+            values = {
+                "status": "success",
+                "provider": route.provider,
+                "model_ref": route.model_ref,
+                "raw_response": b"{}",
+                "schema_status": "unverified",
+                "usage_status": "unavailable",
+            }
+            valid = ReviewerInvocationResponse(**values)
+            if forge_kind == "model_copy":
+                return valid.model_copy(update={"schema_status": "valid"})
+            if forge_kind == "model_construct":
+                values["schema_status"] = "valid"
+                return ReviewerInvocationResponse.model_construct(**values)
+            values["schema_status"] = "valid"
+            return values
+
+    service, intent = _service(tmp_path, reviewer=_ForgedReviewer())
+
+    with pytest.raises(ValueError):
+        asyncio.run(service.run(intent, idempotency_key="run-forged-response"))
+
+    assert not any(call[0] == "commit" for call in service._committer.calls)
 
 
 def test_unknown_reviewer_exception_propagates_without_commit(tmp_path):

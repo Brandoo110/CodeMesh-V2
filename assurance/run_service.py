@@ -640,9 +640,9 @@ class ReviewerInvocationResponse(BaseModel):
     started_at: AwareDatetime | None = None
     completed_at: AwareDatetime | None = None
     raw_response: bytes | None = None
-    schema_status: Literal["valid", "repaired", "invalid", "not_produced"] = (
-        "not_produced"
-    )
+    schema_status: Literal[
+        "valid", "repaired", "unverified", "invalid", "not_produced"
+    ] = "not_produced"
     error_code: str | None = Field(default=None, min_length=1)
     error_message: str | None = Field(default=None, min_length=1)
 
@@ -655,18 +655,37 @@ class ReviewerInvocationResponse(BaseModel):
 
     @model_validator(mode="after")
     def _success_facts(self) -> "ReviewerInvocationResponse":
-        if self.status == "success" and self.raw_response is None:
-            raise ValueError("success response requires raw_response")
-        if self.status == "success" and self.schema_status not in ("valid", "repaired"):
-            raise ValueError("success response requires a valid or repaired schema")
-        if self.status != "success" and self.schema_status in ("valid", "repaired"):
-            raise ValueError("failed response must not claim a valid schema")
-        if self.usage_status == "measured" and (
-            self.input_tokens is None
-            or self.output_tokens is None
-            or self.cost_usd is None
+        expected_error_codes = {
+            "failure": {"REVIEWER_PROVIDER_FAILURE", "REVIEWER_RESPONSE_MISSING"},
+            "timeout": {"REVIEWER_TIMEOUT"},
+            "cancelled": {"REVIEWER_CANCELLED"},
+            "budget_exceeded": {"REVIEWER_BUDGET_EXCEEDED"},
+        }
+        if self.status == "success":
+            if self.schema_status != "unverified":
+                raise ValueError("transport success must be unverified")
+            if self.raw_response is None or not self.raw_response:
+                raise ValueError("transport success requires nonempty raw_response")
+            if self.error_code is not None or self.error_message is not None:
+                raise ValueError("transport success must not carry error facts")
+        else:
+            if self.raw_response is not None:
+                raise ValueError("failed response must not carry raw_response")
+            if self.schema_status != "not_produced":
+                raise ValueError("failed response must be not_produced")
+            if self.error_code not in expected_error_codes[self.status]:
+                raise ValueError("reviewer status and error_code do not match")
+            if self.error_message is not None:
+                raise ValueError("reviewer error_message is not a domain fact")
+        usage_values = (self.input_tokens, self.output_tokens, self.cost_usd)
+        if self.usage_status == "measured" and any(
+            value is None for value in usage_values
         ):
             raise ValueError("measured usage requires token and cost facts")
+        if self.usage_status == "unavailable" and any(
+            value is not None for value in usage_values
+        ):
+            raise ValueError("unavailable usage must not carry numeric facts")
         return self
 
 
@@ -1647,6 +1666,9 @@ class AssuranceRunService:
         if completed < started:
             completed = started
         if response.status != "success":
+            response_error_code = response.error_code
+            if response_error_code not in _REVIEWER_STATUS_ERROR_CODES[response.status]:
+                response_error_code = _REVIEWER_FAILURE_CODES[response.status]
             receipt = self._failure_receipt(
                 run_id=run_id,
                 subject_digest=subject.subject_digest,
@@ -1674,7 +1696,7 @@ class AssuranceRunService:
                     input_tokens=self._usage_value(response, "input_tokens"),
                     output_tokens=self._usage_value(response, "output_tokens"),
                     cost_usd=self._usage_value(response, "cost_usd"),
-                    error_code=_REVIEWER_FAILURE_CODES[response.status],
+                    error_code=response_error_code,
                 ),
                 (),
                 (),
@@ -1683,6 +1705,9 @@ class AssuranceRunService:
 
         raw = response.raw_response
         if type(raw) is not bytes:
+            response_error_code = response.error_code
+            if response_error_code not in _REVIEWER_STATUS_ERROR_CODES["failure"]:
+                response_error_code = "REVIEWER_RESPONSE_MISSING"
             receipt = self._failure_receipt(
                 run_id=run_id,
                 subject_digest=subject.subject_digest,
@@ -1710,13 +1735,16 @@ class AssuranceRunService:
                     input_tokens=self._usage_value(response, "input_tokens"),
                     output_tokens=self._usage_value(response, "output_tokens"),
                     cost_usd=self._usage_value(response, "cost_usd"),
-                    error_code="REVIEWER_RESPONSE_MISSING",
+                    error_code=response_error_code,
                 ),
                 (),
                 (),
                 receipt,
             )
         try:
+            invocation_schema_status = (
+                "valid" if response.schema_status == "unverified" else response.schema_status
+            )
             invocation = SingleReviewerInvocation(
                 schema_version="v1",
                 run_id=run_id,
@@ -1731,7 +1759,7 @@ class AssuranceRunService:
                 latency_ms=max(0, _latency_ms(started, completed)),
                 timeout_seconds=self._config.reviewer_route.timeout_seconds,
                 result="success",
-                schema_status=response.schema_status,
+                schema_status=invocation_schema_status,
                 fallback_reason=None,
                 tool_grants=(),
             )
@@ -1819,9 +1847,11 @@ class AssuranceRunService:
     @staticmethod
     def _coerce_invocation_response(value: Any) -> ReviewerInvocationResponse:
         if type(value) is ReviewerInvocationResponse:
-            return value
+            return ReviewerInvocationResponse.model_validate(
+                value.model_dump(mode="python")
+            )
         if isinstance(value, Mapping):
-            return ReviewerInvocationResponse.model_validate(value)
+            return ReviewerInvocationResponse.model_validate(dict(value))
         raise ValueError("reviewer invoker must return ReviewerInvocationResponse")
 
     @staticmethod
