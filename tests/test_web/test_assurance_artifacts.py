@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from assurance.artifacts import ArtifactNotFoundError, ArtifactStore
+from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandObservation
 from assurance.contracts import AcceptanceCase, Evidence
 from assurance.intake import IntakeDocument
@@ -272,9 +272,7 @@ def test_reader_rejects_external_cross_case_and_unreferenced_digests(tmp_path):
         reader.read_artifact("second", first_evidence.evidence_id, first_digest)
 
 
-def test_reader_fails_closed_for_missing_tampered_and_malformed_manifests(
-    tmp_path, monkeypatch
-):
+def test_reader_fails_closed_for_missing_tampered_and_malformed_manifests(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     repository = _new_repository(tmp_path)
     manifest_digest, _ = _intake_artifact(store, task_bytes=b"task\n")
@@ -283,18 +281,13 @@ def test_reader_fails_closed_for_missing_tampered_and_malformed_manifests(
     )
     _add_evidence(repository, case_id="manifest", evidence=evidence)
     reader = AssuranceArtifactReader(repository, store)
-    original_get_bytes = store.get_bytes
-
-    def missing(digest):
-        if digest == manifest_digest:
-            raise ArtifactNotFoundError(digest)
-        return original_get_bytes(digest)
-
-    monkeypatch.setattr(store, "get_bytes", missing)
+    manifest_path = store._artifact_path(manifest_digest)
+    original_manifest = manifest_path.read_bytes()
+    manifest_path.unlink()
     with pytest.raises(AssuranceWebNotFoundError):
         reader.list_artifacts("manifest", evidence.evidence_id)
 
-    monkeypatch.setattr(store, "get_bytes", original_get_bytes)
+    assert store.put_bytes(original_manifest) == manifest_digest
     malformed_digest = store.put_bytes(b'{"schema_version":"v1"}')
     malformed = _evidence(
         case_id="malformed", kind="command_batch", artifact_digest=malformed_digest
@@ -303,12 +296,7 @@ def test_reader_fails_closed_for_missing_tampered_and_malformed_manifests(
     with pytest.raises(AssuranceWebNotFoundError):
         reader.list_artifacts("malformed", malformed.evidence_id)
 
-    def tampered(digest):
-        if digest == manifest_digest:
-            return b"tampered"
-        return original_get_bytes(digest)
-
-    monkeypatch.setattr(store, "get_bytes", tampered)
+    manifest_path.write_bytes(b"tampered")
     with pytest.raises(AssuranceWebNotFoundError):
         reader.list_artifacts("manifest", evidence.evidence_id)
 
