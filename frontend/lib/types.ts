@@ -248,6 +248,40 @@ export interface AssuranceTimelineItem {
   reason?: string | null;
 }
 
+export type AssuranceActionCode =
+  | "approve"
+  | "reject"
+  | "approve_with_conditions"
+  | "waiver"
+  | "download_passport"
+  | (string & {});
+
+export interface AssuranceAction {
+  code: AssuranceActionCode;
+  required_human_role: string | null;
+  self_approval_forbidden: boolean;
+  high_risk_confirmation_required: boolean;
+}
+
+export interface AssurancePolicyGate {
+  status: string;
+  decision_id: string | null;
+  reason_codes: string[];
+  required_human_role: string | null;
+  waiver_ref: string | null;
+  evaluated_at: string | null;
+}
+
+export interface AssuranceReleaseState {
+  status: string;
+  observation_id: string | null;
+  environment: string | null;
+  deployment_id: string | null;
+  source: string | null;
+  trust_level: string | null;
+  recorded_at: string | null;
+}
+
 export interface AssuranceProjection {
   case: AssuranceCaseState;
   binding: {
@@ -263,6 +297,13 @@ export interface AssuranceProjection {
   decisions: Array<Record<string, unknown> & { kind: "policy" | "human" }>;
   timeline: AssuranceTimelineItem[];
   revision: number;
+  schema_version: "v1";
+  case_id: string;
+  subject_digest: string;
+  policy_gate: AssurancePolicyGate;
+  acceptance_state: string;
+  release_state: AssuranceReleaseState;
+  allowed_actions: AssuranceAction[];
   gate: string;
   digest_freshness: boolean;
   attention_reason: string | null;
