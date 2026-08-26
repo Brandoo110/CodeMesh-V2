@@ -564,6 +564,33 @@ class TaskPolicyCollector:
             evidence=evidence,
         )
 
+    def probe_task_digest(
+        self,
+        repository_path: Path,
+        *,
+        task_path: str,
+    ) -> str:
+        if not isinstance(repository_path, Path):
+            raise TypeError("repository_path must be a pathlib.Path")
+        if type(task_path) is not str:
+            raise TypeError("task_path must be a str")
+
+        root = self._resolve_repository_root(repository_path)
+        validated_task_path = self._validate_path(task_path)
+        present, missing = self._inspect_present(
+            root,
+            [("task_spec", validated_task_path)],
+        )
+        if missing or not present:
+            raise IntakePathError(
+                f"task path must be an existing regular file: "
+                f"{validated_task_path}"
+            )
+
+        _, inspected_path, _, pre, digest = present[0]
+        self._revalidate_file(root, inspected_path, pre, digest)
+        return digest
+
     def _resolve_repository_root(self, repository_path: Path) -> Path:
         try:
             stat_result = repository_path.lstat()

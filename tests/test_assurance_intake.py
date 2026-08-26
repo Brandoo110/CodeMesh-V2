@@ -247,13 +247,151 @@ def test_public_api_imports_and_collect_signature():
         "runbook_paths",
         "collected_at",
     ]
+    probe_signature = inspect.signature(TaskPolicyCollector.probe_task_digest)
+    assert list(probe_signature.parameters) == [
+        "self",
+        "repository_path",
+        "task_path",
+    ]
+    assert probe_signature.parameters["task_path"].kind is (
+        inspect.Parameter.KEYWORD_ONLY
+    )
+    assert probe_signature.return_annotation is str
 
 
 def test_collector_has_no_public_knobs_or_extra_methods():
     collector = TaskPolicyCollector()
     assert [name for name in dir(collector) if not name.startswith("_")] == [
-        "collect"
+        "collect",
+        "probe_task_digest",
     ]
+
+
+def test_probe_task_digest_repeats_raw_sha256_and_collect_snapshot_digest(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    raw = b"---\ntitle: T\nowner: o\n---\n- [ ] probe\n"
+    _write(repo, "task.md", raw)
+
+    collector = TaskPolicyCollector()
+    first = collector.probe_task_digest(repo, task_path="task.md")
+    second = collector.probe_task_digest(repo, task_path="task.md")
+    snapshot = _collect(
+        repo,
+        ArtifactStore(tmp_path / "artifacts"),
+        task_path="task.md",
+    ).snapshot
+
+    assert first == second == _sha256(raw)
+    assert first == snapshot.task_digest
+
+
+def test_probe_task_digest_reuses_safe_intake_seams_without_path_read_bytes(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    raw = b"---\ntitle: T\nowner: o\n---\n- [ ] probe\n"
+    _write(repo, "task.md", raw)
+    collector = TaskPolicyCollector()
+    calls = []
+
+    original_root = collector._resolve_repository_root
+    original_validate = collector._validate_path
+    original_inspect = collector._inspect_present
+    original_revalidate = collector._revalidate_file
+
+    def wrapped_root(path):
+        calls.append(("root", path))
+        return original_root(path)
+
+    def wrapped_validate(path):
+        calls.append(("validate", path))
+        return original_validate(path)
+
+    def wrapped_inspect(root, declared):
+        calls.append(("inspect", root, declared))
+        return original_inspect(root, declared)
+
+    def wrapped_revalidate(root, path, pre, digest):
+        calls.append(("revalidate", root, path, pre, digest))
+        return original_revalidate(root, path, pre, digest)
+
+    monkeypatch.setattr(collector, "_resolve_repository_root", wrapped_root)
+    monkeypatch.setattr(collector, "_validate_path", wrapped_validate)
+    monkeypatch.setattr(collector, "_inspect_present", wrapped_inspect)
+    monkeypatch.setattr(collector, "_revalidate_file", wrapped_revalidate)
+
+    def forbidden_read_bytes(*args, **kwargs):
+        raise AssertionError("probe must use the intake safe read seam")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+
+    digest = collector.probe_task_digest(repo, task_path="task.md")
+
+    assert digest == _sha256(raw)
+    assert [call[0] for call in calls] == [
+        "root",
+        "validate",
+        "inspect",
+        "revalidate",
+    ]
+    assert calls[2][1:] == (repo, [("task_spec", "task.md")])
+    assert calls[3][1:3] == (repo, "task.md")
+    assert calls[3][4] == digest
+
+
+@pytest.mark.parametrize("task_path", ["missing.md", "../task.md"])
+def test_probe_task_digest_rejects_missing_or_noncanonical_task_path(
+    tmp_path,
+    task_path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    with pytest.raises(IntakePathError):
+        TaskPolicyCollector().probe_task_digest(repo, task_path=task_path)
+
+
+def test_probe_task_digest_rejects_non_path_repository_and_non_string_task(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo, "task.md", b"task\n")
+    collector = TaskPolicyCollector()
+
+    with pytest.raises(TypeError):
+        collector.probe_task_digest(str(repo), task_path="task.md")
+    with pytest.raises(TypeError):
+        collector.probe_task_digest(repo, task_path=123)
+
+
+def test_probe_task_digest_fails_on_same_lstat_same_size_content_drift(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = _write(
+        repo, "task.md", b"---\ntitle: T\nowner: o\n---\n- [ ] ok\n"
+    )
+    original = intake_module._read_regular_file
+
+    def mutate_fingerprint(path):
+        raw = original(path)
+        stat_result = path.stat()
+        path.write_bytes(raw.replace(b"ok", b"no"))
+        os.utime(path, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns))
+        return raw
+
+    monkeypatch.setattr(intake_module, "_read_regular_file", mutate_fingerprint)
+    with pytest.raises(IntakeChangedError, match="content"):
+        TaskPolicyCollector().probe_task_digest(repo, task_path="task.md")
+    assert target.read_bytes() == b"---\ntitle: T\nowner: o\n---\n- [ ] no\n"
 
 
 def test_package_exports_preserve_prior_names_and_add_p2_02_api():
