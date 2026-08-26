@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import stat
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -27,6 +28,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     field_validator,
     model_validator,
@@ -94,6 +96,46 @@ _REVIEWER_FAILURE_CODES = {
     "cancelled": "REVIEWER_CANCELLED",
     "budget_exceeded": "REVIEWER_BUDGET_EXCEEDED",
 }
+_REVIEWER_ERROR_CODES = frozenset(
+    {
+        "REDACTION_UNSAFE",
+        "REVIEWER_PROVIDER_FAILURE",
+        "REVIEWER_TIMEOUT",
+        "REVIEWER_CANCELLED",
+        "REVIEWER_BUDGET_EXCEEDED",
+        "REVIEWER_RESPONSE_MISSING",
+        "REVIEWER_INVALID_JSON",
+    }
+)
+_REVIEWER_STATUS_ERROR_CODES = {
+    "failure": frozenset({"REVIEWER_PROVIDER_FAILURE", "REVIEWER_RESPONSE_MISSING"}),
+    "timeout": frozenset({"REVIEWER_TIMEOUT"}),
+    "cancelled": frozenset({"REVIEWER_CANCELLED"}),
+    "budget_exceeded": frozenset({"REVIEWER_BUDGET_EXCEEDED"}),
+    "blocked_redaction": frozenset({"REDACTION_UNSAFE"}),
+    "invalid_json": frozenset({"REVIEWER_INVALID_JSON"}),
+}
+_DEFAULT_GIT_COLLECTOR_PROFILE = {
+    "max_diff_bytes": 262144,
+    "max_files": 500,
+    "max_file_bytes": 5_000_000,
+    "command_timeout_seconds": 10.0,
+}
+_CREDENTIAL_MARKERS = (
+    "token=",
+    "access_token=",
+    "api_key=",
+    "apikey=",
+    "password=",
+    "passwd=",
+    "secret=",
+    "private_key=",
+    "ghp_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "-----begin ",
+)
 
 
 def _sha256(data: bytes) -> str:
@@ -176,6 +218,177 @@ class RedactionDisposition(str, Enum):
     NOT_APPLICABLE = "not_applicable"
     CONTAINS_UNREDACTED_CONTENT = "contains_unredacted_content"
     NOT_ASSESSED = "not_assessed"
+
+
+def _validate_repository_identity(value: str) -> str:
+    """Return a canonical logical identity, refusing credential-bearing URLs."""
+
+    try:
+        normalized = normalize_repository_identity(value)
+    except (TypeError, ValueError):
+        raise
+    lowered = normalized.lower()
+    windows_drive = (
+        len(normalized) >= 2
+        and normalized[0].isalpha()
+        and normalized[1] == ":"
+    )
+    local_path_shape = (
+        normalized.startswith(("/", "~", "./", "../"))
+        or normalized in {".", ".."}
+        or windows_drive
+        or lowered.startswith("file:")
+    )
+    if "\x00" in normalized or "?" in normalized or "#" in normalized:
+        raise ValueError("repository_identity must not contain NUL, query, or fragment")
+    if local_path_shape:
+        raise ValueError("repository_identity must be a logical identity")
+    if any(marker in lowered for marker in _CREDENTIAL_MARKERS):
+        raise ValueError("repository_identity must not contain credential-like material")
+    parsed = urlsplit(normalized)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("repository_identity must not contain URL userinfo")
+    # ``urlsplit`` only exposes userinfo for URL-shaped values; reject a raw
+    # at-sign as well so logical identities cannot smuggle an ambiguous URL.
+    if "@" in normalized:
+        raise ValueError("repository_identity must not contain URL userinfo")
+    return normalized
+
+
+class GitCollectorProfile(BaseModel):
+    """The immutable limits actually used by the Git snapshot collector."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["v1"] = "v1"
+    max_diff_bytes: StrictInt = Field(gt=0)
+    max_files: StrictInt = Field(gt=0)
+    max_file_bytes: StrictInt = Field(gt=0)
+    command_timeout_seconds: StrictFloat = Field(gt=0)
+
+    @field_validator("command_timeout_seconds")
+    @classmethod
+    def _finite_timeout(cls, value: float) -> float:
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("command_timeout_seconds must be finite")
+        return value
+
+
+class FreshnessSourceBinding(BaseModel):
+    """Local-only source facts for a committed run.
+
+    This model is deliberately stored in a separate SQLite column.  Its
+    repository path is useful for local freshness audits but must never cross
+    the public bundle/projection boundary.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["v1"] = "v1"
+    repository_path: Path
+    repository_identity: str = Field(min_length=1)
+    requested_base_ref: str = Field(min_length=1)
+    resolved_base_revision: str = Field(min_length=1)
+    task_path: str = Field(min_length=1)
+    policy_paths: tuple[str, ...] = ()
+    adr_paths: tuple[str, ...] = ()
+    runbook_paths: tuple[str, ...] = ()
+    policy_version: str = Field(min_length=1)
+    rubric_version: str = Field(min_length=1)
+    attachment_digests: tuple[str, ...] = ()
+    git_collector_profile: GitCollectorProfile
+    subject: ChangeSubject
+    author: str = Field(min_length=1)
+    author_provenance: Literal["caller_declared"] = "caller_declared"
+
+    @field_validator("repository_path")
+    @classmethod
+    def _absolute_repository_path(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("repository_path must be absolute")
+        return value
+
+    @field_validator("repository_identity")
+    @classmethod
+    def _safe_identity(cls, value: str) -> str:
+        return _validate_repository_identity(value)
+
+    @field_validator("requested_base_ref")
+    @classmethod
+    def _base_ref(cls, value: str) -> str:
+        if value.startswith("-") or any(char.isspace() for char in value) or "\x00" in value:
+            raise ValueError("requested_base_ref contains forbidden characters")
+        return value
+
+    @field_validator("resolved_base_revision")
+    @classmethod
+    def _full_revision(cls, value: str) -> str:
+        if len(value) not in (40, 64) or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError("resolved_base_revision must be a full lowercase SHA")
+        return value
+
+    @field_validator("task_path", "policy_paths", "adr_paths", "runbook_paths", mode="before")
+    @classmethod
+    def _paths(cls, value: object, info) -> object:
+        if info.field_name == "task_path":
+            if type(value) is not str:
+                raise ValueError("task_path must be a string")
+            normalized = normalize_repo_path(value)
+            if normalized != value or not value.endswith(".md"):
+                raise ValueError("task_path must be a canonical .md path")
+            return value
+        if type(value) not in (tuple, list):
+            raise ValueError(f"{info.field_name} must be a tuple or list")
+        result = []
+        seen = set()
+        for item in value:
+            if type(item) is not str:
+                raise ValueError(f"{info.field_name} must contain strings")
+            normalized = normalize_repo_path(item)
+            if normalized != item or not item.endswith(".md"):
+                raise ValueError(f"{info.field_name} must contain canonical .md paths")
+            if item in seen:
+                raise ValueError(f"{info.field_name} must be unique")
+            seen.add(item)
+            result.append(item)
+        return tuple(result)
+
+    @field_validator("attachment_digests", mode="before")
+    @classmethod
+    def _attachments(cls, value: object) -> tuple[str, ...]:
+        if type(value) not in (tuple, list):
+            raise ValueError("attachment_digests must be a tuple or list")
+        result = tuple(value)
+        if any(
+            type(item) is not str
+            or len(item) != 71
+            or not item.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in item[7:])
+            for item in result
+        ):
+            raise ValueError("attachment_digests must contain sha256 digests")
+        if len(set(result)) != len(result):
+            raise ValueError("attachment_digests must be unique")
+        return result
+
+    @field_validator("author")
+    @classmethod
+    def _author_nonblank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("author must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def _bind_source_facts(self) -> "FreshnessSourceBinding":
+        if self.subject.repository != self.repository_identity:
+            raise ValueError("source repository identity must match subject")
+        if self.subject.base_revision != self.resolved_base_revision:
+            raise ValueError("source base revision must match subject")
+        if self.subject.policy_version != self.policy_version:
+            raise ValueError("source policy version must match subject")
+        return self
 
 
 class ReviewerRoute(BaseModel):
@@ -281,6 +494,8 @@ class AssuranceRunIntent(BaseModel):
 
     repository_path: Path
     repository_identity: str = Field(min_length=1)
+    author: str = Field(min_length=1)
+    author_provenance: Literal["caller_declared"] = "caller_declared"
     base_ref: str = Field(min_length=1)
     task_path: str = Field(min_length=1)
     policy_paths: tuple[str, ...] = ()
@@ -295,7 +510,19 @@ class AssuranceRunIntent(BaseModel):
         "within_declared_boundary", "crosses_declared_boundary", "unknown"
     ] = "unknown"
 
-    @field_validator("repository_identity", "base_ref")
+    @field_validator("repository_identity")
+    @classmethod
+    def _repository_identity(cls, value: str) -> str:
+        return _validate_repository_identity(value)
+
+    @field_validator("author")
+    @classmethod
+    def _author(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("author must not be blank")
+        return value
+
+    @field_validator("base_ref")
     @classmethod
     def _nonblank_text(cls, value: str) -> str:
         if not value.strip():
@@ -461,8 +688,8 @@ class ReviewerRunRecord(BaseModel):
     rubric_version: str = Field(min_length=1)
     prompt_id: str | None = Field(default=None, pattern=r"^srp_[0-9a-f]{32}$")
     prompt_digest: str | None = Field(default=None, pattern=_SHA256_RE)
-    actual_provider: str | None = None
-    actual_model_ref: str | None = None
+    actual_provider: str | None = Field(default=None, min_length=1)
+    actual_model_ref: str | None = Field(default=None, min_length=1)
     schema_status: Literal["valid", "repaired", "invalid", "not_produced"]
     raw_response_artifact_digest: str | None = Field(
         default=None, pattern=_SHA256_RE
@@ -472,7 +699,197 @@ class ReviewerRunRecord(BaseModel):
     )
     result_id: str | None = Field(default=None, pattern=r"^srr_[0-9a-f]{32}$")
     result_digest: str | None = Field(default=None, pattern=_SHA256_RE)
-    error_code: str | None = None
+    usage_status: Literal["measured", "unavailable"] = "unavailable"
+    input_tokens: StrictInt | None = Field(default=None, ge=0)
+    output_tokens: StrictInt | None = Field(default=None, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+    error_code: Literal[
+        "REDACTION_UNSAFE",
+        "REVIEWER_PROVIDER_FAILURE",
+        "REVIEWER_TIMEOUT",
+        "REVIEWER_CANCELLED",
+        "REVIEWER_BUDGET_EXCEEDED",
+        "REVIEWER_RESPONSE_MISSING",
+        "REVIEWER_INVALID_JSON",
+    ] | None = None
+
+    @model_validator(mode="after")
+    def _state_and_usage_facts(self) -> "ReviewerRunRecord":
+        if (self.prompt_id is None) != (self.prompt_digest is None):
+            raise ValueError("reviewer prompt references must be provided together")
+        if (self.actual_provider is None) != (self.actual_model_ref is None):
+            raise ValueError("reviewer actual provider/model must be provided together")
+        if self.actual_provider is not None and not self.actual_provider.strip():
+            raise ValueError("reviewer actual provider must be nonblank")
+        if self.actual_model_ref is not None and not self.actual_model_ref.strip():
+            raise ValueError("reviewer actual model must be nonblank")
+        if self.error_code is not None and self.error_code not in _REVIEWER_ERROR_CODES:
+            raise ValueError("reviewer error_code is not a stable enum value")
+        if self.status == "success":
+            if self.error_code is not None:
+                raise ValueError("successful reviewer must not carry an error code")
+            expected_error_codes = ()
+        else:
+            expected_error_codes = _REVIEWER_STATUS_ERROR_CODES[self.status]
+            if self.error_code not in expected_error_codes:
+                raise ValueError("reviewer status and error_code do not match")
+
+        if self.status == "success":
+            success_refs = (
+                self.prompt_id,
+                self.prompt_digest,
+                self.actual_provider,
+                self.actual_model_ref,
+                self.raw_response_artifact_digest,
+                self.canonical_response_digest,
+                self.result_id,
+                self.result_digest,
+            )
+            if any(value is None for value in success_refs):
+                raise ValueError("successful reviewer must contain complete result facts")
+            if self.schema_status not in ("valid", "repaired"):
+                raise ValueError("successful reviewer must have a valid schema")
+        elif self.status == "invalid_json":
+            if any(
+                value is None
+                for value in (
+                    self.prompt_id,
+                    self.prompt_digest,
+                    self.actual_provider,
+                    self.actual_model_ref,
+                    self.raw_response_artifact_digest,
+                )
+            ):
+                raise ValueError("invalid_json reviewer must retain prompt, route, and raw facts")
+            if self.schema_status != "invalid":
+                raise ValueError("invalid_json reviewer must have an invalid schema")
+            if any(
+                value is not None
+                for value in (
+                    self.canonical_response_digest,
+                    self.result_id,
+                    self.result_digest,
+                )
+            ):
+                raise ValueError("invalid_json reviewer must not carry canonical or result facts")
+        else:
+            if self.status == "blocked_redaction":
+                expected_facts = (
+                    self.prompt_id,
+                    self.prompt_digest,
+                    self.actual_provider,
+                    self.actual_model_ref,
+                    self.raw_response_artifact_digest,
+                    self.canonical_response_digest,
+                    self.result_id,
+                    self.result_digest,
+                )
+                if any(value is not None for value in expected_facts):
+                    raise ValueError("redaction-blocked reviewer must not carry prompt, route, or result facts")
+                if self.usage_status != "unavailable" or any(
+                    value is not None
+                    for value in (self.input_tokens, self.output_tokens, self.cost_usd)
+                ):
+                    raise ValueError("redaction-blocked reviewer usage must be unavailable")
+            elif any(
+                value is None
+                for value in (
+                    self.prompt_id,
+                    self.prompt_digest,
+                    self.actual_provider,
+                    self.actual_model_ref,
+                )
+            ):
+                raise ValueError("failed reviewer must retain prompt and route facts")
+            if any(
+                value is not None
+                for value in (
+                    self.raw_response_artifact_digest,
+                    self.canonical_response_digest,
+                    self.result_id,
+                    self.result_digest,
+                )
+            ):
+                raise ValueError("failed reviewer must not carry success result facts")
+            if self.schema_status != "not_produced":
+                raise ValueError("failed reviewer must not claim a produced schema")
+            if self.status == "blocked_redaction":
+                if self.schema_status != "not_produced":
+                    raise ValueError("redaction-blocked reviewer must not claim a schema")
+        if self.usage_status == "measured" and (
+            self.input_tokens is None
+            or self.output_tokens is None
+            or self.cost_usd is None
+        ):
+            raise ValueError("measured usage requires token and cost facts")
+        if self.usage_status == "unavailable" and any(
+            value is not None
+            for value in (self.input_tokens, self.output_tokens, self.cost_usd)
+        ):
+            raise ValueError("unavailable usage must not carry numeric facts")
+        return self
+
+
+def _validate_reviewer_receipt_binding(
+    reviewer: ReviewerRunRecord, receipt: ExecutionReceipt
+) -> None:
+    """Require the auditable reviewer record and receipt to describe one call."""
+
+    expected_results = {
+        "success": ("success", "success"),
+        "failure": ("failure", "failure"),
+        "timeout": ("timeout", "failure"),
+        "cancelled": ("cancelled", "cancelled"),
+        "budget_exceeded": ("failure", "failure"),
+        "blocked_redaction": ("blocked", "blocked"),
+        "invalid_json": ("failure", "failure"),
+    }
+    expected_step_result, expected_overall = expected_results[reviewer.status]
+    if len(receipt.steps) != len(_REVIEWER_ROLES):
+        raise ValueError("reviewer receipt must contain one step per reviewer role")
+    if tuple(step.planned_role for step in receipt.steps) != _REVIEWER_ROLES:
+        raise ValueError("reviewer receipt roles must use the configured order")
+    route = reviewer.planned_route
+    for step in receipt.steps:
+        if (
+            step.routing_rule != route.routing_rule
+            or step.timeout_seconds != route.timeout_seconds
+            or step.token_budget != route.token_budget
+            or step.tool_grants != route.tool_grants
+        ):
+            raise ValueError("reviewer receipt route facts do not match planned route")
+        if step.result != expected_step_result:
+            raise ValueError("reviewer status does not match receipt step result")
+        if step.schema_status != reviewer.schema_status:
+            raise ValueError("reviewer schema status does not match receipt")
+        if reviewer.status == "blocked_redaction":
+            if (
+                step.actual_role is not None
+                or step.model_ref is not None
+                or step.provider is not None
+            ):
+                raise ValueError("redaction-blocked receipt must not expose actual route")
+        elif (
+            step.actual_role != step.planned_role
+            or step.model_ref != reviewer.actual_model_ref
+            or step.provider != reviewer.actual_provider
+        ):
+            raise ValueError("reviewer receipt actual route does not match record")
+    if receipt.overall_result != expected_overall:
+        raise ValueError("reviewer status does not match receipt overall result")
+    if reviewer.usage_status == "measured":
+        if (
+            receipt.input_tokens != reviewer.input_tokens
+            or receipt.output_tokens != reviewer.output_tokens
+            or receipt.cost_usd != reviewer.cost_usd
+        ):
+            raise ValueError("measured reviewer usage does not match receipt")
+    elif (
+        receipt.input_tokens != 0
+        or receipt.output_tokens != 0
+        or receipt.cost_usd != 0.0
+    ):
+        raise ValueError("unavailable reviewer usage must remain zero in receipt")
 
 
 class AssuranceRunBundle(BaseModel):
@@ -500,6 +917,10 @@ class AssuranceRunBundle(BaseModel):
     execution_receipt: ExecutionReceipt
     policy: PolicyGateResult
     events: tuple[AcceptanceEvent, ...] = Field(min_length=1)
+    freshness_source_binding_digest: str = Field(pattern=_SHA256_RE)
+    freshness_source_binding: FreshnessSourceBinding = Field(
+        exclude=True, repr=False
+    )
     started_at: AwareDatetime
     completed_at: AwareDatetime
 
@@ -586,6 +1007,17 @@ class AssuranceRunBundle(BaseModel):
             raise ValueError("a run must never auto-accept a case")
         if self.case.state not in {"EVIDENCE_COLLECTED", "NEEDS_EVIDENCE"}:
             raise ValueError("run case must end in an evidence-gated state")
+        if self.freshness_source_binding.subject != self.subject:
+            raise ValueError("freshness source must bind to bundle subject")
+        if self.freshness_source_binding.repository_identity != self.subject.repository:
+            raise ValueError("freshness source repository must bind to subject")
+        if self.freshness_source_binding.author_provenance != "caller_declared":
+            raise ValueError("author provenance must remain caller_declared")
+        expected_source_digest = _sha256(
+            _canonical_bytes(self.freshness_source_binding.model_dump(mode="json"))
+        )
+        if self.freshness_source_binding_digest != expected_source_digest:
+            raise ValueError("freshness source binding digest does not match source")
         if self.reviewer.status == "success":
             if self.reviewer.result_id is None or self.reviewer.result_digest is None:
                 raise ValueError("successful reviewer must bind SingleReviewerResult")
@@ -602,6 +1034,7 @@ class AssuranceRunBundle(BaseModel):
             or self.reviewer.prompt_digest is None
         ):
             raise ValueError("invoked reviewer must bind its deterministic prompt")
+        _validate_reviewer_receipt_binding(self.reviewer, self.execution_receipt)
         state = AcceptanceMachineState(
             schema_version="v1",
             case=self.draft_case,
@@ -864,6 +1297,12 @@ class AssuranceRunService:
             manifest_result,
             fence_collection_at,
         )
+        freshness_source_binding = await asyncio.to_thread(
+            self._build_freshness_source_binding,
+            intent,
+            git_result,
+            subject,
+        )
 
         case, events = self._build_case_and_events(
             draft_case=draft_case,
@@ -896,6 +1335,10 @@ class AssuranceRunService:
             execution_receipt=receipt,
             policy=policy_result,
             events=events,
+            freshness_source_binding_digest=_sha256(
+                _canonical_bytes(freshness_source_binding.model_dump(mode="json"))
+            ),
+            freshness_source_binding=freshness_source_binding,
             started_at=started_at,
             completed_at=fence_at,
         )
@@ -922,7 +1365,7 @@ class AssuranceRunService:
         if not intent.repository_path.is_absolute():
             raise AssuranceRunValidationError("repository_path must be absolute")
         try:
-            normalize_repository_identity(intent.repository_identity)
+            _validate_repository_identity(intent.repository_identity)
         except (TypeError, ValueError) as exc:
             raise AssuranceRunValidationError("repository_identity is invalid") from exc
         if any(item not in self._allowed_command_ids for item in intent.command_ids):
@@ -1070,6 +1513,60 @@ class AssuranceRunService:
             created_at=created_at,
         )
 
+    def _build_freshness_source_binding(
+        self,
+        intent: AssuranceRunIntent,
+        git_result: GitSnapshotResult,
+        subject: ChangeSubject,
+    ) -> FreshnessSourceBinding:
+        """Capture final-fence local source facts without exposing them publicly."""
+
+        try:
+            resolved_path = intent.repository_path.resolve(strict=True)
+            path_stat = resolved_path.lstat()
+        except OSError as exc:
+            raise AssuranceRunStaleError(
+                "repository_path disappeared after final freshness fence"
+            ) from exc
+        if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISDIR(path_stat.st_mode):
+            raise AssuranceRunStaleError(
+                "repository_path must remain a real directory after final fence"
+            )
+        if git_result.snapshot.repository != subject.repository:
+            raise AssuranceRunStaleError("source repository identity does not match subject")
+        collector = self._git_collector
+        try:
+            profile_data = {
+                name: getattr(collector, name)
+                for name in _DEFAULT_GIT_COLLECTOR_PROFILE
+            }
+        except AttributeError as exc:
+            raise AssuranceRunStaleError(
+                "Git collector profile limits are unavailable"
+            ) from exc
+        try:
+            profile = GitCollectorProfile.model_validate(profile_data)
+        except Exception as exc:
+            raise AssuranceRunStaleError("Git collector profile is invalid") from exc
+        return FreshnessSourceBinding(
+            schema_version="v1",
+            repository_path=resolved_path,
+            repository_identity=subject.repository,
+            requested_base_ref=intent.base_ref,
+            resolved_base_revision=git_result.snapshot.base_revision,
+            task_path=intent.task_path,
+            policy_paths=intent.policy_paths,
+            adr_paths=intent.adr_paths,
+            runbook_paths=intent.runbook_paths,
+            policy_version=self._config.policy_version,
+            rubric_version=self._config.rubric_version,
+            attachment_digests=(),
+            git_collector_profile=profile,
+            subject=subject,
+            author=intent.author,
+            author_provenance=intent.author_provenance,
+        )
+
     async def _review(
         self,
         *,
@@ -1101,6 +1598,7 @@ class AssuranceRunService:
                     planned_route=self._config.reviewer_route,
                     rubric_version=self._config.rubric_version,
                     schema_status="not_produced",
+                    usage_status="unavailable",
                     error_code="REDACTION_UNSAFE",
                 ),
                 (),
@@ -1158,6 +1656,9 @@ class AssuranceRunService:
                 completed_at=completed,
                 actual_provider=actual_provider,
                 actual_model_ref=actual_model_ref,
+                input_tokens=self._usage_value(response, "input_tokens") or 0,
+                output_tokens=self._usage_value(response, "output_tokens") or 0,
+                cost_usd=self._usage_value(response, "cost_usd") or 0.0,
             )
             return (
                 ReviewerRunRecord(
@@ -1169,6 +1670,10 @@ class AssuranceRunService:
                     actual_provider=actual_provider,
                     actual_model_ref=actual_model_ref,
                     schema_status="not_produced",
+                    usage_status=self._usage_status(response),
+                    input_tokens=self._usage_value(response, "input_tokens"),
+                    output_tokens=self._usage_value(response, "output_tokens"),
+                    cost_usd=self._usage_value(response, "cost_usd"),
                     error_code=_REVIEWER_FAILURE_CODES[response.status],
                 ),
                 (),
@@ -1187,6 +1692,9 @@ class AssuranceRunService:
                 completed_at=completed,
                 actual_provider=actual_provider,
                 actual_model_ref=actual_model_ref,
+                input_tokens=self._usage_value(response, "input_tokens") or 0,
+                output_tokens=self._usage_value(response, "output_tokens") or 0,
+                cost_usd=self._usage_value(response, "cost_usd") or 0.0,
             )
             return (
                 ReviewerRunRecord(
@@ -1198,6 +1706,10 @@ class AssuranceRunService:
                     actual_provider=actual_provider,
                     actual_model_ref=actual_model_ref,
                     schema_status="not_produced",
+                    usage_status=self._usage_status(response),
+                    input_tokens=self._usage_value(response, "input_tokens"),
+                    output_tokens=self._usage_value(response, "output_tokens"),
+                    cost_usd=self._usage_value(response, "cost_usd"),
                     error_code="REVIEWER_RESPONSE_MISSING",
                 ),
                 (),
@@ -1236,6 +1748,7 @@ class AssuranceRunService:
                 self._artifact_store,
             )
             self._require_type(normalized, SingleReviewerResult, "reviewer normalization result")
+            receipt = self._bind_success_receipt_route(normalized.execution_receipt)
             return (
                 ReviewerRunRecord(
                     status="success",
@@ -1250,10 +1763,14 @@ class AssuranceRunService:
                     canonical_response_digest=normalized.canonical_response_digest,
                     result_id=normalized.result_id,
                     result_digest=normalized.result_digest,
+                    usage_status=self._usage_status(response),
+                    input_tokens=self._usage_value(response, "input_tokens"),
+                    output_tokens=self._usage_value(response, "output_tokens"),
+                    cost_usd=self._usage_value(response, "cost_usd"),
                 ),
                 normalized.findings,
                 normalized.questions,
-                normalized.execution_receipt,
+                receipt,
             )
         except (SingleReviewerPayloadError, SingleReviewerSubjectMismatchError):
             status: Literal["invalid_json"] = "invalid_json"
@@ -1273,6 +1790,9 @@ class AssuranceRunService:
                 completed_at=completed,
                 actual_provider=actual_provider,
                 actual_model_ref=actual_model_ref,
+                input_tokens=self._usage_value(response, "input_tokens") or 0,
+                output_tokens=self._usage_value(response, "output_tokens") or 0,
+                cost_usd=self._usage_value(response, "cost_usd") or 0.0,
             )
             return (
                 ReviewerRunRecord(
@@ -1285,6 +1805,10 @@ class AssuranceRunService:
                     actual_model_ref=actual_model_ref,
                     schema_status="invalid" if status == "invalid_json" else "not_produced",
                     raw_response_artifact_digest=raw_artifact_digest,
+                    usage_status=self._usage_status(response),
+                    input_tokens=self._usage_value(response, "input_tokens"),
+                    output_tokens=self._usage_value(response, "output_tokens"),
+                    cost_usd=self._usage_value(response, "cost_usd"),
                     error_code="REVIEWER_INVALID_JSON",
                 ),
                 (),
@@ -1300,6 +1824,51 @@ class AssuranceRunService:
             return ReviewerInvocationResponse.model_validate(value)
         raise ValueError("reviewer invoker must return ReviewerInvocationResponse")
 
+    @staticmethod
+    def _usage_status(response: ReviewerInvocationResponse) -> Literal[
+        "measured", "unavailable"
+    ]:
+        if response.usage_status == "measured" and all(
+            value is not None
+            for value in (response.input_tokens, response.output_tokens, response.cost_usd)
+        ):
+            return "measured"
+        return "unavailable"
+
+    @classmethod
+    def _usage_value(
+        cls, response: ReviewerInvocationResponse, name: str
+    ) -> int | float | None:
+        if cls._usage_status(response) != "measured":
+            return None
+        return getattr(response, name)
+
+    def _bind_success_receipt_route(
+        self, receipt: ExecutionReceipt
+    ) -> ExecutionReceipt:
+        """Bind normalized success steps to the configured immutable route."""
+
+        route = self._config.reviewer_route
+        steps = tuple(
+            step.model_copy(
+                update={
+                    "routing_rule": route.routing_rule,
+                    "token_budget": route.token_budget,
+                    "timeout_seconds": route.timeout_seconds,
+                    "tool_grants": route.tool_grants,
+                }
+            )
+            for step in receipt.steps
+        )
+        data = receipt.model_dump(mode="json")
+        data["receipt_id"] = "exr_" + "0" * 32
+        data["steps"] = [step.model_dump(mode="json") for step in steps]
+        rebound = ExecutionReceipt.model_validate(data)
+        body = rebound.model_dump(mode="json")
+        body.pop("receipt_id")
+        receipt_id = "exr_" + hashlib.sha256(_canonical_bytes(body)).hexdigest()[:32]
+        return rebound.model_copy(update={"receipt_id": receipt_id})
+
     def _failure_receipt(
         self,
         *,
@@ -1311,6 +1880,9 @@ class AssuranceRunService:
         completed_at: datetime,
         actual_provider: str | None,
         actual_model_ref: str | None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_usd: float = 0.0,
     ) -> ExecutionReceipt:
         if status == "blocked_redaction":
             steps = tuple(
@@ -1367,9 +1939,9 @@ class AssuranceRunService:
             subject_digest=subject_digest,
             steps=steps,
             overall_result=overall,
-            input_tokens=0,
-            output_tokens=0,
-            cost_usd=0.0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
             started_at=started_at,
             completed_at=completed_at,
         )
@@ -1530,11 +2102,14 @@ __all__ = [
     "AssuranceRunIntent",
     "AssuranceRunResult",
     "AssuranceRunService",
+    "FreshnessSourceBinding",
+    "GitCollectorProfile",
     "ReviewerContextBuilder",
     "ReviewerContextPlan",
     "ReviewerContextPlanEntry",
     "ReviewerInvocationResponse",
     "ReviewerInvoker",
     "ReviewerRoute",
+    "ReviewerRunRecord",
     "RunCommitter",
 ]

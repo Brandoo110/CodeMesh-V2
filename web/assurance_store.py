@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from pydantic import ValidationError
+from assurance.run_service import AssuranceRunBundle, AssuranceRunResult
 from assurance.contracts import (
     AcceptanceCase, Evidence, ExecutionReceipt, Finding,
     HumanDecision, PolicyDecision,
@@ -14,6 +15,21 @@ from assurance.lifecycle_store import SQLiteAssuranceLifecycleStore
 from assurance.state_machine import AcceptanceBinding, AcceptanceEvent
 from assurance.store import CaseNotFoundError
 from web.assurance_case_view import build_case_view
+from web.assurance_run_committer import (
+    AssuranceRunCommitter,
+    AssuranceRunConflictError,
+    AssuranceRunMigrationError,
+    AssuranceRunPersistenceError,
+    _assert_row_columns,
+    _canonical_json,
+    _validate_run_schema,
+    _ensure_run_schema,
+    _load_bundle_from_row,
+    _load_pointer,
+    _public_bundle_json,
+    _result_pointer,
+    _source_binding_json,
+)
 
 
 class AssuranceWebError(Exception):
@@ -39,6 +55,7 @@ class AssuranceWebRepository:
     def __init__(self, db_path: Path | None = None) -> None:
         self._db_path = Path(db_path or Path.home() / ".codemesh" / "assurance.sqlite")
         self._store = SQLiteAssuranceLifecycleStore(self._db_path)
+        self._run_committer = AssuranceRunCommitter(self)
 
     def initialize(self) -> None:
         self._store.initialize()
@@ -47,12 +64,288 @@ class AssuranceWebRepository:
             conn.execute("BEGIN")
             conn.execute("CREATE TABLE IF NOT EXISTS assurance_web_cases (case_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, evidence_json TEXT NOT NULL, findings_json TEXT NOT NULL, receipt_json TEXT, updated_at TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS assurance_web_idempotency (idempotency_key TEXT PRIMARY KEY, operation TEXT NOT NULL, payload_digest TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL)")
+            _ensure_run_schema(conn)
             conn.commit()
+        except AssuranceRunMigrationError:
+            conn.rollback()
+            raise
         except sqlite3.Error as exc:
             conn.rollback()
             raise AssuranceWebError(f"failed to initialize assurance web tables: {exc}") from exc
         finally:
             conn.close()
+
+    def lookup_run(
+        self, idempotency_key: str, request_digest: str
+    ) -> AssuranceRunResult | None:
+        """Return the durable winner for a run key, or ``None`` before work."""
+
+        try:
+            return self._run_committer.lookup_run(idempotency_key, request_digest)
+        except AssuranceRunConflictError as exc:
+            raise AssuranceWebConflictError(str(exc)) from exc
+        except AssuranceRunPersistenceError as exc:
+            raise AssuranceWebError(str(exc)) from exc
+
+    def commit_run(
+        self,
+        bundle: AssuranceRunBundle,
+        *,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> AssuranceRunResult:
+        """Persist a complete GP-03 bundle in one short SQLite transaction."""
+
+        try:
+            return self._run_committer.commit_run(
+                bundle,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+            )
+        except AssuranceRunConflictError as exc:
+            raise AssuranceWebConflictError(str(exc)) from exc
+        except AssuranceRunPersistenceError as exc:
+            raise AssuranceWebError(str(exc)) from exc
+
+    # RunCommitter's GP-02 short names make this repository directly usable as
+    # the service port while the explicit *_run methods remain discoverable.
+    def lookup(self, idempotency_key: str, request_digest: str):
+        return self.lookup_run(idempotency_key, request_digest)
+
+    def commit(self, bundle, *, idempotency_key: str, request_digest: str):
+        return self.commit_run(
+            bundle,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+
+    def _lookup_run_in_transaction_boundary(
+        self, idempotency_key: str, request_digest: str
+    ) -> AssuranceRunResult | None:
+        if type(idempotency_key) is not str or not idempotency_key.strip():
+            raise ValueError("idempotency_key must be nonblank")
+        if type(request_digest) is not str or not request_digest.startswith("sha256:"):
+            raise ValueError("request_digest must be a sha256 digest")
+        with self._store._transaction(write=False) as unit_of_work:
+            conn = unit_of_work.connection
+            # A read lookup must never mutate migration state.  Initialization
+            # owns schema creation; this boundary only verifies it.
+            _validate_run_schema(conn)
+            row = conn.execute(
+                "SELECT * FROM assurance_web_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            pointer = conn.execute(
+                "SELECT operation, payload_digest, result_json"
+                " FROM assurance_web_idempotency WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                if pointer is not None:
+                    if pointer["operation"] == "run":
+                        raise AssuranceRunPersistenceError(
+                            "run idempotency pointer exists without its run row"
+                        )
+                    raise AssuranceRunConflictError(
+                        "idempotency key is already used by another operation"
+                    )
+                return None
+            if row["request_digest"] != request_digest:
+                raise AssuranceRunConflictError(
+                    "idempotency key is bound to another request digest"
+                )
+            bundle = _load_bundle_from_row(row)
+            _assert_row_columns(row, bundle)
+            _load_pointer(conn, idempotency_key, bundle)
+            self._projection_in_transaction(unit_of_work, bundle.case.case_id)
+            return AssuranceRunResult(
+                run_id=bundle.run_id,
+                request_digest=bundle.request_digest,
+                cached=True,
+                bundle=bundle,
+            )
+
+    def _commit_run_in_transaction_boundary(
+        self,
+        bundle: AssuranceRunBundle,
+        *,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> AssuranceRunResult:
+        from web.assurance_run_committer import _validate_run_arguments
+
+        _validate_run_arguments(bundle, idempotency_key, request_digest)
+        public_json = _public_bundle_json(bundle)
+        source_json = _source_binding_json(bundle.freshness_source_binding)
+        if str(bundle.freshness_source_binding.repository_path) in public_json:
+            raise AssuranceRunPersistenceError(
+                "absolute repository path must remain in source binding only"
+            )
+        source_path = bundle.freshness_source_binding.repository_path
+        source_error = None
+        try:
+            resolved_source = source_path.resolve(strict=True)
+            source_stat = resolved_source.lstat()
+        except (OSError, RuntimeError) as exc:
+            source_error = AssuranceRunPersistenceError(
+                "freshness source repository is no longer available"
+            )
+            source_error.__cause__ = exc
+        else:
+            import stat
+
+            if (
+                not source_path.is_absolute()
+                or resolved_source != source_path
+                or stat.S_ISLNK(source_stat.st_mode)
+                or not stat.S_ISDIR(source_stat.st_mode)
+            ):
+                source_error = AssuranceRunPersistenceError(
+                    "freshness source repository must be an existing real directory"
+                )
+        if source_error is not None:
+            winner = self._lookup_run_in_transaction_boundary(
+                idempotency_key, request_digest
+            )
+            if winner is not None:
+                return winner
+            raise source_error
+
+        with self._store._transaction() as unit_of_work:
+            conn = unit_of_work.connection
+            # The repository is initialized before a commit.  Keeping the
+            # write transaction validation-only avoids an implicit migration
+            # competing with the idempotent run transaction.
+            _validate_run_schema(conn)
+            existing = conn.execute(
+                "SELECT * FROM assurance_web_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            pointer = conn.execute(
+                "SELECT operation, payload_digest, result_json"
+                " FROM assurance_web_idempotency WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_digest"] != request_digest:
+                    raise AssuranceRunConflictError(
+                        "idempotency key is bound to another request digest"
+                    )
+                winner = _load_bundle_from_row(existing)
+                _assert_row_columns(existing, winner)
+                _load_pointer(conn, idempotency_key, winner)
+                self._projection_in_transaction(unit_of_work, winner.case.case_id)
+                return AssuranceRunResult(
+                    run_id=winner.run_id,
+                    request_digest=winner.request_digest,
+                    cached=True,
+                    bundle=winner,
+                )
+            if pointer is not None:
+                if (
+                    pointer["operation"] != "run"
+                    or pointer["payload_digest"] != request_digest
+                ):
+                    raise AssuranceRunConflictError(
+                        "idempotency key is already used by another operation"
+                    )
+                raise AssuranceRunPersistenceError(
+                    "run idempotency pointer exists without its run row"
+                )
+
+            existing_case = conn.execute(
+                "SELECT case_id FROM assurance_cases WHERE case_id = ?",
+                (bundle.case.case_id,),
+            ).fetchone()
+            subject_case = conn.execute(
+                "SELECT case_id FROM assurance_cases WHERE subject_digest = ?",
+                (bundle.subject.subject_digest,),
+            ).fetchone()
+            if existing_case is not None or subject_case is not None:
+                raise AssuranceRunConflictError(
+                    "deterministic case already exists for another run key"
+                )
+
+            unit_of_work.create_case(bundle.draft_case, bundle.binding)
+            unit_of_work.append_policy_decision(
+                bundle.case.case_id, bundle.policy.decision
+            )
+            for event in bundle.events:
+                unit_of_work.append_event(bundle.case.case_id, event)
+            replayed = unit_of_work.load_case(bundle.case.case_id)
+            if replayed.case != bundle.case or replayed.applied_events != bundle.events:
+                raise AssuranceRunPersistenceError(
+                    "stored Case replay does not equal the complete run bundle"
+                )
+
+            source = bundle.freshness_source_binding
+            metadata = {
+                "author": source.author,
+                "author_provenance": source.author_provenance,
+                "risk": bundle.risk.classification.risk_level,
+                "run_id": bundle.run_id,
+            }
+            self._touch_web_case(
+                conn,
+                bundle.case.case_id,
+                bundle.case.updated_at,
+                metadata=metadata,
+                evidence=bundle.evidence,
+                findings=bundle.findings,
+                receipt=bundle.execution_receipt,
+            )
+            committed_at = bundle.completed_at.isoformat()
+            conn.execute(
+                "INSERT INTO assurance_web_runs (idempotency_key, request_digest,"
+                " run_id, case_id, subject_digest, bundle_json,"
+                " source_binding_json, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    idempotency_key,
+                    request_digest,
+                    bundle.run_id,
+                    bundle.case.case_id,
+                    bundle.subject.subject_digest,
+                    public_json,
+                    source_json,
+                    committed_at,
+                ),
+            )
+            projection = self._projection_in_transaction(
+                unit_of_work,
+                bundle.case.case_id,
+                require_run_pointers=False,
+            )
+            if projection["case"] != bundle.case.model_dump(mode="json"):
+                raise AssuranceRunPersistenceError(
+                    "committed projection Case does not equal bundle Case"
+                )
+            if projection["receipt"] != bundle.execution_receipt.model_dump(mode="json"):
+                raise AssuranceRunPersistenceError(
+                    "committed projection Receipt does not equal bundle Receipt"
+                )
+            pointer_data = _result_pointer(
+                bundle,
+                bundle_json=public_json,
+                source_binding_json=source_json,
+            )
+            conn.execute(
+                "INSERT INTO assurance_web_idempotency"
+                " (idempotency_key, operation, payload_digest, result_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    idempotency_key,
+                    "run",
+                    request_digest,
+                    _canonical_json(pointer_data),
+                    committed_at,
+                ),
+            )
+            return AssuranceRunResult(
+                run_id=bundle.run_id,
+                request_digest=request_digest,
+                cached=False,
+                bundle=bundle,
+            )
 
     def create_change(self, case, binding, metadata, idempotency_key, payload) -> dict:
         self._require_exact(case, AcceptanceCase, "case")
@@ -238,12 +531,19 @@ class AssuranceWebRepository:
         with self._store._transaction(write=False) as unit_of_work:
             return self._projection_in_transaction(unit_of_work, case_id)
 
-    def _projection_in_transaction(self, unit_of_work, case_id: str) -> dict:
+    def _projection_in_transaction(
+        self, unit_of_work, case_id: str, *, require_run_pointers: bool = True
+    ) -> dict:
         state = unit_of_work.load_case(case_id)
         binding = unit_of_work.get_binding(case_id)
         decisions = unit_of_work.list_decisions(case_id)
         web = self._load_web_case_in_transaction(
             unit_of_work.connection, case_id
+        )
+        runs = self._load_web_runs_in_transaction(
+            unit_of_work.connection,
+            case_id,
+            require_pointers=require_run_pointers,
         )
         release_observations = (
             self._store._list_release_observations_in_transaction(
@@ -251,11 +551,11 @@ class AssuranceWebRepository:
             )
         )
         return self._render_projection(
-            state, binding, decisions, web, release_observations
+            state, binding, decisions, web, release_observations, runs
         )
 
     def _render_projection(
-        self, state, binding, decisions, web, release_observations
+        self, state, binding, decisions, web, release_observations, runs=()
     ) -> dict:
         evidence = self._decode_models((web or {}).get("evidence_json", "[]"), Evidence)
         findings = self._decode_models((web or {}).get("findings_json", "[]"), Finding)
@@ -273,6 +573,67 @@ class AssuranceWebRepository:
             decisions_out.append(data)
         gate, attention = self._gate_and_attention(state, decisions)
         metadata = json.loads(web["metadata_json"]) if web is not None else None
+        questions_by_id = {}
+        reviewer_runs_by_id = {}
+        receipts_by_id = {}
+        for bundle in runs:
+            for question in bundle.questions:
+                question_data = question.model_dump(mode="json")
+                self._append_immutable_projection(
+                    questions_by_id,
+                    question_data["question_id"],
+                    question_data,
+                    "question",
+                )
+            reviewer = bundle.reviewer
+            reviewer_data = {
+                "run_id": bundle.run_id,
+                "status": reviewer.status,
+                "planned_route": reviewer.planned_route.model_dump(mode="json"),
+                "rubric_version": reviewer.rubric_version,
+                "prompt_id": reviewer.prompt_id,
+                "prompt_digest": reviewer.prompt_digest,
+                "actual_provider": reviewer.actual_provider,
+                "actual_model_ref": reviewer.actual_model_ref,
+                "schema_status": reviewer.schema_status,
+                "raw_response_artifact_digest": reviewer.raw_response_artifact_digest,
+                "canonical_response_digest": reviewer.canonical_response_digest,
+                "result_id": reviewer.result_id,
+                "result_digest": reviewer.result_digest,
+                "usage_status": reviewer.usage_status,
+                "input_tokens": reviewer.input_tokens,
+                "output_tokens": reviewer.output_tokens,
+                "cost_usd": reviewer.cost_usd,
+                "error_code": reviewer.error_code,
+            }
+            self._append_immutable_projection(
+                reviewer_runs_by_id, bundle.run_id, reviewer_data, "reviewer run"
+            )
+            receipt_data = bundle.execution_receipt.model_dump(mode="json")
+            self._append_immutable_projection(
+                receipts_by_id,
+                receipt_data["receipt_id"],
+                receipt_data,
+                "receipt",
+            )
+        questions = list(questions_by_id.values())
+        reviewer_runs = list(reviewer_runs_by_id.values())
+        receipts = list(receipts_by_id.values())
+        if receipts and receipt is not None and receipts[-1] != receipt.model_dump(mode="json"):
+            raise AssuranceWebError(
+                "legacy receipt disagrees with immutable run receipt"
+            )
+        if receipts and receipt is None:
+            receipt = ExecutionReceipt.model_validate(receipts[-1])
+        if runs:
+            self._crosscheck_legacy_run_projection(
+                web=web,
+                metadata=metadata,
+                evidence=evidence,
+                findings=findings,
+                receipt=receipt,
+                runs=runs,
+            )
         revision = len(state.applied_events) + len(decisions)
         digest_freshness = self._digest_freshness(
             state.case, binding, evidence, findings, receipt
@@ -284,6 +645,9 @@ class AssuranceWebRepository:
             "evidence": [item.model_dump(mode="json") for item in evidence],
             "findings": findings_out,
             "receipt": receipt.model_dump(mode="json") if receipt is not None else None,
+            "questions": questions,
+            "reviewer_runs": reviewer_runs,
+            "receipts": receipts,
             "decisions": decisions_out,
             "timeline": self._timeline(state, decisions, receipt),
             "revision": revision,
@@ -306,6 +670,68 @@ class AssuranceWebRepository:
             )
         )
         return projection
+
+    def _crosscheck_legacy_run_projection(
+        self,
+        *,
+        web,
+        metadata,
+        evidence,
+        findings,
+        receipt,
+        runs,
+    ) -> None:
+        if web is None or metadata is None:
+            raise AssuranceWebError("legacy projection is missing run metadata")
+        latest = runs[-1]
+        expected_metadata = {
+            "author": latest.freshness_source_binding.author,
+            "author_provenance": latest.freshness_source_binding.author_provenance,
+            "risk": latest.risk.classification.risk_level,
+            "run_id": latest.run_id,
+        }
+        if metadata != expected_metadata:
+            raise AssuranceWebError("legacy metadata disagrees with run bundle")
+
+        expected_evidence = {}
+        expected_findings = {}
+        for bundle in runs:
+            for item in bundle.evidence:
+                self._append_immutable_projection(
+                    expected_evidence,
+                    item.evidence_id,
+                    item.model_dump(mode="json"),
+                    "evidence",
+                )
+            for item in bundle.findings:
+                self._append_immutable_projection(
+                    expected_findings,
+                    item.finding_id,
+                    item.model_dump(mode="json"),
+                    "finding",
+                )
+        actual_evidence = [item.model_dump(mode="json") for item in evidence]
+        actual_findings = [item.model_dump(mode="json") for item in findings]
+        if actual_evidence != list(expected_evidence.values()):
+            raise AssuranceWebError("legacy evidence disagrees with run bundle")
+        if actual_findings != list(expected_findings.values()):
+            raise AssuranceWebError("legacy findings disagree with run bundle")
+        expected_receipt = latest.execution_receipt.model_dump(mode="json")
+        if receipt is None or receipt.model_dump(mode="json") != expected_receipt:
+            raise AssuranceWebError("legacy receipt disagrees with run bundle")
+
+    @staticmethod
+    def _append_immutable_projection(
+        destination: dict, item_id: str, value: dict, label: str
+    ) -> None:
+        existing = destination.get(item_id)
+        if existing is not None:
+            if existing != value:
+                raise AssuranceWebError(
+                    f"conflicting immutable {label} {item_id!r} in run projection"
+                )
+            return
+        destination[item_id] = value
 
     def _timeline(self, state, decisions, receipt) -> list:
         timeline = []
@@ -482,6 +908,30 @@ class AssuranceWebRepository:
     def _load_web_case_in_transaction(self, conn, case_id) -> dict | None:
         row = conn.execute("SELECT metadata_json, evidence_json, findings_json, receipt_json FROM assurance_web_cases WHERE case_id = ?", (case_id,)).fetchone()
         return dict(row) if row is not None else None
+
+    def _load_web_runs_in_transaction(
+        self, conn, case_id, *, require_pointers: bool = True
+    ) -> tuple:
+        rows = conn.execute(
+            "SELECT * FROM assurance_web_runs WHERE case_id = ?"
+            " ORDER BY committed_at ASC, run_id ASC",
+            (case_id,),
+        ).fetchall()
+        bundles = []
+        for row in rows:
+            try:
+                bundle = _load_bundle_from_row(row)
+                _assert_row_columns(row, bundle)
+                if require_pointers:
+                    _load_pointer(conn, row["idempotency_key"], bundle)
+            except AssuranceRunPersistenceError as exc:
+                raise AssuranceWebError(str(exc)) from exc
+            if bundle.case.case_id != case_id:
+                raise AssuranceWebError(
+                    "stored run case binding does not match projection"
+                )
+            bundles.append(bundle)
+        return tuple(bundles)
 
     def _decode_models(self, raw, model_cls) -> tuple:
         try:

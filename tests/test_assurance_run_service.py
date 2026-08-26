@@ -29,6 +29,7 @@ from assurance.run_service import (
     ReviewerContextPlanEntry,
     ReviewerInvocationResponse,
     ReviewerRoute,
+    ReviewerRunRecord,
 )
 
 
@@ -203,6 +204,7 @@ def _service(
     intent = AssuranceRunIntent(
         repository_path=root,
         repository_identity="example/service",
+        author="author-agent",
         base_ref="HEAD",
         task_path="TASK.md",
         policy_paths=("POLICY.md",),
@@ -219,14 +221,73 @@ def test_intent_rejects_duplicate_or_empty_command_ids_before_io(tmp_path):
         AssuranceRunIntent(
             repository_path=tmp_path / "does-not-exist",
             repository_identity="example/service",
+            author="author-agent",
             base_ref="HEAD",
             task_path="TASK.md",
             command_ids=("check", "check"),
         )
+
+
+@pytest.mark.parametrize(
+    "repository_identity",
+    (
+        "/tmp/repository",
+        "//server/share/repository",
+        "C:/repository",
+        "C:\\repository",
+        "~",
+        "~/repository",
+        "file:///tmp/repository",
+    ),
+)
+def test_intent_rejects_path_like_repository_identity(tmp_path, repository_identity):
+    service, intent = _service(tmp_path)
+    payload = intent.model_dump()
+    payload["repository_identity"] = repository_identity
+
+    with pytest.raises(ValueError):
+        AssuranceRunIntent.model_validate(payload)
+
+    payload["repository_identity"] = "github.com/org/repository"
+    assert AssuranceRunIntent.model_validate(payload).repository_identity == (
+        "github.com/org/repository"
+    )
+
+
+def test_reviewer_record_rejects_forged_state_combinations_and_error_text(tmp_path):
+    service, intent = _service(tmp_path)
+    result = asyncio.run(service.run(intent, idempotency_key="reviewer-state"))
+    record = result.bundle.reviewer
+
+    def invalid(**updates):
+        data = record.model_dump()
+        data.update(updates)
+        with pytest.raises(ValueError):
+            ReviewerRunRecord.model_validate(data)
+
+    invalid(actual_provider=None)
+    invalid(raw_response_artifact_digest=None)
+    invalid(error_code="provider returned secret text")
+    invalid(status="failure", result_id=None, result_digest=None)
+    invalid(status="blocked_redaction", actual_provider=None, actual_model_ref=None)
+
+    invalid_json = record.model_dump()
+    invalid_json.update(
+        {
+            "status": "invalid_json",
+            "schema_status": "invalid",
+            "canonical_response_digest": None,
+            "result_id": None,
+            "result_digest": None,
+            "error_code": "REVIEWER_INVALID_JSON",
+        }
+    )
+    assert ReviewerRunRecord.model_validate(invalid_json).status == "invalid_json"
     with pytest.raises(ValueError):
         AssuranceRunIntent(
             repository_path=tmp_path / "does-not-exist",
             repository_identity="example/service",
+            author="author-agent",
             base_ref="HEAD",
             task_path="TASK.md",
             command_ids=(),
@@ -377,6 +438,38 @@ def test_real_git_happy_path_commits_and_never_accepts(tmp_path):
     assert result.bundle.reviewer.prompt_digest.startswith("sha256:")
 
 
+def test_success_receipt_binds_non_default_reviewer_route(tmp_path):
+    service, intent = _service(tmp_path)
+    service._config = AssuranceRunConfig(
+        workspace_root=service._config.workspace_root,
+        allowed_commands=service._config.allowed_commands,
+        redaction_policy_version=service._config.redaction_policy_version,
+        orchestration_version=service._config.orchestration_version,
+        policy_version=service._config.policy_version,
+        rubric_version=service._config.rubric_version,
+        freshness_ttl_seconds=service._config.freshness_ttl_seconds,
+        reviewer_route=ReviewerRoute(
+            provider="custom-provider",
+            model_ref="custom-model",
+            timeout_seconds=17,
+            token_budget=321,
+            routing_rule="custom.route:v1",
+        ),
+    )
+
+    result = asyncio.run(service.run(intent, idempotency_key="run-custom-route"))
+    route = service._config.reviewer_route
+    assert all(
+        (
+            step.routing_rule == route.routing_rule
+            and step.timeout_seconds == route.timeout_seconds
+            and step.token_budget == route.token_budget
+            and step.tool_grants == route.tool_grants
+        )
+        for step in result.bundle.execution_receipt.steps
+    )
+
+
 def test_questions_request_evidence_and_cached_replay_does_not_invoke_again(tmp_path):
     reviewer = _Reviewer(questions=True)
     committer = _Committer()
@@ -450,7 +543,7 @@ def test_redaction_adapter_error_fails_without_commit(tmp_path):
     assert not any(call[0] == "commit" for call in committer.calls)
 
 
-@pytest.mark.parametrize("status", ["timeout", "failure"])
+@pytest.mark.parametrize("status", ["timeout", "failure", "cancelled", "budget_exceeded"])
 def test_reviewer_failure_is_a_failed_receipt_not_a_success_invocation(tmp_path, status):
     reviewer = _Reviewer(status=status)
     service, intent = _service(tmp_path, reviewer=reviewer)
@@ -461,11 +554,97 @@ def test_reviewer_failure_is_a_failed_receipt_not_a_success_invocation(tmp_path,
     assert result.bundle.reviewer.error_code == {
         "timeout": "REVIEWER_TIMEOUT",
         "failure": "REVIEWER_PROVIDER_FAILURE",
+        "cancelled": "REVIEWER_CANCELLED",
+        "budget_exceeded": "REVIEWER_BUDGET_EXCEEDED",
     }[status]
     assert "error_message" not in result.bundle.reviewer.model_dump()
     assert result.bundle.execution_receipt.overall_result in {"failure", "cancelled"}
     assert result.bundle.policy.decision.outcome == "BLOCKED"
     assert "REQUIRED_REVIEWER_NOT_SUCCESS" in result.bundle.policy.decision.reason_codes
+
+
+@pytest.mark.parametrize("variant", ["timeout", "cancelled", "invalid_json", "blocked", "failure_valid"])
+def test_reviewer_record_enforces_exact_status_error_and_fact_combinations(tmp_path, variant):
+    service, intent = _service(tmp_path)
+    result = asyncio.run(service.run(intent, idempotency_key="reviewer-combination-" + variant))
+    data = result.bundle.reviewer.model_dump()
+    if variant in {"timeout", "cancelled"}:
+        data.update(
+                {
+                    "status": variant,
+                    "error_code": "REVIEWER_CANCELLED" if variant == "timeout" else "REVIEWER_TIMEOUT",
+                "schema_status": "not_produced",
+                "raw_response_artifact_digest": None,
+                "canonical_response_digest": None,
+                "result_id": None,
+                "result_digest": None,
+                "usage_status": "unavailable",
+                "input_tokens": None,
+                "output_tokens": None,
+                "cost_usd": None,
+            }
+        )
+    elif variant == "invalid_json":
+        data.update(
+            {
+                "status": "invalid_json",
+                "schema_status": "invalid",
+                "raw_response_artifact_digest": None,
+                "canonical_response_digest": None,
+                "result_id": None,
+                "result_digest": None,
+                "error_code": "REVIEWER_INVALID_JSON",
+            }
+        )
+    elif variant == "blocked":
+        data.update(
+            {
+                "status": "blocked_redaction",
+                "prompt_id": None,
+                "prompt_digest": None,
+                "actual_provider": None,
+                "actual_model_ref": None,
+                "schema_status": "not_produced",
+                "raw_response_artifact_digest": None,
+                "canonical_response_digest": None,
+                "result_id": None,
+                "result_digest": None,
+                "error_code": "REDACTION_UNSAFE",
+                "usage_status": "measured",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cost_usd": 0.01,
+            }
+        )
+    else:
+        data.update(
+            {
+                "status": "failure",
+                "error_code": "REVIEWER_PROVIDER_FAILURE",
+                "schema_status": "valid",
+                "raw_response_artifact_digest": None,
+                "canonical_response_digest": None,
+                "result_id": None,
+                "result_digest": None,
+            }
+        )
+    with pytest.raises(ValueError):
+        ReviewerRunRecord.model_validate(data)
+
+
+def test_missing_git_collector_profile_limit_fails_closed(tmp_path):
+    service, intent = _service(tmp_path)
+
+    class _CollectorWithoutProfile:
+        def __init__(self, delegate):
+            self._delegate = delegate
+
+        def collect(self, *args, **kwargs):
+            return self._delegate.collect(*args, **kwargs)
+
+    service._git_collector = _CollectorWithoutProfile(service._git_collector)
+    with pytest.raises(AssuranceRunStaleError, match="profile"):
+        asyncio.run(service.run(intent, idempotency_key="missing-git-profile"))
 
 
 def test_invalid_reviewer_json_is_fail_closed(tmp_path):
@@ -743,7 +922,15 @@ def test_service_preserves_frozen_stage_order(tmp_path):
             order.append("commit")
             return original_committer.commit(*args, **kwargs)
 
-    service._git_collector = _Git()
+    wrapped_git = _Git()
+    for attribute in (
+        "max_diff_bytes",
+        "max_files",
+        "max_file_bytes",
+        "command_timeout_seconds",
+    ):
+        setattr(wrapped_git, attribute, getattr(original_git, attribute))
+    service._git_collector = wrapped_git
     service._intake_collector = _Intake()
     service._command_collector = _Commands()
     service._context_builder = _Context()
@@ -836,7 +1023,15 @@ def test_sync_validation_collectors_context_normalize_artifact_and_commit_use_wo
         "normalize",
         staticmethod(normalize),
     )
-    service._git_collector = _Git()
+    wrapped_git = _Git()
+    for attribute in (
+        "max_diff_bytes",
+        "max_files",
+        "max_file_bytes",
+        "command_timeout_seconds",
+    ):
+        setattr(wrapped_git, attribute, getattr(original_git, attribute))
+    service._git_collector = wrapped_git
     service._intake_collector = _Intake()
     service._command_collector = _Commands()
     service._context_builder = _Context()
