@@ -21,6 +21,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     ValidationError,
     field_validator,
@@ -163,6 +164,9 @@ class AuthorizedArtifactIndex(BaseModel):
     artifacts: tuple[ArtifactReference, ...] = Field(min_length=1)
     intake_documents: tuple[IntakeDocument, ...] = ()
     command_observations: tuple[CommandObservation, ...] = ()
+    intake_complete: StrictBool | None = None
+    command_complete: StrictBool | None = None
+    command_all_passed: StrictBool | None = None
 
     @field_validator("evidence_id", "evidence_kind", mode="before")
     @classmethod
@@ -188,10 +192,28 @@ class AuthorizedArtifactIndex(BaseModel):
         if self.evidence_kind == "intake_documents":
             if self.command_observations:
                 raise ValueError("intake index cannot expose command observations")
+            if (
+                self.intake_complete is None
+                or self.command_complete is not None
+                or self.command_all_passed is not None
+            ):
+                raise ValueError("intake index requires only intake completion")
         elif self.evidence_kind == "command_batch":
             if self.intake_documents:
                 raise ValueError("command index cannot expose intake documents")
-        elif self.intake_documents or self.command_observations:
+            if (
+                self.intake_complete is not None
+                or self.command_complete is None
+                or self.command_all_passed is None
+            ):
+                raise ValueError("command index requires only command completion")
+        elif (
+            self.intake_documents
+            or self.command_observations
+            or self.intake_complete is not None
+            or self.command_complete is not None
+            or self.command_all_passed is not None
+        ):
             raise ValueError("opaque index cannot expose typed projections")
         return self
 
@@ -284,6 +306,39 @@ class VerifiedArtifactBytes(BaseModel):
         return self
 
 
+class ResolvedEvidenceArtifacts(BaseModel):
+    """One authoritative index and its integrity-verified artifact bytes."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["v1"] = "v1"
+    index: AuthorizedArtifactIndex
+    artifacts: tuple[VerifiedArtifactBytes, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _bind_artifacts_to_index(self) -> "ResolvedEvidenceArtifacts":
+        if len(self.artifacts) != len(self.index.artifacts):
+            raise ValueError("resolved artifacts must cover the exact index")
+        for reference, artifact in zip(
+            self.index.artifacts, self.artifacts, strict=True
+        ):
+            if (
+                artifact.evidence_id != self.index.evidence_id
+                or artifact.digest != reference.digest
+                or artifact.kind != reference.kind
+                or artifact.label != reference.label
+                or artifact.byte_size != reference.byte_size
+                or artifact.media_type != reference.media_type
+                or artifact.integrity_status != reference.integrity_status
+                or artifact.role != reference.role
+                or artifact.path != reference.path
+                or artifact.command_id != reference.command_id
+                or artifact.stream != reference.stream
+            ):
+                raise ValueError("resolved artifact binding mismatch")
+        return self
+
+
 def _digest_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
@@ -312,6 +367,63 @@ class EvidenceArtifactResolver:
             top_level_digest=top_digest,
             artifact_store=store,
         )
+
+    @staticmethod
+    def resolve(
+        evidence: Evidence,
+        *,
+        artifact_store: ArtifactStore,
+        subject_digest: str,
+    ) -> ResolvedEvidenceArtifacts:
+        """Build one closure and return every authorized byte projection."""
+
+        normalized_evidence = _revalidate_evidence(evidence)
+        store = _require_store(artifact_store)
+        expected_subject = _require_digest(subject_digest)
+        if normalized_evidence.subject_digest != expected_subject:
+            raise _error()
+        cached_bytes: dict[str, bytes] = {}
+        authoritative_index = _index_from_binding(
+            evidence_id=normalized_evidence.evidence_id,
+            evidence_kind=normalized_evidence.kind,
+            subject_digest=expected_subject,
+            top_level_digest=normalized_evidence.artifact_digest,
+            artifact_store=store,
+            resolved_bytes=cached_bytes,
+        )
+        resolved: list[VerifiedArtifactBytes] = []
+        for reference in authoritative_index.artifacts:
+            data = cached_bytes.get(reference.digest)
+            if data is None:
+                raise _error()
+            if len(data) != reference.byte_size:
+                raise _error()
+            try:
+                resolved.append(
+                    VerifiedArtifactBytes(
+                        evidence_id=authoritative_index.evidence_id,
+                        digest=reference.digest,
+                        kind=reference.kind,
+                        label=reference.label,
+                        byte_size=reference.byte_size,
+                        data=data,
+                        media_type=reference.media_type,
+                        integrity_status=reference.integrity_status,
+                        role=reference.role,
+                        path=reference.path,
+                        command_id=reference.command_id,
+                        stream=reference.stream,
+                    )
+                )
+            except (TypeError, ValueError, ValidationError):
+                raise _error() from None
+        try:
+            return ResolvedEvidenceArtifacts(
+                index=authoritative_index,
+                artifacts=tuple(resolved),
+            )
+        except (TypeError, ValueError, ValidationError):
+            raise _error() from None
 
     @staticmethod
     def read(
@@ -422,13 +534,17 @@ def _index_from_binding(
     subject_digest: str,
     top_level_digest: str,
     artifact_store: ArtifactStore,
+    resolved_bytes: dict[str, bytes] | None = None,
 ) -> AuthorizedArtifactIndex:
     """Rebuild the closure from its immutable binding and current CAS bytes."""
 
     expected_subject = _require_digest(subject_digest)
     top_digest = _require_digest(top_level_digest)
-    top_bytes = _read_cas_bytes(
-        artifact_store, top_digest, _top_level_cap(evidence_kind)
+    top_bytes = _read_bound_bytes(
+        artifact_store,
+        top_digest,
+        _top_level_cap(evidence_kind),
+        resolved_bytes,
     )
     top = _reference(
         digest=top_digest,
@@ -441,24 +557,40 @@ def _index_from_binding(
         references = (top,)
         intake_documents = ()
         command_observations = ()
+        intake_complete = None
+        command_complete = None
+        command_all_passed = None
     elif evidence_kind == "intake_documents":
-        intake_documents = _parse_intake_manifest(
+        intake_documents, intake_complete = _parse_intake_manifest(
             top_digest, top_bytes, expected_subject
         )
         command_observations = ()
+        command_complete = None
+        command_all_passed = None
         references = (top,) + tuple(
-            _document_reference(artifact_store, document)
+            _document_reference(
+                artifact_store, document, resolved_bytes=resolved_bytes
+            )
             for document in intake_documents
         )
     elif evidence_kind == "command_batch":
         intake_documents = ()
-        command_observations = _parse_command_manifest(
+        intake_complete = None
+        (
+            command_observations,
+            command_complete,
+            command_all_passed,
+        ) = _parse_command_manifest(
             top_digest, top_bytes, expected_subject
         )
         references = (top,) + tuple(
             reference
             for observation in command_observations
-            for reference in _command_references(artifact_store, observation)
+            for reference in _command_references(
+                artifact_store,
+                observation,
+                resolved_bytes=resolved_bytes,
+            )
         )
     else:
         # Unknown kinds remain opaque.  A JSON-looking top-level artifact does
@@ -466,6 +598,9 @@ def _index_from_binding(
         references = (top,)
         intake_documents = ()
         command_observations = ()
+        intake_complete = None
+        command_complete = None
+        command_all_passed = None
     try:
         return AuthorizedArtifactIndex(
             evidence_id=evidence_id,
@@ -475,6 +610,9 @@ def _index_from_binding(
             artifacts=references,
             intake_documents=intake_documents,
             command_observations=command_observations,
+            intake_complete=intake_complete,
+            command_complete=command_complete,
+            command_all_passed=command_all_passed,
         )
     except (TypeError, ValueError, ValidationError):
         raise _error() from None
@@ -487,6 +625,26 @@ def _reference_cap(kind: str, reference: ArtifactReference) -> int:
     if reference.role == "document":
         return _MAX_INTAKE_FILE_BYTES
     return _MAX_COMMAND_OUTPUT_BYTES
+
+
+def _read_bound_bytes(
+    artifact_store: ArtifactStore,
+    digest: str,
+    max_bytes: int | None,
+    resolved_bytes: dict[str, bytes] | None,
+) -> bytes:
+    if resolved_bytes is not None and digest in resolved_bytes:
+        data = resolved_bytes[digest]
+        if (
+            (max_bytes is not None and len(data) > max_bytes)
+            or _digest_bytes(data) != digest
+        ):
+            raise _error()
+        return data
+    data = _read_cas_bytes(artifact_store, digest, max_bytes)
+    if resolved_bytes is not None:
+        resolved_bytes[digest] = data
+    return data
 
 
 def _read_cas_bytes(
@@ -575,11 +733,19 @@ def _reference(
 
 
 def _document_reference(
-    artifact_store: ArtifactStore, document: IntakeDocument
+    artifact_store: ArtifactStore,
+    document: IntakeDocument,
+    *,
+    resolved_bytes: dict[str, bytes] | None = None,
 ) -> ArtifactReference:
     if type(document.byte_size) is not int or document.byte_size > _MAX_INTAKE_FILE_BYTES:
         raise _error()
-    data = _read_cas_bytes(artifact_store, document.artifact_digest, document.byte_size)
+    data = _read_bound_bytes(
+        artifact_store,
+        document.artifact_digest,
+        document.byte_size,
+        resolved_bytes,
+    )
     if len(data) != document.byte_size:
         raise _error()
     return _reference(
@@ -593,20 +759,25 @@ def _document_reference(
 
 
 def _command_references(
-    artifact_store: ArtifactStore, observation: CommandObservation
+    artifact_store: ArtifactStore,
+    observation: CommandObservation,
+    *,
+    resolved_bytes: dict[str, bytes] | None = None,
 ) -> tuple[ArtifactReference, ArtifactReference]:
     for byte_size in (observation.stdout_bytes, observation.stderr_bytes):
         if type(byte_size) is not int or byte_size > _MAX_COMMAND_OUTPUT_BYTES:
             raise _error()
-    stdout = _read_cas_bytes(
+    stdout = _read_bound_bytes(
         artifact_store,
         observation.stdout_artifact_digest,
         observation.stdout_bytes,
+        resolved_bytes,
     )
-    stderr = _read_cas_bytes(
+    stderr = _read_bound_bytes(
         artifact_store,
         observation.stderr_artifact_digest,
         observation.stderr_bytes,
+        resolved_bytes,
     )
     if len(stdout) != observation.stdout_bytes or len(stderr) != observation.stderr_bytes:
         raise _error()
@@ -642,7 +813,7 @@ def _top_label(kind: str) -> str:
 
 def _parse_intake_manifest(
     digest: str, raw: bytes, subject_digest: str
-) -> tuple[IntakeDocument, ...]:
+) -> tuple[tuple[IntakeDocument, ...], bool]:
     data = _parse_json(raw)
     _require_keys(
         data,
@@ -679,7 +850,7 @@ def _parse_intake_manifest(
     try:
         documents = tuple(IntakeDocument.model_validate(item) for item in documents_raw)
         notices = tuple(IntakeNotice.model_validate(item) for item in notices_raw)
-        IntakeSnapshot(
+        snapshot = IntakeSnapshot(
             schema_version="v1",
             subject_digest=subject_digest,
             documents=documents,
@@ -717,12 +888,12 @@ def _parse_intake_manifest(
         limits["max_total_bytes"], _MAX_INTAKE_TOTAL_BYTES
     ):
         raise _error()
-    return documents
+    return documents, snapshot.complete
 
 
 def _parse_command_manifest(
     digest: str, raw: bytes, subject_digest: str
-) -> tuple[CommandObservation, ...]:
+) -> tuple[tuple[CommandObservation, ...], bool, bool]:
     data = _parse_json(raw)
     _require_keys(
         data,
@@ -746,7 +917,7 @@ def _parse_command_manifest(
         observations = tuple(
             CommandObservation.model_validate(item) for item in observations_raw
         )
-        CommandBatchSnapshot(
+        snapshot = CommandBatchSnapshot(
             schema_version="v1",
             subject_digest=subject_digest,
             commands=observations,
@@ -770,7 +941,7 @@ def _parse_command_manifest(
         for observation in observations
     ):
         raise _error()
-    return observations
+    return observations, snapshot.complete, snapshot.all_passed
 
 
 def _parse_json(raw: bytes) -> dict[str, Any]:
@@ -828,5 +999,6 @@ __all__ = [
     "AuthorizedArtifactIndex",
     "EvidenceArtifactError",
     "EvidenceArtifactResolver",
+    "ResolvedEvidenceArtifacts",
     "VerifiedArtifactBytes",
 ]

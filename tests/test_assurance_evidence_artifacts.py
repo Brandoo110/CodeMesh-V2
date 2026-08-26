@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
+import assurance.evidence_artifacts as evidence_artifacts_module
 from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandObservation
 from assurance.contracts import Evidence
@@ -17,6 +18,7 @@ from assurance.evidence_artifacts import (
     AuthorizedArtifactIndex,
     EvidenceArtifactError,
     EvidenceArtifactResolver,
+    ResolvedEvidenceArtifacts,
 )
 from assurance.intake import IntakeDocument
 
@@ -533,6 +535,12 @@ def test_authorized_index_projection_is_typed_and_kind_bound(tmp_path):
         intake_index.model_dump(mode="python")
     )
     assert round_tripped == intake_index
+    assert intake_index.intake_complete is True
+    assert intake_index.command_complete is None
+    assert intake_index.command_all_passed is None
+    assert command_index.intake_complete is None
+    assert command_index.command_complete is True
+    assert command_index.command_all_passed is False
     with pytest.raises(ValidationError):
         AuthorizedArtifactIndex(
             evidence_id=intake_index.evidence_id,
@@ -631,3 +639,78 @@ def test_resolver_rejects_intermediate_prefix_symlink(tmp_path):
             artifact_store=store,
             subject_digest=SUBJECT,
         )
+
+
+def test_resolve_builds_one_authoritative_closure_and_returns_all_bytes(
+    tmp_path, monkeypatch
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    top_digest, stdout_digest, stderr_digest, top_raw = _command_artifact(store)
+    evidence = _evidence("command_batch", top_digest)
+    original_index = evidence_artifacts_module._index_from_binding
+    original_parse = evidence_artifacts_module._parse_command_manifest
+    original_read = evidence_artifacts_module._read_cas_bytes
+    calls = {"index": 0, "parse": 0, "digests": []}
+
+    def counted_index(*args, **kwargs):
+        calls["index"] += 1
+        return original_index(*args, **kwargs)
+
+    def counted_parse(*args, **kwargs):
+        calls["parse"] += 1
+        return original_parse(*args, **kwargs)
+
+    def counted_read(*args, **kwargs):
+        digest = args[1] if len(args) > 1 else kwargs["digest"]
+        calls["digests"].append(digest)
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(
+        evidence_artifacts_module, "_index_from_binding", counted_index
+    )
+    monkeypatch.setattr(
+        evidence_artifacts_module, "_parse_command_manifest", counted_parse
+    )
+    monkeypatch.setattr(
+        evidence_artifacts_module, "_read_cas_bytes", counted_read
+    )
+
+    resolved = EvidenceArtifactResolver.resolve(
+        evidence, artifact_store=store, subject_digest=SUBJECT
+    )
+
+    assert type(resolved) is ResolvedEvidenceArtifacts
+    assert calls["index"] == 1
+    assert calls["parse"] == 1
+    assert calls["digests"] == [top_digest, stdout_digest, stderr_digest]
+    assert resolved.index.command_complete is True
+    assert resolved.index.command_all_passed is False
+    assert tuple(item.digest for item in resolved.artifacts) == (
+        top_digest,
+        stdout_digest,
+        stderr_digest,
+    )
+    assert resolved.artifacts[0].data == top_raw
+    assert resolved.artifacts[1].data == b"stdout\n"
+    assert resolved.artifacts[2].data == b"stderr\n"
+
+
+def test_resolve_rejects_wrong_subject_missing_and_tampered_artifact(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    top_digest, task_digest, _ = _intake_artifact(store)
+    evidence = _evidence("intake_documents", top_digest)
+
+    with pytest.raises(EvidenceArtifactError):
+        EvidenceArtifactResolver.resolve(
+            evidence,
+            artifact_store=store,
+            subject_digest="sha256:" + "2" * 64,
+        )
+
+    store._artifact_path(task_digest).write_bytes(b"tampered\n")
+    with pytest.raises(EvidenceArtifactError) as exc_info:
+        EvidenceArtifactResolver.resolve(
+            evidence, artifact_store=store, subject_digest=SUBJECT
+        )
+    assert str(exc_info.value) == EvidenceArtifactError.message
+    assert task_digest not in str(exc_info.value)
