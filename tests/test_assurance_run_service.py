@@ -1,0 +1,923 @@
+"""GP-02 focused tests for the in-memory AssuranceRunService orchestration."""
+
+import asyncio
+import json
+import shutil
+import subprocess
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+import assurance.run_service as run_service_module
+
+from assurance.artifacts import ArtifactStore
+from assurance.commands import CommandSpec
+from assurance.run_service import (
+    AssuranceRunBundle,
+    AssuranceRunConfig,
+    AssuranceRunError,
+    AssuranceRunIntent,
+    AssuranceRunRedactionError,
+    AssuranceRunResult,
+    AssuranceRunService,
+    AssuranceRunStaleError,
+    AssuranceRunValidationError,
+    IdempotencyConflictError,
+    RedactionDisposition,
+    ReviewerContextPlan,
+    ReviewerContextPlanEntry,
+    ReviewerInvocationResponse,
+    ReviewerRoute,
+)
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(("git", *args), cwd=cwd, check=True, capture_output=True)
+
+
+def _repository(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.name", "CodeMesh Test")
+    (root / "TASK.md").write_text(
+        "---\n"
+        "title: Golden path\n"
+        "owner: test\n"
+        "version: v1\n"
+        "status: active\n"
+        "---\n"
+        "# Golden path\n\n## Acceptance\n\n- [ ] command passes\n",
+        encoding="utf-8",
+    )
+    (root / "POLICY.md").write_text(
+        "# Policy\n\nVersion: v1\n\nStatus: active\n",
+        encoding="utf-8",
+    )
+    (root / "changed.txt").write_text("changed\n", encoding="utf-8")
+    _git(root, "add", "TASK.md", "POLICY.md")
+    _git(root, "commit", "-qm", "base")
+    (root / "changed.txt").write_text("changed again\n", encoding="utf-8")
+    return root
+
+
+class _ContextBuilder:
+    def __init__(self, disposition=RedactionDisposition.NOT_APPLICABLE):
+        self.disposition = disposition
+        self.calls = 0
+
+    def prepare(self, evidences, *, artifact_store, subject_digest):
+        self.calls += 1
+        return ReviewerContextPlan(
+            entries=tuple(
+                ReviewerContextPlanEntry(
+                    evidence_id=evidence.evidence_id,
+                    kind=evidence.kind,
+                    artifact_digest=evidence.artifact_digest,
+                    disposition=self.disposition,
+                    content=(
+                        "safe evidence"
+                        if self.disposition
+                        in (
+                            RedactionDisposition.DECLARED_REDACTED,
+                            RedactionDisposition.NOT_APPLICABLE,
+                        )
+                        else None
+                    ),
+                    truncated=False,
+                )
+                for evidence in evidences
+            )
+        )
+
+
+class _Reviewer:
+    def __init__(self, status="success", questions=False):
+        self.status = status
+        self.questions = questions
+        self.calls = 0
+
+    async def invoke(self, prompt, *, run_id, route):
+        self.calls += 1
+        if self.status != "success":
+            return ReviewerInvocationResponse(
+                status=self.status,
+                provider=route.provider,
+                model_ref=route.model_ref,
+                error_code=self.status,
+            )
+        questions = ()
+        if self.questions:
+            questions = (
+                {
+                    "reviewer_role": "intent",
+                    "question": "Please confirm the acceptance evidence.",
+                    "reason": "model_question",
+                    "evidence_refs": [prompt.input.contexts[0].evidence_id],
+                },
+            )
+        payload = {
+            "schema_version": "v1",
+            "subject_digest": prompt.input.subject.subject_digest,
+            "rubric_hash": prompt.rubric_hash,
+            "findings": [],
+            "questions": list(questions),
+        }
+        return ReviewerInvocationResponse(
+            status="success",
+            provider=route.provider,
+            model_ref=route.model_ref,
+            raw_response=json.dumps(payload, separators=(",", ":")).encode(),
+            started_at=prompt.input.evaluated_at,
+            completed_at=prompt.input.evaluated_at,
+            schema_status="valid",
+            usage_status="unavailable",
+        )
+
+
+class _Committer:
+    def __init__(self):
+        self.calls = []
+        self.cached = None
+
+    def lookup(self, idempotency_key, request_digest):
+        self.calls.append(("lookup", idempotency_key, request_digest))
+        return self.cached
+
+    def commit(self, bundle, *, idempotency_key, request_digest):
+        self.calls.append(("commit", idempotency_key, request_digest))
+        self.cached = AssuranceRunResult(
+            run_id=bundle.run_id,
+            request_digest=request_digest,
+            cached=False,
+            bundle=bundle,
+        )
+        return self.cached
+
+
+def _service(
+    tmp_path,
+    *,
+    reviewer=None,
+    context=None,
+    committer=None,
+    command_specs=None,
+    freshness_ttl_seconds=300,
+    clock=None,
+):
+    root = _repository(tmp_path)
+    store = ArtifactStore(tmp_path / "artifacts")
+    if command_specs is None:
+        command_specs = (
+            CommandSpec(
+                command_id="check",
+                kind="test",
+                argv=("python", "-c", "print('ok')"),
+                cwd=".",
+                timeout_seconds=5.0,
+                max_output_bytes=4096,
+            ),
+        )
+    service = AssuranceRunService(
+        artifact_store=store,
+        reviewer_invoker=reviewer or _Reviewer(),
+        context_builder=context or _ContextBuilder(),
+        committer=committer or _Committer(),
+        config=AssuranceRunConfig(
+            workspace_root=tmp_path,
+            redaction_policy_version="redaction.v0",
+            policy_version="gate.v0",
+            rubric_version="single_general.v0",
+            allowed_commands=command_specs,
+            freshness_ttl_seconds=freshness_ttl_seconds,
+            reviewer_route=ReviewerRoute(
+                provider="fake",
+                model_ref="fake-model",
+                timeout_seconds=30,
+            ),
+        ),
+        clock=clock,
+    )
+    intent = AssuranceRunIntent(
+        repository_path=root,
+        repository_identity="example/service",
+        base_ref="HEAD",
+        task_path="TASK.md",
+        policy_paths=("POLICY.md",),
+        command_ids=("check",),
+        changed_lines_total=1,
+        external_side_effects="none_declared",
+        provider_boundary="within_declared_boundary",
+    )
+    return service, intent
+
+
+def test_intent_rejects_duplicate_or_empty_command_ids_before_io(tmp_path):
+    with pytest.raises(ValueError):
+        AssuranceRunIntent(
+            repository_path=tmp_path / "does-not-exist",
+            repository_identity="example/service",
+            base_ref="HEAD",
+            task_path="TASK.md",
+            command_ids=("check", "check"),
+        )
+    with pytest.raises(ValueError):
+        AssuranceRunIntent(
+            repository_path=tmp_path / "does-not-exist",
+            repository_identity="example/service",
+            base_ref="HEAD",
+            task_path="TASK.md",
+            command_ids=(),
+        )
+
+
+def test_intent_rejects_command_outside_frozen_allowlist_before_lookup(tmp_path):
+    service, intent = _service(tmp_path)
+    committer = service._committer
+    invalid = intent.model_copy(update={"command_ids": ("unknown",)})
+
+    with pytest.raises(AssuranceRunValidationError):
+        asyncio.run(service.run(invalid, idempotency_key="run-unknown-command"))
+
+    assert committer.calls == []
+
+
+def test_unsafe_redaction_disposition_cannot_carry_content():
+    with pytest.raises(ValueError, match="must not expose content"):
+        ReviewerContextPlanEntry(
+            evidence_id="ev_1",
+            kind="git_diff",
+            artifact_digest="sha256:" + "0" * 64,
+            disposition=RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
+            content="unredacted",
+        )
+
+
+def test_config_versions_are_required_and_request_digest_bound(tmp_path):
+    service, intent = _service(tmp_path)
+    config = service._config
+    assert config.orchestration_version == "golden.v1"
+    assert config.redaction_policy_version == "redaction.v0"
+
+    with pytest.raises(ValueError, match="redaction_policy_version"):
+        AssuranceRunConfig(
+            workspace_root=config.workspace_root,
+            allowed_commands=config.allowed_commands,
+            redaction_policy_version="",
+        )
+
+    baseline = service._request_digest(intent)
+    service._config = AssuranceRunConfig(
+        workspace_root=config.workspace_root,
+        allowed_commands=config.allowed_commands,
+        redaction_policy_version="redaction.v1",
+        orchestration_version=config.orchestration_version,
+        policy_version=config.policy_version,
+        rubric_version=config.rubric_version,
+        freshness_ttl_seconds=config.freshness_ttl_seconds,
+        reviewer_route=config.reviewer_route,
+    )
+    assert service._request_digest(intent) != baseline
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "repository",
+        "base_revision",
+        "head_revision",
+        "task_digest",
+        "policy_version",
+        "created_at",
+    ],
+)
+def test_bundle_validator_binds_subject_facts_to_collected_results(
+    tmp_path, field_name
+):
+    service, intent = _service(tmp_path)
+    bundle = asyncio.run(service.run(intent, idempotency_key="run-subject-bind")).bundle
+    if field_name in {"repository", "base_revision", "head_revision"}:
+        replacement = bundle.git.snapshot.model_copy(
+            update={field_name: "other/service" if field_name == "repository" else "0" * 40}
+        )
+        bad_git = bundle.git.model_copy(update={"snapshot": replacement})
+        bad_bundle = bundle.model_copy(update={"git": bad_git})
+    elif field_name == "task_digest":
+        replacement = bundle.intake.snapshot.model_copy(
+            update={"task_digest": "sha256:" + "0" * 64}
+        )
+        bad_intake = bundle.intake.model_copy(update={"snapshot": replacement})
+        bad_bundle = bundle.model_copy(update={"intake": bad_intake})
+    elif field_name == "policy_version":
+        bad_binding = bundle.binding.model_copy(update={"policy_version": "gate.tampered"})
+        bad_bundle = bundle.model_copy(update={"binding": bad_binding})
+    else:
+        bad_bundle = bundle.model_copy(
+            update={"started_at": datetime(2030, 1, 1, tzinfo=timezone.utc)}
+        )
+
+    with pytest.raises(ValueError):
+        bad_bundle._bind_all_results()
+
+
+@pytest.mark.parametrize("field_name", ["snapshot", "intake", "manifest"])
+def test_bundle_validator_binds_risk_input_to_exact_collected_results(
+    tmp_path, field_name
+):
+    service, intent = _service(tmp_path)
+    bundle = asyncio.run(service.run(intent, idempotency_key="run-risk-bind")).bundle
+    if field_name == "snapshot":
+        replacement = bundle.risk.input.snapshot.model_copy(
+            update={"head_revision": "0" * 40}
+        )
+    elif field_name == "intake":
+        replacement = bundle.risk.input.intake.model_copy(
+            update={"task_digest": "sha256:" + "0" * 64}
+        )
+    else:
+        replacement = bundle.risk.input.manifest.model_copy(
+            update={"evaluated_at": datetime(2030, 1, 1, tzinfo=timezone.utc)}
+        )
+    bad_input = bundle.risk.input.model_copy(update={field_name: replacement})
+    bad_risk = bundle.risk.model_copy(update={"input": bad_input})
+    bad_bundle = bundle.model_copy(update={"risk": bad_risk})
+
+    with pytest.raises(ValueError, match="risk input .* must match bundle"):
+        bad_bundle._bind_all_results()
+
+
+@pytest.mark.parametrize("field_name", ["run_id", "request_digest"])
+def test_result_validator_binds_envelope_to_bundle(tmp_path, field_name):
+    service, intent = _service(tmp_path)
+    result = asyncio.run(service.run(intent, idempotency_key="run-result-bind"))
+    replacement = (
+        "run_tampered"
+        if field_name == "run_id"
+        else "sha256:" + "0" * 64
+    )
+
+    with pytest.raises(ValueError, match="result .* must match bundle"):
+        AssuranceRunResult.model_validate(
+            {**result.__dict__, field_name: replacement}
+        )
+
+
+def test_real_git_happy_path_commits_and_never_accepts(tmp_path):
+    service, intent = _service(tmp_path)
+    result = asyncio.run(service.run(intent, idempotency_key="run-1"))
+
+    assert result.bundle.subject.subject_digest == result.bundle.git.snapshot.subject_digest
+    assert result.bundle.case.state == "EVIDENCE_COLLECTED"
+    assert result.bundle.policy.decision.outcome == "PASS"
+    assert result.bundle.events[0].kind == "COLLECT_EVIDENCE"
+    assert result.bundle.execution_receipt.overall_result == "success"
+    assert result.bundle.reviewer.prompt_id.startswith("srp_")
+    assert result.bundle.reviewer.prompt_digest.startswith("sha256:")
+
+
+def test_questions_request_evidence_and_cached_replay_does_not_invoke_again(tmp_path):
+    reviewer = _Reviewer(questions=True)
+    committer = _Committer()
+    service, intent = _service(tmp_path, reviewer=reviewer, committer=committer)
+    first = asyncio.run(service.run(intent, idempotency_key="run-questions"))
+
+    assert first.bundle.case.state == "NEEDS_EVIDENCE"
+    assert first.bundle.case.missing_evidence == (
+        "review_question:" + first.bundle.questions[0].question_id,
+    )
+    assert first.bundle.events[-1].kind == "REQUEST_EVIDENCE"
+    assert reviewer.calls == 1
+
+    replay = asyncio.run(service.run(intent, idempotency_key="run-questions"))
+    assert replay.cached is True
+    assert reviewer.calls == 1
+
+
+def test_commit_race_winner_preserves_adapter_cached_value(tmp_path):
+    class _RaceCommitter(_Committer):
+        def commit(self, bundle, *, idempotency_key, request_digest):
+            self.calls.append(("commit", idempotency_key, request_digest))
+            self.cached = AssuranceRunResult(
+                run_id=bundle.run_id,
+                request_digest=request_digest,
+                cached=True,
+                bundle=bundle,
+            )
+            return self.cached
+
+    committer = _RaceCommitter()
+    service, intent = _service(tmp_path, committer=committer)
+
+    result = asyncio.run(service.run(intent, idempotency_key="run-race-winner"))
+
+    assert result.cached is True
+
+
+def test_unsafe_redaction_blocks_reviewer_and_commit(tmp_path):
+    reviewer = _Reviewer()
+    committer = _Committer()
+    context = _ContextBuilder(RedactionDisposition.CONTAINS_UNREDACTED_CONTENT)
+    service, intent = _service(
+        tmp_path, reviewer=reviewer, context=context, committer=committer
+    )
+
+    result = asyncio.run(service.run(intent, idempotency_key="run-unsafe"))
+
+    assert reviewer.calls == 0
+    assert any(call[0] == "commit" for call in committer.calls)
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert result.bundle.reviewer.status == "blocked_redaction"
+    assert result.bundle.reviewer.prompt_id is None
+    assert result.bundle.reviewer.prompt_digest is None
+
+
+def test_redaction_adapter_error_fails_without_commit(tmp_path):
+    class _ErrorContext(_ContextBuilder):
+        def prepare(self, evidences, *, artifact_store, subject_digest):
+            self.calls += 1
+            raise RuntimeError("redaction adapter unavailable")
+
+    committer = _Committer()
+    service, intent = _service(
+        tmp_path, context=_ErrorContext(), committer=committer
+    )
+
+    with pytest.raises(AssuranceRunRedactionError):
+        asyncio.run(service.run(intent, idempotency_key="run-redaction-error"))
+
+    assert not any(call[0] == "commit" for call in committer.calls)
+
+
+@pytest.mark.parametrize("status", ["timeout", "failure"])
+def test_reviewer_failure_is_a_failed_receipt_not_a_success_invocation(tmp_path, status):
+    reviewer = _Reviewer(status=status)
+    service, intent = _service(tmp_path, reviewer=reviewer)
+
+    result = asyncio.run(service.run(intent, idempotency_key="run-failed-" + status))
+
+    assert result.bundle.reviewer.status == status
+    assert result.bundle.reviewer.error_code == {
+        "timeout": "REVIEWER_TIMEOUT",
+        "failure": "REVIEWER_PROVIDER_FAILURE",
+    }[status]
+    assert "error_message" not in result.bundle.reviewer.model_dump()
+    assert result.bundle.execution_receipt.overall_result in {"failure", "cancelled"}
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert "REQUIRED_REVIEWER_NOT_SUCCESS" in result.bundle.policy.decision.reason_codes
+
+
+def test_invalid_reviewer_json_is_fail_closed(tmp_path):
+    class _InvalidJsonReviewer(_Reviewer):
+        async def invoke(self, prompt, *, run_id, route):
+            self.calls += 1
+            return ReviewerInvocationResponse(
+                status="success",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                raw_response=b"not-json",
+                started_at=prompt.input.evaluated_at,
+                completed_at=prompt.input.evaluated_at,
+                schema_status="valid",
+            )
+
+    service, intent = _service(tmp_path, reviewer=_InvalidJsonReviewer())
+    result = asyncio.run(service.run(intent, idempotency_key="run-invalid-json"))
+
+    assert result.bundle.reviewer.status == "invalid_json"
+    assert result.bundle.reviewer.raw_response_artifact_digest is not None
+    assert service._artifact_store.verify(
+        result.bundle.reviewer.raw_response_artifact_digest
+    )
+    assert result.bundle.reviewer.error_code == "REVIEWER_INVALID_JSON"
+    assert "error_message" not in result.bundle.reviewer.model_dump()
+    assert result.bundle.execution_receipt.overall_result == "failure"
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+
+
+def test_unknown_reviewer_exception_propagates_without_commit(tmp_path):
+    class _UnknownErrorReviewer(_Reviewer):
+        async def invoke(self, prompt, *, run_id, route):
+            self.calls += 1
+            raise ValueError("provider exploded")
+
+    committer = _Committer()
+    service, intent = _service(
+        tmp_path,
+        reviewer=_UnknownErrorReviewer(),
+        committer=committer,
+    )
+
+    with pytest.raises(ValueError, match="provider exploded"):
+        asyncio.run(service.run(intent, idempotency_key="run-reviewer-error"))
+
+    assert not any(call[0] == "commit" for call in committer.calls)
+
+
+def test_reviewer_cancelled_error_propagates_without_commit(tmp_path):
+    class _CancelledReviewer(_Reviewer):
+        async def invoke(self, prompt, *, run_id, route):
+            self.calls += 1
+            raise asyncio.CancelledError()
+
+    committer = _Committer()
+    service, intent = _service(
+        tmp_path,
+        reviewer=_CancelledReviewer(),
+        committer=committer,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(service.run(intent, idempotency_key="run-reviewer-cancelled"))
+
+    assert not any(call[0] == "commit" for call in committer.calls)
+
+
+def test_unknown_normalization_error_propagates_without_commit(tmp_path, monkeypatch):
+    def _unexpected_normalization_error(*args, **kwargs):
+        raise RuntimeError("normalizer unavailable")
+
+    monkeypatch.setattr(
+        run_service_module.SingleStrongReviewer,
+        "normalize",
+        staticmethod(_unexpected_normalization_error),
+    )
+    committer = _Committer()
+    service, intent = _service(tmp_path, committer=committer)
+
+    with pytest.raises(RuntimeError, match="normalizer unavailable"):
+        asyncio.run(service.run(intent, idempotency_key="run-normalizer-error"))
+
+    assert not any(call[0] == "commit" for call in committer.calls)
+
+
+def test_probe_and_intake_task_drift_fails_before_commit(tmp_path):
+    service, intent = _service(tmp_path)
+    committer = service._committer
+    original = service._intake_collector
+
+    class _DriftingIntake:
+        def probe_task_digest(self, *args, **kwargs):
+            return original.probe_task_digest(*args, **kwargs)
+
+        def collect(self, *args, **kwargs):
+            task = intent.repository_path / "TASK.md"
+            task.write_text(task.read_text(encoding="utf-8") + "\n# drift\n", encoding="utf-8")
+            return original.collect(*args, **kwargs)
+
+    service._intake_collector = _DriftingIntake()
+    with pytest.raises(AssuranceRunStaleError):
+        asyncio.run(service.run(intent, idempotency_key="run-task-drift"))
+
+    assert not any(call[0] == "commit" for call in committer.calls)
+
+
+@pytest.mark.parametrize(
+    ("argv", "outcome"),
+    [
+        (("python", "-c", "import sys; sys.exit(3)"), "failure"),
+        (("python", "-c", "import time; time.sleep(0.2)"), "timeout"),
+    ],
+)
+def test_command_failure_or_timeout_is_collected_and_policy_blocks(
+    tmp_path, argv, outcome
+):
+    command_specs = (
+        CommandSpec(
+            command_id="check",
+            kind="test",
+            argv=argv,
+            cwd=".",
+            timeout_seconds=0.05 if outcome == "timeout" else 5.0,
+            max_output_bytes=4096,
+        ),
+    )
+    service, intent = _service(tmp_path, command_specs=command_specs)
+
+    result = asyncio.run(service.run(intent, idempotency_key="run-command-" + outcome))
+
+    assert result.bundle.commands.snapshot.commands[0].outcome == outcome
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+
+
+def test_missing_typed_collector_is_exact_policy_block(tmp_path):
+    service, intent = _service(tmp_path)
+    api_dir = intent.repository_path / "api"
+    api_dir.mkdir()
+    (api_dir / "routes.py").write_text("def route(): pass\n", encoding="utf-8")
+
+    result = asyncio.run(service.run(intent, idempotency_key="run-missing-typed"))
+
+    assert "api_contract" in result.bundle.risk.classification.required_collectors
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert result.bundle.policy.decision.reason_codes == ("REQUIRED_COLLECTOR_MISSING",)
+    assert all(
+        entry.producer != "generic_importer"
+        for entry in result.bundle.manifest.manifest.entries
+    )
+
+
+def test_same_key_with_different_request_digest_conflicts_before_external_work(tmp_path):
+    committer = _Committer()
+    service, intent = _service(tmp_path, committer=committer)
+    asyncio.run(service.run(intent, idempotency_key="run-conflict"))
+    changed_intent = intent.model_copy(update={"changed_lines_total": 2})
+
+    with pytest.raises(IdempotencyConflictError):
+        asyncio.run(service.run(changed_intent, idempotency_key="run-conflict"))
+
+    assert [call[0] for call in committer.calls] == ["lookup", "commit", "lookup"]
+
+
+def test_same_key_conflict_precedes_workspace_validation_when_repo_deleted(tmp_path):
+    committer = _Committer()
+    service, intent = _service(tmp_path, committer=committer)
+    asyncio.run(service.run(intent, idempotency_key="run-deleted-conflict"))
+    changed_intent = intent.model_copy(update={"changed_lines_total": 2})
+    shutil.rmtree(intent.repository_path)
+
+    with pytest.raises(IdempotencyConflictError):
+        asyncio.run(service.run(changed_intent, idempotency_key="run-deleted-conflict"))
+
+    assert [call[0] for call in committer.calls] == ["lookup", "commit", "lookup"]
+
+
+def test_committer_error_is_not_converted_to_success(tmp_path):
+    class _ErrorCommitter(_Committer):
+        def commit(self, bundle, *, idempotency_key, request_digest):
+            self.calls.append(("commit", idempotency_key, request_digest))
+            raise RuntimeError("commit failed")
+
+    committer = _ErrorCommitter()
+    service, intent = _service(tmp_path, committer=committer)
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        asyncio.run(service.run(intent, idempotency_key="run-commit-error"))
+
+    assert [call[0] for call in committer.calls] == ["lookup", "commit"]
+
+
+def test_committer_none_is_not_converted_to_success(tmp_path):
+    class _NoneCommitter(_Committer):
+        def commit(self, bundle, *, idempotency_key, request_digest):
+            self.calls.append(("commit", idempotency_key, request_digest))
+            return None
+
+    committer = _NoneCommitter()
+    service, intent = _service(tmp_path, committer=committer)
+
+    with pytest.raises(AssuranceRunError, match="did not return a persisted result"):
+        asyncio.run(service.run(intent, idempotency_key="run-commit-none"))
+
+    assert [call[0] for call in committer.calls] == ["lookup", "commit"]
+
+
+def test_final_fence_ttl_uses_fresh_clock_after_artifact_verification(tmp_path):
+    base = datetime.now(timezone.utc)
+    clock_calls = []
+
+    def clock():
+        clock_calls.append(len(clock_calls) + 1)
+        return base if len(clock_calls) < 6 else base + timedelta(seconds=2)
+
+    service, intent = _service(
+        tmp_path,
+        freshness_ttl_seconds=1,
+        clock=clock,
+    )
+    committer = service._committer
+
+    with pytest.raises(AssuranceRunStaleError, match="TTL expired"):
+        asyncio.run(service.run(intent, idempotency_key="run-ttl-expired"))
+
+    assert len(clock_calls) >= 6
+    assert not any(call[0] == "commit" for call in committer.calls)
+
+
+def test_service_preserves_frozen_stage_order(tmp_path):
+    service, intent = _service(tmp_path)
+    order = []
+    original_git = service._git_collector
+    original_intake = service._intake_collector
+    original_commands = service._command_collector
+    original_context = service._context_builder
+    original_reviewer = service._reviewer_invoker
+    original_committer = service._committer
+
+    class _Git:
+        def collect(self, *args, **kwargs):
+            order.append("git")
+            return original_git.collect(*args, **kwargs)
+
+    class _Intake:
+        def probe_task_digest(self, *args, **kwargs):
+            order.append("probe")
+            return original_intake.probe_task_digest(*args, **kwargs)
+
+        def collect(self, *args, **kwargs):
+            order.append("intake")
+            return original_intake.collect(*args, **kwargs)
+
+    class _Commands:
+        def collect(self, *args, **kwargs):
+            order.append("commands")
+            return original_commands.collect(*args, **kwargs)
+
+    class _Context:
+        def prepare(self, *args, **kwargs):
+            order.append("redaction")
+            return original_context.prepare(*args, **kwargs)
+
+    class _Reviewer:
+        async def invoke(self, *args, **kwargs):
+            order.append("reviewer")
+            return await original_reviewer.invoke(*args, **kwargs)
+
+    class _Committer:
+        def lookup(self, *args, **kwargs):
+            order.append("lookup")
+            return original_committer.lookup(*args, **kwargs)
+
+        def commit(self, *args, **kwargs):
+            order.append("commit")
+            return original_committer.commit(*args, **kwargs)
+
+    service._git_collector = _Git()
+    service._intake_collector = _Intake()
+    service._command_collector = _Commands()
+    service._context_builder = _Context()
+    service._reviewer_invoker = _Reviewer()
+    service._committer = _Committer()
+
+    asyncio.run(service.run(intent, idempotency_key="run-order"))
+
+    assert order == [
+        "lookup",
+        "probe",
+        "git",
+        "intake",
+        "commands",
+        "redaction",
+        "reviewer",
+        "git",
+        "intake",
+        "commit",
+    ]
+
+
+def test_sync_validation_collectors_context_normalize_artifact_and_commit_use_worker_threads(
+    tmp_path, monkeypatch
+):
+    service, intent = _service(tmp_path)
+    event_loop_thread = threading.get_ident()
+    thread_ids = {}
+    original_git = service._git_collector
+    original_intake = service._intake_collector
+    original_commands = service._command_collector
+    original_context = service._context_builder
+    original_committer = service._committer
+    original_verify = service._artifact_store.verify
+    original_normalize = run_service_module.SingleStrongReviewer.normalize
+
+    def record(name):
+        thread_ids.setdefault(name, threading.get_ident())
+
+    def validate_workspace(value):
+        record("workspace")
+        return original_validate_workspace(value)
+
+    original_validate_workspace = service._validate_workspace
+    service._validate_workspace = validate_workspace
+
+    class _Git:
+        def collect(self, *args, **kwargs):
+            record("git")
+            return original_git.collect(*args, **kwargs)
+
+    class _Intake:
+        def probe_task_digest(self, *args, **kwargs):
+            record("probe")
+            return original_intake.probe_task_digest(*args, **kwargs)
+
+        def collect(self, *args, **kwargs):
+            record("intake")
+            return original_intake.collect(*args, **kwargs)
+
+    class _Commands:
+        def collect(self, *args, **kwargs):
+            record("commands")
+            return original_commands.collect(*args, **kwargs)
+
+    class _Context:
+        def prepare(self, *args, **kwargs):
+            record("context")
+            return original_context.prepare(*args, **kwargs)
+
+    class _Committer:
+        def lookup(self, *args, **kwargs):
+            record("lookup")
+            return original_committer.lookup(*args, **kwargs)
+
+        def commit(self, *args, **kwargs):
+            record("commit")
+            return original_committer.commit(*args, **kwargs)
+
+    def verify(digest):
+        record("artifact")
+        return original_verify(digest)
+
+    def normalize(*args, **kwargs):
+        record("normalize")
+        return original_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        run_service_module.SingleStrongReviewer,
+        "normalize",
+        staticmethod(normalize),
+    )
+    service._git_collector = _Git()
+    service._intake_collector = _Intake()
+    service._command_collector = _Commands()
+    service._context_builder = _Context()
+    service._committer = _Committer()
+    service._artifact_store.verify = verify
+
+    asyncio.run(service.run(intent, idempotency_key="run-worker-threads"))
+
+    assert {
+        "workspace",
+        "lookup",
+        "probe",
+        "git",
+        "intake",
+        "commands",
+        "context",
+        "normalize",
+        "artifact",
+        "commit",
+    } <= thread_ids.keys()
+    assert all(thread_id != event_loop_thread for thread_id in thread_ids.values())
+
+
+def test_final_git_fence_rejects_reviewer_side_drift_without_commit(tmp_path):
+    service, intent = _service(tmp_path)
+    committer = service._committer
+
+    class _DriftingReviewer(_Reviewer):
+        async def invoke(self, prompt, *, run_id, route):
+            self.calls += 1
+            (intent.repository_path / "changed.txt").write_text(
+                "changed by reviewer\n", encoding="utf-8"
+            )
+            return await _Reviewer.invoke(self, prompt, run_id=run_id, route=route)
+
+    service._reviewer_invoker = _DriftingReviewer()
+    with pytest.raises(AssuranceRunStaleError):
+        asyncio.run(service.run(intent, idempotency_key="run-drift"))
+
+    assert not any(call[0] == "commit" for call in committer.calls)
+
+
+def test_final_fence_rejects_tampered_evidence_artifact(tmp_path):
+    service, intent = _service(tmp_path)
+    committer = service._committer
+
+    class _TamperingReviewer(_Reviewer):
+        async def invoke(self, prompt, *, run_id, route):
+            digest = prompt.input.contexts[0].artifact_digest
+            service._artifact_store._artifact_path(digest).write_bytes(b"tampered")
+            return await super().invoke(prompt, run_id=run_id, route=route)
+
+    service._reviewer_invoker = _TamperingReviewer()
+    with pytest.raises(AssuranceRunStaleError):
+        asyncio.run(service.run(intent, idempotency_key="run-evidence-tamper"))
+
+    assert not any(call[0] == "commit" for call in committer.calls)
+
+
+def test_final_fence_rejects_tampered_manifest_artifact(tmp_path):
+    service, intent = _service(tmp_path)
+    committer = service._committer
+    manifest_digest = {}
+    original_build_manifest = service._build_manifest
+
+    def capture_manifest(*args):
+        result = original_build_manifest(*args)
+        manifest_digest["value"] = result.manifest.artifact_digest
+        return result
+
+    service._build_manifest = capture_manifest
+
+    class _TamperingReviewer(_Reviewer):
+        async def invoke(self, prompt, *, run_id, route):
+            service._artifact_store._artifact_path(
+                manifest_digest["value"]
+            ).write_bytes(b"tampered manifest")
+            return await super().invoke(prompt, run_id=run_id, route=route)
+
+    service._reviewer_invoker = _TamperingReviewer()
+    with pytest.raises(AssuranceRunStaleError):
+        asyncio.run(service.run(intent, idempotency_key="run-manifest-tamper"))
+
+    assert not any(call[0] == "commit" for call in committer.calls)
