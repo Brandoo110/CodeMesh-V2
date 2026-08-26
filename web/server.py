@@ -35,7 +35,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from web import __version__
-from web.routes import assurance, chat, health, memory, models, sessions, stats, workflows
+from web.routes import (
+    assurance,
+    assurance_lifecycle,
+    chat,
+    health,
+    memory,
+    models,
+    sessions,
+    stats,
+    workflows,
+)
 
 
 def create_app() -> FastAPI:
@@ -77,6 +87,7 @@ def create_app() -> FastAPI:
     app.include_router(memory.router, prefix="/api")
     app.include_router(workflows.router, prefix="/api")  # v5 Phase 6.1
     app.include_router(assurance.router, prefix="/api")
+    app.include_router(assurance_lifecycle.router, prefix="/api")
 
     return app
 
