@@ -28,6 +28,7 @@ from assurance.run_service import (
     AssuranceRunResult,
     AssuranceRunService,
     AssuranceRunStaleError,
+    AssuranceRunPreconditionError,
     AssuranceRunValidationError,
     IdempotencyConflictError,
     RedactionDisposition,
@@ -316,6 +317,22 @@ def test_intent_rejects_command_outside_frozen_allowlist_before_lookup(tmp_path)
         asyncio.run(service.run(invalid, idempotency_key="run-unknown-command"))
 
     assert committer.calls == []
+
+
+@pytest.mark.parametrize(
+    "provider_boundary", ["unknown", "crosses_declared_boundary"]
+)
+def test_provider_boundary_precondition_fails_before_any_work(
+    tmp_path, provider_boundary
+):
+    service, intent = _service(tmp_path)
+    invalid = intent.model_copy(update={"provider_boundary": provider_boundary})
+
+    with pytest.raises(AssuranceRunPreconditionError):
+        asyncio.run(service.run(invalid, idempotency_key="run-boundary"))
+
+    assert service._committer.calls == []
+    assert service._reviewer_invoker.calls == 0
 
 
 def test_unsafe_redaction_disposition_cannot_carry_content():

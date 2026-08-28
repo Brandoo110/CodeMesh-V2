@@ -31,6 +31,12 @@ localhost 单用户场景（ADR-0006 部署目标），允许 Next.js 默认端�
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+from typing import Any
+
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -39,6 +45,10 @@ from fastapi.responses import JSONResponse
 
 from web import __version__
 from web.assurance_run_composition import AssuranceRunWebDependencies
+from web.assurance_runtime import (
+    AssuranceRuntimeStartupError,
+    load_assurance_runtime_from_environment,
+)
 from web.assurance_store import get_assurance_repository
 from web.routes import (
     assurance,
@@ -57,13 +67,80 @@ from web.routes import (
 def create_app(
     *,
     assurance_run_dependencies: AssuranceRunWebDependencies | None = None,
+    assurance_runtime_loader: Callable[[], Any] | None = None,
     enable_assurance_fixture_mutations: bool = False,
 ) -> FastAPI:
     """工厂函数 —— 方便测试时注入 dependencies。"""
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        previous_dependencies = app.state.assurance_run_dependencies
+        previous_runtime = getattr(app.state, "assurance_runtime", None)
+        missing = object()
+        previous_repository_override = app.dependency_overrides.get(
+            get_assurance_repository, missing
+        )
+        runtime = None
+        installed_runtime_override = False
+        close_error = False
+
+        try:
+            if previous_dependencies is None and assurance_runtime_loader is not None:
+                try:
+                    candidate = assurance_runtime_loader()
+                    if inspect.isawaitable(candidate):
+                        candidate = await candidate
+                    if candidate is not None:
+                        runtime = candidate
+                        dependencies = AssuranceRunWebDependencies(
+                            service=candidate.service,
+                            repository=candidate.repository,
+                        )
+                        # The runtime is loaded only at application startup; the
+                        # ordinary factory remains free of environment reads.
+                        app.state.assurance_runtime = candidate
+                        app.state.assurance_run_dependencies = dependencies
+                        app.dependency_overrides[get_assurance_repository] = (
+                            lambda: dependencies.repository
+                        )
+                        installed_runtime_override = True
+                except AssuranceRuntimeStartupError:
+                    raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise AssuranceRuntimeStartupError() from None
+
+            yield
+        finally:
+            try:
+                if runtime is not None:
+                    try:
+                        result = runtime.aclose()
+                        if inspect.isawaitable(result):
+                            await result
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        close_error = True
+            finally:
+                if installed_runtime_override:
+                    if previous_repository_override is missing:
+                        app.dependency_overrides.pop(get_assurance_repository, None)
+                    else:
+                        app.dependency_overrides[
+                            get_assurance_repository
+                        ] = previous_repository_override
+                app.state.assurance_run_dependencies = previous_dependencies
+                app.state.assurance_runtime = previous_runtime
+            if close_error:
+                raise AssuranceRuntimeStartupError() from None
+
     app = FastAPI(
         title="CodeMesh Web API",
         version=__version__,
         description="CodeMesh Web UI 后端 — FastAPI 直接复用 harness（详见 ADR-0006）",
+        lifespan=lifespan,
     )
 
     # CORS：本地开发环境允许 Next.js dev server
@@ -83,6 +160,7 @@ def create_app(
         allow_headers=["*"],
     )
     app.state.assurance_run_dependencies = assurance_run_dependencies
+    app.state.assurance_runtime = None
     if assurance_run_dependencies is not None:
         # Product read routes and the Run adapter must observe the same
         # repository instance.  This is an app-local dependency override; the
@@ -131,4 +209,4 @@ def create_app(
 
 
 # Uvicorn 入口
-app = create_app()
+app = create_app(assurance_runtime_loader=load_assurance_runtime_from_environment)

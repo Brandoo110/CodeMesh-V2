@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 from assurance.run_service import (
     AssuranceRunError,
     AssuranceRunIntent,
+    AssuranceRunPreconditionError,
     AssuranceRunRedactionError,
     AssuranceRunResult,
     AssuranceRunService,
@@ -125,6 +126,13 @@ def _to_intent(request: AssuranceRunRequest) -> AssuranceRunIntent:
 def _map_run_exception(exc: BaseException) -> JSONResponse:
     """Map only stable public classes; never expose exception text."""
 
+    if isinstance(exc, AssuranceRunPreconditionError):
+        return _error(
+            412,
+            "ASSURANCE_RUN_PRECONDITION",
+            "assurance run precondition was not satisfied",
+            "PROVIDER_BOUNDARY_REQUIRED",
+        )
     if isinstance(exc, AssuranceRunValidationError):
         return _error(
             422,

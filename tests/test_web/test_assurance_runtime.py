@@ -1,9 +1,11 @@
 import asyncio
 import json
 from pathlib import Path
+import re
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 import web.assurance_runtime as runtime_module
 from assurance.artifacts import ArtifactStore
@@ -16,6 +18,9 @@ from web.assurance_runtime import (
     AssuranceRuntimeStartupError,
     load_assurance_runtime_from_environment,
 )
+from web.routes.assurance_runs import get_assurance_run_client
+from web.server import create_app
+from tests.test_assurance_run_service import _repository
 
 
 def _config(tmp_path: Path, **updates):
@@ -264,3 +269,108 @@ def test_path_access_failure_is_startup_error_before_runtime_construction(
     assert "secret-token" not in str(error.value)
     assert "/private/internal/workspace" not in str(error.value)
     assert calls == []
+
+
+def test_delayed_lifespan_loader_runs_fake_post_chain_and_closes_once(
+    tmp_path,
+):
+    config = _config(tmp_path)
+    workspace = Path(config["workspace_root"])
+    repository_path = _repository(workspace)
+    config_path = _write_config(tmp_path, config)
+    requests = []
+    close_calls = []
+
+    async def handler(request):
+        requests.append(request)
+        payload = json.loads(request.content)
+        prompt_text = payload["messages"][0]["content"]
+        subject_digest = re.search(
+            r"^Subject digest: (sha256:[0-9a-f]{64})$",
+            prompt_text,
+            re.MULTILINE,
+        ).group(1)
+        rubric_hash = re.search(
+            r"^Rubric hash: (sha256:[0-9a-f]{64})$",
+            prompt_text,
+            re.MULTILINE,
+        ).group(1)
+        response_body = {
+            "schema_version": "v1",
+            "subject_digest": subject_digest,
+            "rubric_hash": rubric_hash,
+            "findings": [],
+            "questions": [],
+        }
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-fake",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "deepseek-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                response_body, separators=(",", ":")
+                            ),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    class _CountingMockTransport(httpx.MockTransport):
+        async def aclose(self):
+            close_calls.append(True)
+            await super().aclose()
+
+    transport = _CountingMockTransport(handler)
+    loader_calls = []
+    runtime_holder = {}
+
+    def loader():
+        loader_calls.append(True)
+        runtime = load_assurance_runtime_from_environment(
+            _environment(config_path), reviewer_transport=transport
+        )
+        runtime_holder["runtime"] = runtime
+        return runtime
+
+    app = create_app(assurance_runtime_loader=loader)
+    app.dependency_overrides[get_assurance_run_client] = lambda: "127.0.0.1"
+    body = {
+        "repository_path": str(repository_path),
+        "repository_identity": "example/service",
+        "author": "author-agent",
+        "base_ref": "HEAD",
+        "task_path": "TASK.md",
+        "policy_paths": ["POLICY.md"],
+        "adr_paths": [],
+        "runbook_paths": [],
+        "command_ids": ["check"],
+        "changed_lines_total": 1,
+        "external_side_effects": "none_declared",
+        "provider_boundary": "within_declared_boundary",
+    }
+
+    assert loader_calls == []
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/assurance/runs",
+            headers={"Idempotency-Key": "run:lifespan"},
+            json=body,
+        )
+        assert 200 <= response.status_code < 300
+        assert response.json()["case_view"]["gate"] == "PASS"
+        assert response.json()["case_view"]["policy_gate"]["status"] == "PASS"
+
+    assert loader_calls == [True]
+    assert len(requests) == 1
+    assert close_calls == [True]
+    runtime = runtime_holder["runtime"]
+    assert runtime.service._committer is runtime.repository

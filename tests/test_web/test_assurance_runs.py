@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from assurance.run_service import (
     AssuranceRunError,
+    AssuranceRunPreconditionError,
     AssuranceRunRedactionError,
     AssuranceRunStaleError,
     AssuranceRunValidationError,
@@ -226,6 +227,7 @@ class _UnusedRepository:
     ("error_type", "status_code", "code"),
     (
         (AssuranceRunValidationError, 422, "ASSURANCE_RUN_INVALID"),
+        (AssuranceRunPreconditionError, 412, "ASSURANCE_RUN_PRECONDITION"),
         (AssuranceRunStaleError, 409, "ASSURANCE_RUN_STALE"),
         (IdempotencyConflictError, 409, "ASSURANCE_RUN_CONFLICT"),
         (AssuranceWebConflictError, 409, "ASSURANCE_RUN_CONFLICT"),

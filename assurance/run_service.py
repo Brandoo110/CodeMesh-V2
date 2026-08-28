@@ -199,6 +199,10 @@ class AssuranceRunValidationError(AssuranceRunError, ValueError):
     """Caller intent or immutable run configuration is invalid."""
 
 
+class AssuranceRunPreconditionError(AssuranceRunError):
+    """A required external-side-effect precondition was not satisfied."""
+
+
 class AssuranceRunStaleError(AssuranceRunError):
     """A source or artifact changed after it was collected."""
 
@@ -1377,6 +1381,10 @@ class AssuranceRunService:
     def _validate_intent(self, intent: AssuranceRunIntent, idempotency_key: str) -> None:
         if type(intent) is not AssuranceRunIntent:
             raise AssuranceRunValidationError("intent must be an exact AssuranceRunIntent")
+        if getattr(intent, "provider_boundary", None) != "within_declared_boundary":
+            raise AssuranceRunPreconditionError(
+                "provider boundary must remain within the declared boundary"
+            )
         if type(idempotency_key) is not str or not idempotency_key.strip():
             raise AssuranceRunValidationError("idempotency_key must be nonblank")
         if len(idempotency_key.encode("utf-8")) > 256:
@@ -2130,6 +2138,7 @@ __all__ = [
     "AssuranceRunBundle",
     "AssuranceRunConfig",
     "AssuranceRunIntent",
+    "AssuranceRunPreconditionError",
     "AssuranceRunResult",
     "AssuranceRunService",
     "FreshnessSourceBinding",
