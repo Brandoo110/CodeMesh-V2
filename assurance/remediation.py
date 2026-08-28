@@ -25,8 +25,9 @@ from pydantic import (
     model_validator,
 )
 
-from assurance.contracts import Finding
+from assurance.contracts import ExecutionReceipt, Finding
 from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.remediation_reviewer import PreparedReviewerRerun
 from assurance.remediation_validation import (
     BudgetedValidationExecutor,
     ValidationResult,
@@ -34,6 +35,7 @@ from assurance.remediation_validation import (
     make_validation_tool_registry,
 )
 from assurance.remediation_workspace import IsolatedWorkspace, WorkspaceGrant
+from assurance.run_service import ReviewerRunRecord
 
 
 _SHA256_PREFIX = "sha256:"
@@ -116,13 +118,14 @@ class RemediationRequest(BaseModel):
 
 
 class ReviewerRerunReceipt(BaseModel):
-    """Subject/role binding returned by the injected reviewer rerunner."""
+    """Auditable subject/role binding for one prepared reviewer rerun."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     reviewer_role: Literal["intent", "architecture", "operability"]
     subject_digest: str
-    accepted: StrictBool = True
+    reviewer: ReviewerRunRecord
+    execution_receipt: ExecutionReceipt
 
     @field_validator("subject_digest")
     @classmethod
@@ -130,6 +133,54 @@ class ReviewerRerunReceipt(BaseModel):
         if not _is_sha256_digest(value):
             raise ValueError("subject_digest must be sha256:<64 lowercase hex>")
         return value
+
+    @model_validator(mode="after")
+    def _bind_successful_rerun(self) -> "ReviewerRerunReceipt":
+        if type(self.reviewer) is not ReviewerRunRecord:
+            raise ValueError("reviewer must be an exact ReviewerRunRecord")
+        if type(self.execution_receipt) is not ExecutionReceipt:
+            raise ValueError("execution_receipt must be an exact ExecutionReceipt")
+        if self.reviewer.status != "success":
+            raise ValueError("reviewer rerun must bind a successful reviewer")
+        if self.execution_receipt.overall_result != "success":
+            raise ValueError("reviewer rerun must bind a successful receipt")
+        if self.execution_receipt.subject_digest != self.subject_digest:
+            raise ValueError("reviewer rerun receipt subject does not match")
+        steps = self.execution_receipt.steps
+        selected = tuple(
+            step for step in steps if step.planned_role == self.reviewer_role
+        )
+        if len(selected) != 1:
+            raise ValueError("reviewer rerun role must have one receipt step")
+        step = selected[0]
+        if step.result != "success" or step.actual_role != self.reviewer_role:
+            raise ValueError("selected reviewer role was not executed")
+        if step.model_ref != self.reviewer.actual_model_ref:
+            raise ValueError("reviewer model provenance does not match receipt")
+        if step.provider != self.reviewer.actual_provider:
+            raise ValueError("reviewer provider provenance does not match receipt")
+        if step.schema_status != self.reviewer.schema_status:
+            raise ValueError("reviewer schema provenance does not match receipt")
+        if self.reviewer.usage_status == "measured":
+            if (
+                self.execution_receipt.input_tokens != self.reviewer.input_tokens
+                or self.execution_receipt.output_tokens != self.reviewer.output_tokens
+                or self.execution_receipt.cost_usd != self.reviewer.cost_usd
+            ):
+                raise ValueError("reviewer usage provenance does not match receipt")
+        elif (
+            self.execution_receipt.input_tokens != 0
+            or self.execution_receipt.output_tokens != 0
+            or self.execution_receipt.cost_usd != 0.0
+        ):
+            raise ValueError("unavailable reviewer usage must remain zero")
+        return self
+
+    @property
+    def reviewer_record(self) -> ReviewerRunRecord:
+        """Compatibility-free descriptive alias for the nested reviewer record."""
+
+        return self.reviewer
 
 
 class RemediationAttempt(BaseModel):
@@ -232,7 +283,6 @@ class RemediationResult(BaseModel):
             if (
                 receipt.reviewer_role != self.rerun_roles[0]
                 or receipt.subject_digest != self.new_subject_digest
-                or receipt.accepted is not True
             ):
                 raise ValueError("reviewer receipt is not bound to the new subject")
         else:
@@ -402,7 +452,14 @@ class RemediationController:
         }
         return await _await_if_needed(function(**_filtered_kwargs(function, values)))
 
-    async def _run_reviewer(self, role: str, subject: SubjectDigestInput, digest: str) -> Any:
+    async def _run_reviewer(
+        self,
+        role: str,
+        subject: SubjectDigestInput,
+        digest: str,
+        *,
+        workspace: IsolatedWorkspace,
+    ) -> Any:
         function = self.reviewer_rerunner
         values = {
             "reviewer_role": role,
@@ -412,42 +469,25 @@ class RemediationController:
             "subject_digest": digest,
             "request": self.request,
             "finding_id": self.request.human_selected_finding_id,
+            "selected_finding": self.selected_finding,
+            "workspace": workspace,
         }
         return await _await_if_needed(function(**_filtered_kwargs(function, values)))
 
     @staticmethod
     def _reviewer_receipt(result: Any, role: str, digest: str) -> ReviewerRerunReceipt | None:
-        if isinstance(result, ReviewerRerunReceipt):
-            if result.accepted is not True:
-                return None
-            candidate_role = result.reviewer_role
-            candidate_digest = result.subject_digest
-        elif isinstance(result, Mapping):
-            if result.get("accepted") is not True:
-                return None
-            candidate_role = result.get("reviewer_role", result.get("role"))
-            candidate_digest = result.get("subject_digest")
-        else:
-            if getattr(result, "accepted", None) is not True:
-                return None
-            candidate_role = getattr(result, "reviewer_role", getattr(result, "role", None))
-            candidate_digest = getattr(result, "subject_digest", None)
-            findings = getattr(result, "findings", None)
-            if (candidate_role is None or candidate_digest is None) and findings:
-                for finding in findings:
-                    finding_role = getattr(finding, "reviewer_role", None)
-                    finding_digest = getattr(finding, "subject_digest", None)
-                    if finding_role is not None and finding_digest is not None:
-                        candidate_role, candidate_digest = finding_role, finding_digest
-                        break
-        if candidate_role != role or candidate_digest != digest:
+        if type(result) is not PreparedReviewerRerun:
+            return None
+        if result.reviewer_role != role or result.bundle.subject.subject_digest != digest:
             return None
         try:
             return ReviewerRerunReceipt(
                 reviewer_role=role,
                 subject_digest=digest,
+                reviewer=result.bundle.reviewer,
+                execution_receipt=result.bundle.execution_receipt,
             )
-        except ValueError:
+        except (TypeError, ValueError):
             return None
 
     @staticmethod
@@ -708,7 +748,12 @@ class RemediationController:
                 )
 
             role = self.selected_finding.reviewer_role
-            reviewer_output = await self._run_reviewer(role, subject_input, new_digest)
+            reviewer_output = await self._run_reviewer(
+                role,
+                subject_input,
+                new_digest,
+                workspace=workspace,
+            )
             reviewer_receipt = self._reviewer_receipt(reviewer_output, role, new_digest)
             if reviewer_receipt is None:
                 return self._result(

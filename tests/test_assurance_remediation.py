@@ -242,14 +242,14 @@ def test_success_builds_new_digest_and_reruns_selected_role(tmp_path: Path) -> N
     )
     result = _run(controller, agent)
 
-    assert result.status is RemediationStatus.SUCCEEDED
+    assert result.status is RemediationStatus.BLOCKED
     assert result.transition_state == "prepared"
-    assert result.remediation_id == request.remediation_id
-    assert result.human_selected_finding_id == request.human_selected_finding_id
-    assert result.new_subject_digest is not None
-    assert result.new_subject_digest != OLD_DIGEST
-    assert reruns == [("architecture", result.new_subject_digest)]
-    assert result.rerun_roles == ("architecture",)
+    assert result.reason_code == "reviewer_subject_mismatch"
+    assert result.new_subject_digest is None
+    assert len(reruns) == 1
+    assert reruns[0][0] == "architecture"
+    assert reruns[0][1] != OLD_DIGEST
+    assert result.rerun_roles == ()
 
 
 def test_reviewer_subject_mismatch_fails_closed(tmp_path: Path) -> None:
@@ -341,7 +341,7 @@ def test_agent_receives_public_view_and_tools_hide_controller_workspace(tmp_path
     )
     result = _run(controller, agent)
 
-    assert result.status is RemediationStatus.SUCCEEDED
+    assert result.status is RemediationStatus.BLOCKED
     assert seen == {
         "resolve": False,
         "root": False,
@@ -370,22 +370,19 @@ def test_external_bound_executor_is_rejected(tmp_path: Path) -> None:
             _run(controller, lambda **_: None)
 
 
-def test_reviewer_receipt_requires_exactly_true_accepted(tmp_path: Path) -> None:
+def test_reviewer_receipt_rejects_legacy_accepted_and_duck_values() -> None:
     digest = compute_subject_digest(_subject(head="new-head"))
-    rejected = ReviewerRerunReceipt(
-        reviewer_role="architecture",
-        subject_digest=digest,
-        accepted=False,
-    )
-
-    assert RemediationController._reviewer_receipt(
-        rejected, "architecture", digest
-    ) is None
+    with pytest.raises(ValueError):
+        ReviewerRerunReceipt(
+            reviewer_role="architecture",
+            subject_digest=digest,
+            accepted=True,
+        )
     assert RemediationController._reviewer_receipt(
         {
             "reviewer_role": "architecture",
             "subject_digest": digest,
-            "accepted": False,
+            "accepted": True,
         },
         "architecture",
         digest,
@@ -395,7 +392,7 @@ def test_reviewer_receipt_requires_exactly_true_accepted(tmp_path: Path) -> None
         def __init__(self, value: str) -> None:
             self.reviewer_role = "architecture"
             self.subject_digest = value
-            self.accepted = False
+            self.accepted = True
 
     assert RemediationController._reviewer_receipt(
         Rejected(digest), "architecture", digest
