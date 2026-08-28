@@ -1,0 +1,45 @@
+{
+  "schema_version": "v2",
+  "workspace_root": "/ABSOLUTE/PATH/TO/CODEMESH_WORKSPACE",
+  "database_path": "/ABSOLUTE/PATH/TO/CODEMESH_RUNTIME/assurance.sqlite",
+  "artifact_store_root": "/ABSOLUTE/PATH/TO/CODEMESH_RUNTIME/artifacts",
+  "allowed_commands": [
+    {
+      "schema_version": "v1",
+      "command_id": "diff-check",
+      "kind": "lint",
+      "argv": ["git", "diff", "--check", "HEAD", "--"],
+      "cwd": ".",
+      "timeout_seconds": 60.0,
+      "max_output_bytes": 65536
+    }
+  ],
+  "orchestration_version": "golden.v1",
+  "redaction_policy_version": "redaction.v0",
+  "policy_version": "gate.v0",
+  "rubric_version": "single_general.v0",
+  "freshness_ttl_seconds": 300,
+  "reviewer": {
+    "provider": "deepseek",
+    "model_ref": "deepseek-chat",
+    "timeout_seconds": 60,
+    "token_budget": 4096,
+    "routing_rule": "single_general.v0:fixed"
+  },
+  "remediation": {
+    "provider": "qwen",
+    "model_ref": "qwen-max",
+    "workspace_grant": {
+      "allowed_paths": ["PATH/TO/REAL_FILE.py"],
+      "max_files": 4,
+      "max_bytes": 4096
+    },
+    "policy": {
+      "max_attempts": 1,
+      "max_agent_iterations": 2,
+      "max_validation_calls_per_attempt": 1,
+      "total_wall_time_s": 30.0,
+      "authoritative_check_id": "diff-check"
+    }
+  }
+}
