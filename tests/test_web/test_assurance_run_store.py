@@ -5,12 +5,28 @@ import json
 import shutil
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from threading import Barrier
 
 import pytest
 
+from assurance.remediation import (
+    PreparedRemediationHandoff,
+    RemediationController,
+)
+from assurance.remediation_validation import ValidationStatus
+from assurance.remediation_reviewer import AssuranceRemediationReviewer
+from assurance.live_freshness import FreshnessStatus, LiveFreshness
 from tests.test_assurance_run_service import _Reviewer, _service
+from tests.test_assurance_remediation import _FakeExecutor
+from tests.test_assurance_remediation_reviewer import (
+    _FindingReviewer,
+    _baseline_and_changed_subject,
+    _request_for_baseline,
+    _reconfigure_service,
+)
 from web.assurance_store import (
+    AssuranceWebConflictError,
     AssuranceWebError,
     AssuranceWebRepository,
 )
@@ -31,6 +47,31 @@ def _db_rows(repository: AssuranceWebRepository, query: str):
         return conn.execute(query).fetchall()
     finally:
         conn.close()
+
+
+class _FreshnessFixture:
+    def __init__(self, status: FreshnessStatus):
+        self.status = status
+
+    def check(self, *_):
+        return LiveFreshness(
+            status=self.status,
+            reason_code=self.status.value.upper(),
+            checked_at=datetime.now(timezone.utc),
+        )
+
+
+class _ExplodingFreshness:
+    def check(self, *_):
+        raise RuntimeError("freshness exploded")
+
+
+def _fresh_repository(tmp_path):
+    return AssuranceWebRepository(
+        tmp_path / "assurance.sqlite",
+        freshness_checker=_FreshnessFixture(FreshnessStatus.FRESH),
+        live_required=False,
+    )
 
 
 def test_commit_lookup_projects_run_and_keeps_local_source_private(tmp_path):
@@ -497,3 +538,559 @@ def test_questions_replay_as_additive_projection_and_keep_missing_refs(tmp_path)
     assert replay is not None
     assert replay.cached is True
     assert replay.bundle.questions == (question,)
+
+
+def _prepared_success(tmp_path, monkeypatch):
+    (
+        service,
+        intent,
+        baseline,
+        workspace,
+        changed_bundle,
+        subject_input,
+        selected_finding,
+    ) = _baseline_and_changed_subject(tmp_path, monkeypatch)
+    request, _ = _request_for_baseline(baseline)
+    executor = _FakeExecutor([ValidationStatus.FAILED, ValidationStatus.PASSED])
+
+    def service_factory(root):
+        _reconfigure_service(service, root)
+        return service
+
+    adapter = AssuranceRemediationReviewer(
+        baseline_bundle=baseline,
+        service_factory=service_factory,
+    )
+
+    async def reviewer(**kwargs):
+        return await adapter.rerun(
+            reviewer_role=kwargs["reviewer_role"],
+            subject_input=kwargs["subject_input"],
+            subject_digest=kwargs["subject_digest"],
+            workspace=kwargs["workspace"],
+            request=kwargs["request"],
+            selected_finding=kwargs["selected_finding"],
+        )
+
+    async def agent(*, workspace, **_):
+        workspace.write_text("changed.txt", "repaired\n")
+
+    controller = RemediationController(
+        request=request,
+        selected_finding=selected_finding,
+        seed_root=intent.repository_path,
+        validation_executor=lambda _workspace: executor,
+        subject_builder=lambda _patch_digest: subject_input,
+        reviewer_rerunner=reviewer,
+    )
+    handoff = asyncio.run(controller.prepare(agent))
+    assert type(handoff) is PreparedRemediationHandoff
+    return baseline, changed_bundle, request, handoff
+
+
+def test_commit_prepared_remediation_projects_authoritative_transition(
+    tmp_path, monkeypatch
+):
+    baseline, changed_bundle, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+
+    receipt = repository.commit_prepared_remediation(
+        request,
+        handoff,
+        idempotency_key="remediate:happy",
+    )
+
+    assert receipt.old_case_id == baseline.case.case_id
+    assert receipt.new_case_id == changed_bundle.draft_case.case_id
+
+
+def test_commit_prepared_remediation_is_atomic_and_replays_exactly(
+    tmp_path, monkeypatch
+):
+    baseline, changed_bundle, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+
+    receipt = repository.commit_prepared_remediation(
+        request, handoff, idempotency_key="remediate:atomic"
+    )
+    old_state = repository._store.load_case(request.old_case_id)
+    new_state = repository._store.load_case(receipt.new_case_id)
+    assert old_state.case.state == "INVALIDATED"
+    assert old_state.applied_events[-1].event_id == receipt.invalidation_event_id
+    assert new_state.case.state == "DRAFT"
+    assert new_state.applied_events == ()
+    assert repository._store.get_binding(receipt.new_case_id) == handoff.bundle.binding
+    assert repository._store.get_remediation(request.remediation_id) == receipt
+
+    projection = repository.get_change(receipt.new_case_id)
+    assert projection["case"]["state"] == "DRAFT"
+    assert projection["decisions"] == []
+    assert projection["evidence"] == [
+        item.model_dump(mode="json") for item in handoff.bundle.evidence
+    ]
+    assert projection["receipt"] == handoff.bundle.execution_receipt.model_dump(
+        mode="json"
+    )
+
+    rows = {
+        name: _db_rows(
+            repository, f"SELECT * FROM {name}"
+        )
+        for name in (
+            "assurance_cases",
+            "assurance_case_events",
+            "assurance_web_cases",
+            "assurance_web_runs",
+            "assurance_remediations",
+            "assurance_web_idempotency",
+        )
+    }
+    assert len(rows["assurance_cases"]) == 2
+    assert len(rows["assurance_case_events"]) == len(baseline.events) + 1
+    assert len(rows["assurance_web_cases"]) == 2
+    assert len(rows["assurance_web_runs"]) == 2
+    assert len(rows["assurance_remediations"]) == 1
+    remediation_pointer = next(
+        row
+        for row in rows["assurance_web_idempotency"]
+        if row["idempotency_key"] == "remediate:atomic"
+    )
+    assert remediation_pointer["operation"] == "remediate"
+    assert json.loads(remediation_pointer["result_json"])["new_case_id"] == receipt.new_case_id
+    stored_bundle = json.loads(
+        next(
+            row["bundle_json"]
+            for row in rows["assurance_web_runs"]
+            if row["idempotency_key"] == handoff.bundle.idempotency_key
+        )
+    )
+    assert stored_bundle["draft_case"]["state"] == "DRAFT"
+    assert stored_bundle["case"]["state"] in {"EVIDENCE_COLLECTED", "NEEDS_EVIDENCE"}
+
+    before = {
+        name: len(value)
+        for name, value in rows.items()
+        if name not in {"assurance_web_idempotency"}
+    }
+    replay = repository.commit_prepared_remediation(
+        request, handoff, idempotency_key="remediate:atomic"
+    )
+    assert replay == receipt
+    after = {
+        name: len(_db_rows(repository, f"SELECT * FROM {name}"))
+        for name in before
+    }
+    assert after == before
+
+
+def test_commit_prepared_remediation_signature_rejects_caller_facts(
+    tmp_path, monkeypatch
+):
+    _, _, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = AssuranceWebRepository(tmp_path / "assurance.sqlite")
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        repository.commit_prepared_remediation(
+            request,
+            handoff,
+            idempotency_key="remediate:caller-facts",
+            finding=object(),
+        )
+
+
+def test_commit_prepared_remediation_rejects_nested_case_id_tampering(
+    tmp_path, monkeypatch
+):
+    baseline, changed_bundle, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+
+    forged_draft_case = handoff.bundle.draft_case.model_copy(
+        update={"case_id": "evil-case-id"}
+    )
+    forged_run_case = handoff.bundle.case.model_copy(
+        update={"case_id": "evil-case-id"}
+    )
+    forged_bundle = handoff.bundle.model_copy(
+        update={"draft_case": forged_draft_case, "case": forged_run_case}
+    )
+    forged_handoff = PreparedRemediationHandoff(
+        result=handoff.result,
+        bundle=forged_bundle,
+    )
+
+    with pytest.raises(AssuranceWebConflictError, match="case_id|derived|bundle"):
+        repository.commit_prepared_remediation(
+            request,
+            forged_handoff,
+            idempotency_key="remediate:evil-case",
+        )
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_remediations",
+    )[0]["count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("reason_code", "forged"), ("human_selected_finding_id", "forged-finding")),
+)
+def test_remediation_result_success_facts_are_server_derived(
+    tmp_path, monkeypatch, field, value
+):
+    baseline, _, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+    forged_result = handoff.result.model_copy(update={field: value})
+    forged_handoff = PreparedRemediationHandoff(
+        result=forged_result,
+        bundle=handoff.bundle,
+    )
+
+    with pytest.raises(AssuranceWebConflictError, match="result|Finding|derived"):
+        repository.commit_prepared_remediation(
+            request,
+            forged_handoff,
+            idempotency_key=f"remediate:result:{field}",
+        )
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_remediations",
+    )[0]["count"] == 0
+
+
+def test_remediation_replay_rejects_receipt_tampering_even_when_jsons_agree(
+    tmp_path, monkeypatch
+):
+    baseline, _, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+    repository.commit_prepared_remediation(
+        request, handoff, idempotency_key="remediate:receipt-tamper"
+    )
+
+    forged_case_id = "evil-replay-case"
+    conn = sqlite3.connect(repository._db_path)
+    try:
+        lineage = conn.execute(
+            "SELECT receipt_json FROM assurance_remediations WHERE remediation_id = ?",
+            (request.remediation_id,),
+        ).fetchone()
+        pointer = conn.execute(
+            "SELECT result_json FROM assurance_web_idempotency WHERE idempotency_key = ?",
+            ("remediate:receipt-tamper",),
+        ).fetchone()
+        lineage_result = json.loads(lineage[0])
+        pointer_result = json.loads(pointer[0])
+        lineage_result["new_case_id"] = forged_case_id
+        pointer_result["new_case_id"] = forged_case_id
+        encoded_lineage = json.dumps(
+            lineage_result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        encoded_pointer = json.dumps(
+            pointer_result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            "UPDATE assurance_remediations SET new_case_id = ?, receipt_json = ?"
+            " WHERE remediation_id = ?",
+            (forged_case_id, encoded_lineage, request.remediation_id),
+        )
+        conn.execute(
+            "UPDATE assurance_web_idempotency SET result_json = ? WHERE idempotency_key = ?",
+            (encoded_pointer, "remediate:receipt-tamper"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(AssuranceWebError, match="receipt|replay|lineage|case"):
+        repository.commit_prepared_remediation(
+            request, handoff, idempotency_key="remediate:receipt-tamper"
+        )
+
+
+@pytest.mark.parametrize(
+    "checker",
+    (
+        None,
+        _FreshnessFixture(FreshnessStatus.STALE),
+        _ExplodingFreshness(),
+    ),
+)
+def test_remediation_freshness_failure_is_zero_write(
+    tmp_path, monkeypatch, checker
+):
+    baseline, _, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = AssuranceWebRepository(
+        tmp_path / "assurance.sqlite",
+        freshness_checker=checker,
+        live_required=False,
+    )
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+    before = {
+        name: _db_rows(repository, f"SELECT COUNT(*) AS count FROM {name}")[0]["count"]
+        for name in (
+            "assurance_cases",
+            "assurance_case_events",
+            "assurance_web_cases",
+            "assurance_web_runs",
+            "assurance_remediations",
+            "assurance_web_idempotency",
+        )
+    }
+    with pytest.raises(AssuranceWebConflictError, match="freshness"):
+        repository.commit_prepared_remediation(
+            request, handoff, idempotency_key="remediate:freshness"
+        )
+    after = {
+        name: _db_rows(repository, f"SELECT COUNT(*) AS count FROM {name}")[0]["count"]
+        for name in before
+    }
+    assert after == before
+
+
+def test_remediation_idempotency_conflicts_on_payload_or_key_reuse(
+    tmp_path, monkeypatch
+):
+    baseline, _, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+    repository.commit_prepared_remediation(
+        request, handoff, idempotency_key="remediate:conflict"
+    )
+
+    with pytest.raises(AssuranceWebConflictError):
+        repository.commit_prepared_remediation(
+            request.model_copy(update={"requested_by": "another-owner"}),
+            handoff,
+            idempotency_key="remediate:conflict",
+        )
+    forged_handoff = PreparedRemediationHandoff(
+        result=handoff.result.model_copy(update={"reason_code": "forged"}),
+        bundle=handoff.bundle,
+    )
+    with pytest.raises(AssuranceWebConflictError):
+        repository.commit_prepared_remediation(
+            request,
+            forged_handoff,
+            idempotency_key="remediate:conflict",
+        )
+    with pytest.raises(AssuranceWebConflictError, match="already committed"):
+        repository.commit_prepared_remediation(
+            request, handoff, idempotency_key="remediate:another-key"
+        )
+
+
+def test_remediation_fails_closed_when_baseline_pointer_is_corrupt(
+    tmp_path, monkeypatch
+):
+    baseline, _, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+    conn = sqlite3.connect(repository._db_path)
+    try:
+        conn.execute(
+            "DELETE FROM assurance_web_idempotency WHERE idempotency_key = ?",
+            (baseline.idempotency_key,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(AssuranceWebError, match="pointer|idempotency"):
+        repository.commit_prepared_remediation(
+            request, handoff, idempotency_key="remediate:bad-baseline"
+        )
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_remediations",
+    )[0]["count"] == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("missing", "closed", "subject_drift", "duplicate"),
+)
+def test_authoritative_finding_variants_fail_closed_without_writes(
+    tmp_path, monkeypatch, tamper
+):
+    baseline, _, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+    if tamper == "missing":
+        request = request.model_copy(update={"human_selected_finding_id": "missing"})
+    else:
+        conn = sqlite3.connect(repository._db_path)
+        try:
+            row = conn.execute(
+                "SELECT bundle_json FROM assurance_web_runs WHERE idempotency_key = ?",
+                (baseline.idempotency_key,),
+            ).fetchone()
+            bundle_data = json.loads(row[0])
+            findings = bundle_data["findings"]
+            if tamper == "closed":
+                findings[0]["status"] = "closed"
+                bundle_data["policy"]["input"]["findings"][0]["status"] = "closed"
+            elif tamper == "subject_drift":
+                findings[0]["subject_digest"] = "sha256:" + "f" * 64
+                bundle_data["policy"]["input"]["findings"][0]["subject_digest"] = (
+                    "sha256:" + "f" * 64
+                )
+            else:
+                findings.append(dict(findings[0]))
+                bundle_data["policy"]["input"]["findings"].append(
+                    dict(bundle_data["policy"]["input"]["findings"][0])
+                )
+            conn.execute(
+                "UPDATE assurance_web_runs SET bundle_json = ? WHERE idempotency_key = ?",
+                (
+                    json.dumps(
+                        bundle_data,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    baseline.idempotency_key,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    with pytest.raises(AssuranceWebError, match="Finding|stored|contract"):
+        repository.commit_prepared_remediation(
+            request, handoff, idempotency_key=f"remediate:finding:{tamper}"
+        )
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_remediations",
+    )[0]["count"] == 0
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ("lifecycle", "projection", "run", "idempotency"),
+)
+def test_remediation_failure_injection_rolls_back_every_written_layer(
+    tmp_path, monkeypatch, failure_point
+):
+    baseline, _, request, handoff = _prepared_success(tmp_path, monkeypatch)
+    repository = _fresh_repository(tmp_path)
+    repository.initialize()
+    repository.commit_run(
+        baseline,
+        idempotency_key=baseline.idempotency_key,
+        request_digest=baseline.request_digest,
+    )
+
+    if failure_point == "lifecycle":
+        original = repository._store._commit_prepared_remediation_in_transaction
+
+        def fail(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError("injected lifecycle failure")
+
+        monkeypatch.setattr(
+            repository._store,
+            "_commit_prepared_remediation_in_transaction",
+            fail,
+        )
+    elif failure_point == "projection":
+        original = repository._touch_web_case
+
+        def fail(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError("injected projection failure")
+
+        monkeypatch.setattr(repository, "_touch_web_case", fail)
+    elif failure_point == "run":
+        original = repository._run_committer._commit_run_in_transaction
+
+        def fail(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError("injected run failure")
+
+        monkeypatch.setattr(
+            repository._run_committer, "_commit_run_in_transaction", fail
+        )
+    else:
+        def fail(*args, **kwargs):
+            raise RuntimeError("injected idempotency failure")
+
+        monkeypatch.setattr(repository, "_record_mutation", fail)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        repository.commit_prepared_remediation(
+            request, handoff, idempotency_key=f"remediate:failure:{failure_point}"
+        )
+
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_remediations",
+    )[0]["count"] == 0
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_case_events "
+        f"WHERE case_id = '{request.old_case_id}'",
+    )[0]["count"] == len(baseline.events)
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_web_runs",
+    )[0]["count"] == 1
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_web_idempotency"
+        " WHERE idempotency_key LIKE 'remediate:failure:%'",
+    )[0]["count"] == 0

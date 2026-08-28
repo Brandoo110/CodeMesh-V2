@@ -6,19 +6,39 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from pydantic import ValidationError
-from assurance.run_service import AssuranceRunBundle, AssuranceRunResult
+from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.run_service import (
+    AssuranceRunBundle,
+    AssuranceRunResult,
+    AssuranceRunService,
+)
 from assurance.contracts import (
     AcceptanceCase, Evidence, ExecutionReceipt, Finding,
     HumanDecision, PolicyDecision,
 )
-from assurance.lifecycle_store import SQLiteAssuranceLifecycleStore
+from assurance.lifecycle_store import (
+    LifecycleProjectionError,
+    RemediationCommitReceipt,
+    SQLiteAssuranceLifecycleStore,
+)
 from assurance.live_freshness import (
     FreshnessStatus,
     LiveFreshness,
     LiveFreshnessCheckerProtocol,
 )
+from assurance.remediation import (
+    PreparedRemediationHandoff,
+    RemediationController,
+    RemediationRequest,
+    RemediationStatus,
+    ReviewerRerunReceipt,
+)
 from assurance.state_machine import AcceptanceBinding, AcceptanceEvent
-from assurance.store import CaseNotFoundError
+from assurance.store import (
+    CaseNotFoundError,
+    StoreConflictError,
+    StorePersistenceError,
+)
 from web.assurance_case_view import apply_live_freshness, build_case_view
 from web.assurance_run_committer import (
     AssuranceRunCommitter,
@@ -51,6 +71,7 @@ class AssuranceWebNotFoundError(AssuranceWebError):
 
 _UNSET = object()
 _LIVE_BASELINE_CORRUPT = object()
+_REMEDIATION_OPERATION = "remediate"
 
 
 def _now_iso() -> str:
@@ -122,6 +143,674 @@ class AssuranceWebRepository:
             raise AssuranceWebConflictError(str(exc)) from exc
         except AssuranceRunPersistenceError as exc:
             raise AssuranceWebError(str(exc)) from exc
+
+    def commit_prepared_remediation(
+        self,
+        request: RemediationRequest,
+        handoff: PreparedRemediationHandoff,
+        *,
+        idempotency_key: str,
+    ) -> RemediationCommitReceipt:
+        """Atomically commit one already-prepared remediation handoff.
+
+        The handoff carries the derived rerun bundle, but the old Finding is
+        deliberately reloaded from its immutable committed run inside the
+        same write transaction.  No caller-supplied Case, Binding, Event,
+        Finding, Receipt, or final status is accepted by this seam.
+        """
+
+        self._require_exact(request, RemediationRequest, "request")
+        self._require_exact(handoff, PreparedRemediationHandoff, "handoff")
+        if type(idempotency_key) is not str or not idempotency_key.strip():
+            raise ValueError("idempotency_key must be nonblank")
+
+        bundle = handoff.bundle
+        if bundle is None:
+            raise AssuranceWebConflictError(
+                "successful remediation handoff requires its bundle"
+            )
+        if bundle is not None and idempotency_key == bundle.idempotency_key:
+            raise AssuranceWebConflictError(
+                "remediation idempotency key must differ from its run key"
+            )
+        payload = self._remediation_payload(request, handoff)
+
+        try:
+            with self._store._transaction() as unit_of_work:
+                conn = unit_of_work.connection
+                _validate_run_schema(conn)
+                self._ensure_web_remediation_schema(conn)
+                self._store._ensure_lifecycle_initialized(conn)
+
+                replayed, cached = self._begin_mutation(
+                    conn,
+                    _REMEDIATION_OPERATION,
+                    idempotency_key,
+                    payload,
+                )
+                if replayed:
+                    self._require_live_freshness_in_transaction(
+                        conn, request.old_case_id, required=True
+                    )
+                    return self._replay_prepared_remediation_in_transaction(
+                        unit_of_work,
+                        request=request,
+                        handoff=handoff,
+                        idempotency_key=idempotency_key,
+                        cached=cached,
+                    )
+
+                existing = conn.execute(
+                    "SELECT remediation_id FROM assurance_remediations"
+                    " WHERE remediation_id = ?",
+                    (request.remediation_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise AssuranceWebConflictError(
+                        f"remediation_id {request.remediation_id!r}"
+                        " is already committed under another idempotency key"
+                    )
+
+                selected_finding, baseline_binding, baseline_bundle = (
+                    self._load_authoritative_remediation_finding_in_transaction(
+                        unit_of_work, request=request, handoff=handoff
+                    )
+                )
+                self._require_live_freshness_in_transaction(
+                    conn, request.old_case_id, required=True
+                )
+                expected_case, expected_binding, expected_event = (
+                    self._derive_remediation_transition_in_transaction(
+                        unit_of_work,
+                        request=request,
+                        handoff=handoff,
+                        selected_finding=selected_finding,
+                        baseline_binding=baseline_binding,
+                        baseline_bundle=baseline_bundle,
+                    )
+                )
+                expected_receipt = self._expected_remediation_receipt(
+                    request=request,
+                    handoff=handoff,
+                    expected_case=expected_case,
+                    expected_event=expected_event,
+                )
+
+                new_case_id = expected_case.case_id
+                if self._load_web_case_in_transaction(conn, new_case_id) is not None:
+                    raise AssuranceWebConflictError(
+                        "new remediation case already has a web projection"
+                    )
+
+                receipt = self._store._commit_prepared_remediation_in_transaction(
+                    unit_of_work,
+                    request=request,
+                    handoff=handoff,
+                    selected_finding=selected_finding,
+                )
+                if receipt != expected_receipt:
+                    raise AssuranceWebError(
+                        "remediation lifecycle receipt is not server-derived"
+                    )
+                metadata = self._remediation_projection_metadata(bundle)
+                self._touch_web_case(
+                    conn,
+                    new_case_id,
+                    bundle.draft_case.updated_at,
+                    metadata=metadata,
+                    evidence=bundle.evidence,
+                    findings=bundle.findings,
+                    receipt=bundle.execution_receipt,
+                )
+                committed = self._run_committer._commit_run_in_transaction(
+                    unit_of_work,
+                    bundle,
+                    idempotency_key=bundle.idempotency_key,
+                    request_digest=bundle.request_digest,
+                )
+                if committed.cached:
+                    raise AssuranceWebConflictError(
+                        "remediation run unexpectedly replayed an existing row"
+                    )
+                self._assert_remediation_artifacts_in_transaction(
+                    unit_of_work,
+                    request=request,
+                    handoff=handoff,
+                    receipt=receipt,
+                    expected_case=expected_case,
+                    expected_binding=expected_binding,
+                    expected_event=expected_event,
+                    expected_receipt=expected_receipt,
+                )
+                result = receipt.model_dump(mode="json")
+                self._record_mutation(
+                    conn,
+                    _REMEDIATION_OPERATION,
+                    idempotency_key,
+                    payload,
+                    result,
+                )
+                return receipt
+        except AssuranceWebError:
+            raise
+        except CaseNotFoundError as exc:
+            raise AssuranceWebNotFoundError(str(exc)) from exc
+        except (StoreConflictError, AssuranceRunConflictError) as exc:
+            raise AssuranceWebConflictError(str(exc)) from exc
+        except (
+            LifecycleProjectionError,
+            StorePersistenceError,
+            AssuranceRunPersistenceError,
+            AssuranceRunMigrationError,
+        ) as exc:
+            raise AssuranceWebError(str(exc)) from exc
+
+    @staticmethod
+    def _remediation_payload(
+        request: RemediationRequest,
+        handoff: PreparedRemediationHandoff,
+    ) -> dict:
+        """Build the complete idempotency payload without performing I/O."""
+
+        bundle = handoff.bundle
+        bundle_data = None
+        if bundle is not None:
+            bundle_data = bundle.model_dump(mode="json")
+            # ``freshness_source_binding`` is intentionally excluded from the
+            # public bundle, but it is part of the exact opaque handoff.
+            bundle_data["freshness_source_binding"] = (
+                bundle.freshness_source_binding.model_dump(mode="json")
+            )
+        return {
+            "request": request.model_dump(mode="json"),
+            "handoff": {
+                "result": handoff.result.model_dump(mode="json"),
+                "bundle": bundle_data,
+            },
+        }
+
+    @staticmethod
+    def _ensure_web_remediation_schema(conn: sqlite3.Connection) -> None:
+        """Verify additive Web tables without creating or migrating them."""
+
+        for table in ("assurance_web_cases", "assurance_web_idempotency"):
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if row is None:
+                raise AssuranceWebError(
+                    f"assurance web table {table!r} is missing; call initialize()"
+                )
+
+    def _load_authoritative_remediation_finding_in_transaction(
+        self,
+        unit_of_work,
+        *,
+        request: RemediationRequest,
+        handoff: PreparedRemediationHandoff,
+        allow_invalidated: bool = False,
+    ) -> tuple[Finding, AcceptanceBinding, AssuranceRunBundle]:
+        """Read exactly one open Finding from immutable run bundles."""
+
+        state = unit_of_work.load_case(request.old_case_id)
+        if state.case.subject_digest != request.old_subject_digest:
+            raise AssuranceWebConflictError(
+                "remediation old subject digest does not match canonical Case"
+            )
+        if state.case.state == "INVALIDATED" and not allow_invalidated:
+            raise AssuranceWebConflictError(
+                "remediation old Case is already invalidated"
+            )
+
+        rows = unit_of_work.connection.execute(
+            "SELECT * FROM assurance_web_runs WHERE case_id = ?"
+            " ORDER BY committed_at ASC, run_id ASC",
+            (request.old_case_id,),
+        ).fetchall()
+        candidates: list[Finding] = []
+        baseline_binding = None
+        baseline_bundle = None
+        for row in rows:
+            bundle = _load_bundle_from_row(row)
+            _assert_row_columns(row, bundle)
+            _load_pointer(unit_of_work.connection, row["idempotency_key"], bundle)
+            if baseline_binding is None:
+                baseline_binding = bundle.binding
+                baseline_bundle = bundle
+            elif bundle.binding != baseline_binding:
+                raise AssuranceWebConflictError(
+                    "stored remediation baseline bindings disagree"
+                )
+            if (
+                bundle.case.case_id != request.old_case_id
+                or bundle.draft_case.case_id != request.old_case_id
+                or bundle.subject.subject_digest != request.old_subject_digest
+            ):
+                raise AssuranceWebConflictError(
+                    "stored remediation baseline run is not bound to the old Case"
+                )
+            candidates.extend(
+                finding
+                for finding in bundle.findings
+                if finding.finding_id == request.human_selected_finding_id
+            )
+
+        if not rows:
+            raise AssuranceWebConflictError(
+                "remediation old Case has no immutable committed run"
+            )
+        if baseline_bundle is None or baseline_binding is None:
+            raise AssuranceWebConflictError(
+                "remediation old Case has no authoritative baseline binding"
+            )
+        if len(candidates) != 1:
+            raise AssuranceWebConflictError(
+                "remediation selected Finding is missing or duplicated"
+            )
+
+        finding = candidates[0]
+        result = handoff.result
+        if (
+            finding.finding_id != request.human_selected_finding_id
+            or finding.subject_digest != request.old_subject_digest
+            or finding.status != "open"
+        ):
+            raise AssuranceWebConflictError(
+                "remediation selected Finding is not the requested open Finding"
+            )
+        if (
+            result.old_case_id != request.old_case_id
+            or result.old_subject_digest != request.old_subject_digest
+            or result.human_selected_finding_id != finding.finding_id
+            or len(result.rerun_roles) != 1
+            or result.rerun_roles[0] != finding.reviewer_role
+        ):
+            raise AssuranceWebConflictError(
+                "remediation Finding does not match the prepared rerun result"
+            )
+        return finding, baseline_binding, baseline_bundle
+
+    def _derive_remediation_transition_in_transaction(
+        self,
+        unit_of_work,
+        *,
+        request: RemediationRequest,
+        handoff: PreparedRemediationHandoff,
+        selected_finding: Finding,
+        baseline_binding: AcceptanceBinding,
+        baseline_bundle: AssuranceRunBundle,
+    ) -> tuple[AcceptanceCase, AcceptanceBinding, AcceptanceEvent]:
+        """Derive canonical transition facts independently of nested bundle Cases."""
+
+        bundle = handoff.bundle
+        result = handoff.result
+        subject_input = result.new_subject_input
+        if type(subject_input) is not SubjectDigestInput:
+            raise AssuranceWebConflictError(
+                "remediation result has no exact new subject input"
+            )
+        try:
+            new_subject_digest = compute_subject_digest(subject_input)
+        except (TypeError, ValueError) as exc:
+            raise AssuranceWebConflictError(
+                "remediation new subject digest cannot be derived"
+            ) from exc
+        if result.new_subject_digest != new_subject_digest:
+            raise AssuranceWebConflictError(
+                "remediation new subject digest is not server-derived"
+            )
+        if baseline_binding.subject_digest != request.old_subject_digest:
+            raise AssuranceWebConflictError(
+                "remediation baseline binding is not bound to the old subject"
+            )
+        if (
+            subject_input.policy_version != baseline_binding.policy_version
+            or subject_input.rubric_version != baseline_binding.rubric_version
+        ):
+            raise AssuranceWebConflictError(
+                "remediation new subject policy or rubric drifted"
+            )
+        if len(result.reviewer_receipts) != 1:
+            raise AssuranceWebConflictError(
+                "remediation must carry one reviewer provenance receipt"
+            )
+        reviewer_receipt = result.reviewer_receipts[0]
+        if (
+            reviewer_receipt.reviewer_role != selected_finding.reviewer_role
+            or reviewer_receipt.reviewer.rubric_version
+            != baseline_binding.rubric_version
+            or reviewer_receipt.reviewer != bundle.reviewer
+            or reviewer_receipt.execution_receipt != bundle.execution_receipt
+        ):
+            raise AssuranceWebConflictError(
+                "remediation reviewer provenance is not authoritative"
+            )
+
+        subject = bundle.subject
+        expected_change_id = "chg_" + hashlib.sha256(
+            new_subject_digest.encode("ascii")
+        ).hexdigest()[:32]
+        if (
+            subject.subject_digest != new_subject_digest
+            or subject.change_id != expected_change_id
+            or subject.repository != subject_input.repository
+            or subject.base_revision != subject_input.base_revision
+            or subject.head_revision != subject_input.head_revision
+            or subject.task_digest != subject_input.task_digest
+            or subject.policy_version != subject_input.policy_version
+        ):
+            raise AssuranceWebConflictError(
+                "remediation bundle subject is not derived from the new subject"
+            )
+        expected_case = AcceptanceCase(
+            schema_version="v1",
+            case_id=AssuranceRunService._case_id(new_subject_digest),
+            subject_digest=new_subject_digest,
+            state="DRAFT",
+            created_at=subject.created_at,
+            updated_at=subject.created_at,
+        )
+        expected_binding = AcceptanceBinding(
+            schema_version="v1",
+            subject_digest=new_subject_digest,
+            policy_version=subject_input.policy_version,
+            rubric_version=baseline_binding.rubric_version,
+        )
+        try:
+            expected_reviewer_receipt = ReviewerRerunReceipt(
+                reviewer_role=selected_finding.reviewer_role,
+                subject_digest=new_subject_digest,
+                reviewer=bundle.reviewer,
+                execution_receipt=bundle.execution_receipt,
+            )
+            expected_result = RemediationController._result(
+                request=request,
+                status=RemediationStatus.SUCCEEDED,
+                reason_code="prepared_new_subject",
+                attempts=result.attempts,
+                validation_calls=result.validation_calls,
+                attempt_receipts=list(result.attempt_receipts),
+                patch_digests=list(result.patch_digests),
+                last_validation=result.last_validation,
+                new_subject_input=subject_input,
+                new_subject_digest=new_subject_digest,
+                rerun_roles=(selected_finding.reviewer_role,),
+                reviewer_receipts=[expected_reviewer_receipt],
+            )
+        except (TypeError, ValueError) as exc:
+            raise AssuranceWebConflictError(
+                "remediation successful result cannot be canonically rebuilt"
+            ) from exc
+        if result != expected_result:
+            raise AssuranceWebConflictError(
+                "remediation successful result is not server-derived"
+            )
+        expected_event = AcceptanceEvent(
+            event_id=f"remediation:{request.remediation_id}:invalidate",
+            subject_digest=request.old_subject_digest,
+            kind="INVALIDATE",
+            reason=(
+                f"remediation:{request.remediation_id}:superseded_by:"
+                f"{expected_case.case_id}"
+            ),
+            occurred_at=expected_case.created_at,
+        )
+        expected_rerun_key = (
+            "remediation-review:"
+            + baseline_bundle.run_id
+            + ":"
+            + selected_finding.reviewer_role
+            + ":"
+            + new_subject_digest
+        )
+        expected_run_id = AssuranceRunService._run_id(
+            bundle.request_digest, expected_rerun_key
+        )
+        if (
+            bundle.idempotency_key != expected_rerun_key
+            or bundle.run_id != expected_run_id
+            or bundle.draft_case != expected_case
+            or bundle.binding != expected_binding
+            or bundle.case.case_id != expected_case.case_id
+            or bundle.case.subject_digest != new_subject_digest
+        ):
+            raise AssuranceWebConflictError(
+                "remediation handoff Case or run provenance is not server-derived"
+            )
+        return expected_case, expected_binding, expected_event
+
+    @staticmethod
+    def _expected_remediation_receipt(
+        *,
+        request: RemediationRequest,
+        handoff: PreparedRemediationHandoff,
+        expected_case: AcceptanceCase,
+        expected_event: AcceptanceEvent,
+    ) -> RemediationCommitReceipt:
+        result_json = _canonical_json(handoff.result)
+        return RemediationCommitReceipt(
+            remediation_id=request.remediation_id,
+            old_case_id=request.old_case_id,
+            new_case_id=expected_case.case_id,
+            old_subject_digest=request.old_subject_digest,
+            new_subject_digest=expected_case.subject_digest,
+            human_selected_finding_id=request.human_selected_finding_id,
+            invalidation_event_id=expected_event.event_id,
+            result_digest="sha256:"
+            + hashlib.sha256(result_json.encode("utf-8")).hexdigest(),
+            committed_at=expected_event.occurred_at,
+        )
+
+    @staticmethod
+    def _remediation_projection_metadata(bundle: AssuranceRunBundle) -> dict:
+        source = bundle.freshness_source_binding
+        return {
+            "author": source.author,
+            "author_provenance": source.author_provenance,
+            "risk": bundle.risk.classification.risk_level,
+            "run_id": bundle.run_id,
+        }
+
+    def _assert_remediation_artifacts_in_transaction(
+        self,
+        unit_of_work,
+        *,
+        request: RemediationRequest,
+        handoff: PreparedRemediationHandoff,
+        receipt: RemediationCommitReceipt,
+        expected_case: AcceptanceCase,
+        expected_binding: AcceptanceBinding,
+        expected_event: AcceptanceEvent,
+        expected_receipt: RemediationCommitReceipt,
+        idempotency_key: str | None = None,
+    ) -> None:
+        """Replay every durable component before acknowledging a commit."""
+
+        bundle = handoff.bundle
+        if bundle is None:
+            raise AssuranceWebError("stored remediation handoff has no bundle")
+        if (
+            receipt != expected_receipt
+            or bundle.draft_case != expected_case
+            or bundle.binding != expected_binding
+        ):
+            raise AssuranceWebError("remediation receipt or transition is not derived")
+        conn = unit_of_work.connection
+        lineage_row = conn.execute(
+            "SELECT * FROM assurance_remediations WHERE remediation_id = ?",
+            (request.remediation_id,),
+        ).fetchone()
+        if lineage_row is None:
+            raise AssuranceWebError("remediation lineage row is missing")
+        stored_receipt = self._store._remediation_from_row(lineage_row)
+        if stored_receipt != receipt:
+            raise AssuranceWebError("remediation lineage receipt does not match result")
+
+        old_state = unit_of_work.load_case(request.old_case_id)
+        if old_state.case.state != "INVALIDATED":
+            raise AssuranceWebError("stored remediation old Case is not invalidated")
+        if (
+            not old_state.applied_events
+            or old_state.applied_events[-1] != expected_event
+        ):
+            raise AssuranceWebError("stored remediation invalidation replay mismatch")
+
+        new_state = unit_of_work.load_case(expected_case.case_id)
+        if new_state.case != expected_case or new_state.applied_events != ():
+            raise AssuranceWebError("stored remediation new DRAFT replay mismatch")
+        if unit_of_work.get_binding(expected_case.case_id) != expected_binding:
+            raise AssuranceWebError("stored remediation binding replay mismatch")
+        if bundle.case.state not in {"EVIDENCE_COLLECTED", "NEEDS_EVIDENCE"}:
+            raise AssuranceWebError("remediation run bundle is not evidence-gated")
+
+        run_rows = conn.execute(
+            "SELECT * FROM assurance_web_runs WHERE case_id = ?",
+            (expected_case.case_id,),
+        ).fetchall()
+        if len(run_rows) != 1:
+            raise AssuranceWebError("remediation must have exactly one run row")
+        run_row = conn.execute(
+            "SELECT * FROM assurance_web_runs WHERE idempotency_key = ?",
+            (bundle.idempotency_key,),
+        ).fetchone()
+        if run_row is None:
+            raise AssuranceWebError("remediation run row is missing")
+        stored_bundle = _load_bundle_from_row(run_row)
+        _assert_row_columns(run_row, stored_bundle)
+        _load_pointer(conn, bundle.idempotency_key, stored_bundle)
+        if stored_bundle != bundle or run_row["case_id"] != expected_case.case_id:
+            raise AssuranceWebError("remediation run row does not match handoff")
+
+        web = self._load_web_case_in_transaction(conn, expected_case.case_id)
+        if web is None:
+            raise AssuranceWebError("remediation web projection is missing")
+        projection = self._projection_in_transaction(
+            unit_of_work,
+            expected_case.case_id,
+            require_run_pointers=True,
+            check_live=False,
+        )
+        if projection["case"] != expected_case.model_dump(mode="json"):
+            raise AssuranceWebError("remediation projection Case is not the DRAFT case")
+        if projection["evidence"] != [
+            item.model_dump(mode="json") for item in bundle.evidence
+        ]:
+            raise AssuranceWebError("remediation projection evidence does not match run")
+        if projection["receipt"] != bundle.execution_receipt.model_dump(mode="json"):
+            raise AssuranceWebError("remediation projection receipt does not match run")
+        if projection["decisions"]:
+            raise AssuranceWebError("remediation DRAFT projection contains a decision")
+        if projection["questions"] != [
+            item.model_dump(mode="json") for item in bundle.questions
+        ]:
+            raise AssuranceWebError("remediation projection questions do not match run")
+
+        if idempotency_key is not None:
+            pointer = conn.execute(
+                "SELECT operation, payload_digest, result_json"
+                " FROM assurance_web_idempotency WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if pointer is None:
+                raise AssuranceWebError("remediation idempotency pointer is missing")
+            if pointer["operation"] != _REMEDIATION_OPERATION:
+                raise AssuranceWebError("remediation idempotency operation is invalid")
+            if pointer["result_json"] != _canonical_json(expected_receipt):
+                raise AssuranceWebError("remediation idempotency receipt is not derived")
+
+    def _replay_prepared_remediation_in_transaction(
+        self,
+        unit_of_work,
+        *,
+        request: RemediationRequest,
+        handoff: PreparedRemediationHandoff,
+        idempotency_key: str,
+        cached: dict | None,
+    ) -> RemediationCommitReceipt:
+        if not isinstance(cached, dict):
+            raise AssuranceWebError("invalid cached remediation result")
+        conn = unit_of_work.connection
+        pointer = conn.execute(
+            "SELECT operation, payload_digest, result_json"
+            " FROM assurance_web_idempotency WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if pointer is None:
+            raise AssuranceWebError("remediation idempotency pointer is missing")
+        if pointer["operation"] != _REMEDIATION_OPERATION:
+            raise AssuranceWebError("remediation idempotency operation is invalid")
+        try:
+            if _canonical_json(cached) != pointer["result_json"]:
+                raise AssuranceWebError(
+                    "remediation idempotency result is not canonical"
+                )
+            receipt = RemediationCommitReceipt.model_validate(cached)
+        except (ValidationError, TypeError, ValueError) as exc:
+            if isinstance(exc, AssuranceWebError):
+                raise
+            raise AssuranceWebError("invalid cached remediation result") from exc
+
+        selected_finding, baseline_binding, baseline_bundle = (
+            self._load_authoritative_remediation_finding_in_transaction(
+                unit_of_work,
+                request=request,
+                handoff=handoff,
+                allow_invalidated=True,
+            )
+        )
+        expected_case, expected_binding, expected_event = (
+            self._derive_remediation_transition_in_transaction(
+                unit_of_work,
+                request=request,
+                handoff=handoff,
+                selected_finding=selected_finding,
+                baseline_binding=baseline_binding,
+                baseline_bundle=baseline_bundle,
+            )
+        )
+        expected_receipt = self._expected_remediation_receipt(
+            request=request,
+            handoff=handoff,
+            expected_case=expected_case,
+            expected_event=expected_event,
+        )
+        if (
+            receipt != expected_receipt
+            or pointer["result_json"] != _canonical_json(expected_receipt)
+            or pointer["payload_digest"]
+            != self._payload_digest(self._remediation_payload(request, handoff))
+        ):
+            raise AssuranceWebError("remediation replay receipt is not server-derived")
+        lineage_row = conn.execute(
+            "SELECT * FROM assurance_remediations WHERE remediation_id = ?",
+            (request.remediation_id,),
+        ).fetchone()
+        if lineage_row is None:
+            raise AssuranceWebError("remediation idempotency result has no lineage")
+        lineage_receipt = self._store._remediation_from_row(lineage_row)
+        if lineage_receipt != expected_receipt:
+            raise AssuranceWebError("remediation lineage receipt is not server-derived")
+        stored_receipt = self._store._commit_prepared_remediation_in_transaction(
+            unit_of_work,
+            request=request,
+            handoff=handoff,
+            selected_finding=selected_finding,
+        )
+        if stored_receipt != expected_receipt:
+            raise AssuranceWebError("cached remediation receipt does not match lineage")
+        self._assert_remediation_artifacts_in_transaction(
+            unit_of_work,
+            request=request,
+            handoff=handoff,
+            receipt=receipt,
+            expected_case=expected_case,
+            expected_binding=expected_binding,
+            expected_event=expected_event,
+            expected_receipt=expected_receipt,
+            idempotency_key=idempotency_key,
+        )
+        return receipt
 
     # RunCommitter's GP-02 short names make this repository directly usable as
     # the service port while the explicit *_run methods remain discoverable.
@@ -690,9 +1379,13 @@ class AssuranceWebRepository:
         return result
 
     def _require_live_freshness_in_transaction(
-        self, conn: sqlite3.Connection, case_id: str
+        self,
+        conn: sqlite3.Connection,
+        case_id: str,
+        *,
+        required: bool = False,
     ) -> None:
-        if not self._live_required:
+        if not required and not self._live_required:
             return
         baseline = self._load_latest_run_baseline_in_transaction(conn, case_id)
         result = self._live_freshness_result(baseline)
