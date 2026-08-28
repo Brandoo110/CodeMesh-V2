@@ -84,16 +84,42 @@ function shortDate(value: string): string {
 
 function badgeTone(value: string): string {
   const normalized = value.toUpperCase();
-  if (["ACCEPTED", "PASS", "SUCCESS", "VALID"].includes(normalized)) {
+  if (["ACCEPTED", "PASS", "SUCCESS", "VALID", "FRESH"].includes(normalized)) {
     return "border-success/30 bg-success/10 text-success";
   }
-  if (["INVALIDATED", "REJECTED", "FAILURE", "ERROR", "CRITICAL"].includes(normalized)) {
+  if (["INVALIDATED", "REJECTED", "FAILURE", "ERROR", "CRITICAL", "STALE"].includes(normalized)) {
     return "border-error/30 bg-error/10 text-error";
   }
-  if (["NEEDS_HUMAN", "NEEDS_EVIDENCE", "CONFLICTED", "CONDITIONAL", "HIGH", "CANCELLED"].includes(normalized)) {
+  if (["NEEDS_HUMAN", "NEEDS_EVIDENCE", "CONFLICTED", "CONDITIONAL", "HIGH", "CANCELLED", "UNAVAILABLE"].includes(normalized)) {
     return "border-warning/30 bg-warning/10 text-warning";
   }
   return "border-border bg-surface text-fg-muted";
+}
+
+function freshnessLabel(item: AssuranceProjection): string {
+  if (!item.freshness) return "NOT CHECKED";
+  return item.freshness.reason_code === "FRESHNESS_NOT_CHECKED"
+    ? "NOT CHECKED"
+    : item.freshness.status;
+}
+
+function liveFreshnessNotice(item: AssuranceProjection): { title: string; reason: string } | null {
+  if (item.acceptance_state === "INVALIDATED") {
+    return {
+      title: "INVALIDATED / Subject 已失效",
+      reason: item.case.invalidation_reason || "当前 CaseView 绑定不再有效，禁止签收。",
+    };
+  }
+  if (!item.freshness) {
+    return { title: "UNAVAILABLE / Freshness unavailable", reason: "NO_FRESHNESS_CHECKER" };
+  }
+  if (item.freshness.status === "FRESH") return null;
+  return {
+    title: item.freshness.status === "STALE"
+      ? "STALE / Live baseline changed"
+      : "UNAVAILABLE / Freshness could not be checked",
+    reason: item.freshness.reason_code,
+  };
 }
 
 function Badge({ value }: { value: string }) {
@@ -283,6 +309,9 @@ export function AssuranceView() {
       setSelectedId(nextId);
       const nextDetail = nextId ? await getAssuranceChange(nextId) : null;
       if (sequence !== loadSequence.current) return;
+      if (nextDetail) {
+        setCases((current) => current.map((row) => row.case_id === nextDetail.case_id ? nextDetail : row));
+      }
       setDetail(nextDetail);
       setError(null);
     } catch (cause) {
@@ -303,7 +332,13 @@ export function AssuranceView() {
     if (!selectedId) return;
     let cancelled = false;
     getAssuranceChange(selectedId)
-      .then((value) => { if (!cancelled) { setDetail(value); setError(null); } })
+      .then((value) => {
+        if (!cancelled) {
+          setDetail(value);
+          setCases((rows) => rows.map((row) => row.case_id === value.case_id ? value : row));
+          setError(null);
+        }
+      })
       .catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause)); });
     return () => { cancelled = true; };
   }, [selectedId]);
@@ -350,6 +385,7 @@ export function AssuranceView() {
     && runCommands.length > 0
     && (runForm.changed_lines_total.trim() === "" || /^\d+$/.test(runForm.changed_lines_total.trim()))
   );
+  const freshnessNotice = detail ? liveFreshnessNotice(detail) : null;
 
   function openEvidence(ref: string) {
     const evidence = evidenceById.get(ref) || null;
@@ -476,7 +512,7 @@ export function AssuranceView() {
             return (
               <button key={item.case_id} onClick={() => selectCase(item.case_id)} className={`w-full border-b border-border px-4 py-4 text-left transition-colors ${active ? "bg-canvas" : "hover:bg-surface-hover"}`}>
                 <div className="mb-2 flex items-start justify-between gap-2"><span className="line-clamp-2 text-sm font-medium text-fg">{meta?.title || item.case_id}</span><div className="flex flex-wrap justify-end gap-1.5"><Badge value={item.policy_gate.status} /><Badge value={item.acceptance_state} /></div></div>
-                <div className="mb-2 flex flex-wrap gap-1.5"><Badge value={meta?.risk || "unknown"} />{!item.digest_freshness && <Badge value="STALE" />}</div>
+                <div className="mb-2 flex flex-wrap gap-1.5"><Badge value={meta?.risk || "unknown"} /><Badge value={freshnessLabel(item)} /></div>
                 <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-fg-muted"><span>Owner {meta?.owner || "未记录"}</span><span>V/P {meta?.value ?? "-"}/{meta?.priority ?? "-"}</span><span>缺证 {item.case.missing_evidence.length}</span><span>{shortDate(item.case.updated_at)}</span></div>
                 {item.attention_reason && <div className="mt-2 line-clamp-2 text-xs text-warning">{item.attention_reason}</div>}
               </button>
@@ -514,8 +550,8 @@ export function AssuranceView() {
           </section>
         </div> : !detail ? <div className="flex h-full items-center justify-center text-sm text-fg-muted">从左侧选择一个 Case</div> : (
           <div className="mx-auto max-w-[1120px] space-y-6 px-7 py-6">
-            {(!detail.digest_freshness || detail.acceptance_state === "INVALIDATED") && (
-              <div className="flex items-start gap-3 border border-error/40 bg-error/10 p-4 text-error"><AlertTriangle className="mt-0.5 flex-shrink-0" size={18} /><div><div className="font-semibold">{detail.digest_freshness ? "INVALIDATED / Subject 已失效" : "STALE / Digest 已失效"}</div><div className="mt-1 text-sm">{detail.case.invalidation_reason || "当前 CaseView 绑定不再有效，禁止签收。"}</div></div></div>
+            {freshnessNotice && (
+              <div className="flex items-start gap-3 border border-error/40 bg-error/10 p-4 text-error"><AlertTriangle className="mt-0.5 flex-shrink-0" size={18} /><div><div className="font-semibold">{freshnessNotice.title}</div><div className="mt-1 text-sm">{freshnessNotice.reason}</div></div></div>
             )}
             <header className="border-b border-border pb-5">
               <div className="mb-3 flex items-center justify-between gap-3"><span className="text-xs font-semibold uppercase tracking-[0.12em] text-fg-subtle">CaseView v1</span><span className="text-xs text-fg-subtle">rev {detail.revision}</span></div>
@@ -527,7 +563,7 @@ export function AssuranceView() {
               <AxisBlock title="Policy" value={detail.policy_gate.status} />
               <AxisBlock title="Acceptance" value={detail.acceptance_state} />
               <AxisBlock title="Release" value={detail.release_state.status} note={detail.release_state.trust_level ? `trust: ${detail.release_state.trust_level}` : undefined} />
-              <AxisBlock title="Freshness" value={detail.digest_freshness ? "DIGEST BOUND" : "STALE"} note={detail.digest_freshness ? "库内绑定一致" : "当前绑定已失效"} />
+              <AxisBlock title="Freshness" value={detail.freshness?.status || "UNAVAILABLE"} note={detail.freshness?.reason_code || "NO_FRESHNESS_CHECKER"} />
             </section>
 
             <section className="grid grid-cols-1 gap-5 lg:grid-cols-3"><InfoBlock title="Intent Coverage" value={detail.metadata?.intent_coverage} /><InfoBlock title="Architecture Impact" value={detail.metadata?.architecture_impact} /><InfoBlock title="Operational Readiness" value={detail.metadata?.operational_readiness} /><InfoBlock title="Knowledge" value={detail.metadata?.knowledge_notes} /><InfoBlock title="Ownership" value={detail.metadata?.ownership_notes} /><InfoBlock title="Policy / Rubric" value={`${detail.binding.policy_version} / ${detail.binding.rubric_version}`} /></section>
@@ -580,7 +616,7 @@ export function AssuranceView() {
                   {selectedAction?.high_risk_confirmation_required && <label className="mt-3 flex items-center gap-2 text-sm text-warning"><input type="checkbox" checked={highRiskConfirmed} onChange={(e) => setHighRiskConfirmed(e.target.checked)} />我已复核高风险变更并进行二次确认</label>}
                   <div className="mt-4 flex items-center justify-between gap-4">
                     <div className="text-xs text-fg-subtle">动作来自当前 CaseView allowed_actions；服务端会再次校验。</div>
-                    <button onClick={() => void submitDecision()} disabled={submitting || !selectedAction || !reason.trim() || !owner.trim() || !ownerRole.trim() || !ownerRoleMatches || selfApprovalBlocked || Boolean(selectedAction?.high_risk_confirmation_required && !highRiskConfirmed) || !detail.digest_freshness || detail.acceptance_state === "INVALIDATED"} className="flex items-center gap-2 bg-accent px-4 py-2 text-sm font-semibold text-canvas disabled:cursor-not-allowed disabled:opacity-40">
+                    <button onClick={() => void submitDecision()} disabled={submitting || !selectedAction || !reason.trim() || !owner.trim() || !ownerRole.trim() || !ownerRoleMatches || selfApprovalBlocked || Boolean(selectedAction?.high_risk_confirmation_required && !highRiskConfirmed)} className="flex items-center gap-2 bg-accent px-4 py-2 text-sm font-semibold text-canvas disabled:cursor-not-allowed disabled:opacity-40">
                       {submitting ? <RefreshCw size={15} className="animate-spin" /> : effectiveDecision === "reject" ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}提交签收
                     </button>
                   </div>

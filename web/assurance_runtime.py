@@ -26,6 +26,7 @@ from assurance.fixed_reviewer_invoker import (
     FixedOpenAICompatibleReviewerInvoker,
     FixedReviewerEndpoint,
 )
+from assurance.live_freshness import LiveFreshnessChecker
 from assurance.reviewer_context import SafeReviewerContextBuilder
 from assurance.run_service import (
     AssuranceRunConfig,
@@ -117,6 +118,7 @@ class AssuranceRuntime:
 
     config: AssuranceRuntimeConfig
     service_config: AssuranceRunConfig
+    freshness_checker: LiveFreshnessChecker
     repository: AssuranceWebRepository
     artifact_store: ArtifactStore
     context_builder: SafeReviewerContextBuilder
@@ -411,7 +413,14 @@ def _build_runtime(
             freshness_ttl_seconds=config.freshness_ttl_seconds,
             reviewer_route=config.reviewer,
         )
-        repository = AssuranceWebRepository(config.database_path)
+        freshness_checker = LiveFreshnessChecker(
+            workspace_root=config.workspace_root
+        )
+        repository = AssuranceWebRepository(
+            config.database_path,
+            freshness_checker=freshness_checker,
+            live_required=True,
+        )
         repository.initialize()
         artifact_store = ArtifactStore(config.artifact_store_root)
         context_builder = SafeReviewerContextBuilder()
@@ -436,6 +445,7 @@ def _build_runtime(
     return AssuranceRuntime(
         config=config,
         service_config=service_config,
+        freshness_checker=freshness_checker,
         repository=repository,
         artifact_store=artifact_store,
         context_builder=context_builder,

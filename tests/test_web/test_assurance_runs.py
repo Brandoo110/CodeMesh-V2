@@ -11,6 +11,7 @@ from assurance.run_service import (
     AssuranceRunValidationError,
     IdempotencyConflictError,
 )
+from assurance.live_freshness import LiveFreshnessChecker
 from tests.test_assurance_run_service import _Reviewer, _service
 from web.assurance_run_composition import AssuranceRunWebDependencies
 from web.assurance_store import (
@@ -44,7 +45,11 @@ def _payload(intent) -> dict:
 
 def _durable_app(tmp_path: Path):
     service, intent = _service(tmp_path)
-    repository = AssuranceWebRepository(tmp_path / "assurance.sqlite")
+    repository = AssuranceWebRepository(
+        tmp_path / "assurance.sqlite",
+        freshness_checker=LiveFreshnessChecker(workspace_root=tmp_path.resolve()),
+        live_required=True,
+    )
     repository.initialize()
     service._committer = repository
     app = create_app(
@@ -189,7 +194,12 @@ def test_real_run_returns_only_public_projection_and_replays_from_same_repositor
     }
     assert first.json()["cached"] is False
     assert replay.json()["cached"] is True
-    assert replay.json()["case_view"] == repository.get_change(first.json()["case_id"])
+    replay_view = replay.json()["case_view"]
+    live_view = repository.get_change(first.json()["case_id"])
+    replay_view["freshness"] = replay_view["freshness"] | {
+        "checked_at": live_view["freshness"]["checked_at"]
+    }
+    assert replay_view == live_view
     readback = client.get(f"/api/assurance/changes/{first.json()['case_id']}")
     assert readback.status_code == 200
     assert readback.json() == first.json()["case_view"]
@@ -274,7 +284,11 @@ def test_run_exception_mapping_is_stable_and_sanitized(
 
 def test_reviewer_failure_is_a_blocked_successful_run_not_http_5xx(tmp_path):
     service, intent = _service(tmp_path, reviewer=_Reviewer(status="failure"))
-    repository = AssuranceWebRepository(tmp_path / "assurance.sqlite")
+    repository = AssuranceWebRepository(
+        tmp_path / "assurance.sqlite",
+        freshness_checker=LiveFreshnessChecker(workspace_root=tmp_path.resolve()),
+        live_required=True,
+    )
     repository.initialize()
     service._committer = repository
     app = create_app(

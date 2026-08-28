@@ -282,6 +282,16 @@ export interface AssuranceReleaseState {
   recorded_at: string | null;
 }
 
+export type AssuranceFreshnessStatus = "FRESH" | "STALE" | "UNAVAILABLE";
+
+export interface AssuranceFreshness {
+  status: AssuranceFreshnessStatus;
+  reason_code: string;
+  checked_at: string;
+  expected_subject_digest?: string | null;
+  observed_subject_digest?: string | null;
+}
+
 export interface AssuranceProjection {
   case: AssuranceCaseState;
   binding: {
@@ -306,6 +316,7 @@ export interface AssuranceProjection {
   allowed_actions: AssuranceAction[];
   gate: string;
   digest_freshness: boolean;
+  freshness?: AssuranceFreshness | null;
   attention_reason: string | null;
 }
 

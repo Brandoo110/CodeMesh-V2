@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from assurance.artifacts import ArtifactStore
+from assurance.live_freshness import LiveFreshnessChecker
 from assurance.run_service import (
     AssuranceRunConfig,
     AssuranceRunService,
@@ -31,6 +32,18 @@ class AssuranceRunWebDependencies:
         pair, so the optional field keeps that compatibility while still
         deriving the exact same store rather than constructing another one.
         """
+
+        if (
+            isinstance(self.service, AssuranceRunService)
+            and isinstance(self.repository, AssuranceWebRepository)
+            and (
+                self.repository._live_required is not True
+                or self.repository._freshness_checker is None
+            )
+        ):
+            raise ValueError(
+                "product run dependencies require a live-required repository"
+            )
 
         if self.artifact_reader is not None:
             if type(self.artifact_reader) is not AssuranceArtifactReader:
@@ -83,7 +96,14 @@ def build_assurance_run_web_dependencies(
     # Repository construction and initialization happen exactly once.  The
     # same object is then used as the Service's committer and for CaseView
     # read-back in the HTTP route.
-    repository = AssuranceWebRepository(database_path)
+    freshness_checker = LiveFreshnessChecker(
+        workspace_root=config.workspace_root
+    )
+    repository = AssuranceWebRepository(
+        database_path,
+        freshness_checker=freshness_checker,
+        live_required=True,
+    )
     repository.initialize()
     artifact_store = ArtifactStore(artifact_store_root)
     service = AssuranceRunService(

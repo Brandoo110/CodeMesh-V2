@@ -12,9 +12,14 @@ from assurance.contracts import (
     HumanDecision, PolicyDecision,
 )
 from assurance.lifecycle_store import SQLiteAssuranceLifecycleStore
+from assurance.live_freshness import (
+    FreshnessStatus,
+    LiveFreshness,
+    LiveFreshnessCheckerProtocol,
+)
 from assurance.state_machine import AcceptanceBinding, AcceptanceEvent
 from assurance.store import CaseNotFoundError
-from web.assurance_case_view import build_case_view
+from web.assurance_case_view import apply_live_freshness, build_case_view
 from web.assurance_run_committer import (
     AssuranceRunCommitter,
     AssuranceRunConflictError,
@@ -45,6 +50,7 @@ class AssuranceWebNotFoundError(AssuranceWebError):
 
 
 _UNSET = object()
+_LIVE_BASELINE_CORRUPT = object()
 
 
 def _now_iso() -> str:
@@ -52,8 +58,18 @@ def _now_iso() -> str:
 
 
 class AssuranceWebRepository:
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        freshness_checker: LiveFreshnessCheckerProtocol | None = None,
+        live_required: bool = False,
+    ) -> None:
+        if type(live_required) is not bool:
+            raise TypeError("live_required must be a bool")
         self._db_path = Path(db_path or Path.home() / ".codemesh" / "assurance.sqlite")
+        self._freshness_checker = freshness_checker
+        self._live_required = live_required
         self._store = SQLiteAssuranceLifecycleStore(self._db_path)
         self._run_committer = AssuranceRunCommitter(self)
 
@@ -157,7 +173,9 @@ class AssuranceWebRepository:
             bundle = _load_bundle_from_row(row)
             _assert_row_columns(row, bundle)
             _load_pointer(conn, idempotency_key, bundle)
-            self._projection_in_transaction(unit_of_work, bundle.case.case_id)
+            self._projection_in_transaction(
+                unit_of_work, bundle.case.case_id, check_live=False
+            )
             return AssuranceRunResult(
                 run_id=bundle.run_id,
                 request_digest=bundle.request_digest,
@@ -234,7 +252,9 @@ class AssuranceWebRepository:
                 winner = _load_bundle_from_row(existing)
                 _assert_row_columns(existing, winner)
                 _load_pointer(conn, idempotency_key, winner)
-                self._projection_in_transaction(unit_of_work, winner.case.case_id)
+                self._projection_in_transaction(
+                    unit_of_work, winner.case.case_id, check_live=False
+                )
                 return AssuranceRunResult(
                     run_id=winner.run_id,
                     request_digest=winner.request_digest,
@@ -314,6 +334,7 @@ class AssuranceWebRepository:
                 unit_of_work,
                 bundle.case.case_id,
                 require_run_pointers=False,
+                check_live=False,
             )
             if projection["case"] != bundle.case.model_dump(mode="json"):
                 raise AssuranceRunPersistenceError(
@@ -369,7 +390,10 @@ class AssuranceWebRepository:
         )
 
     def list_changes(self) -> list[dict]:
-        return [self._projection(s.case.case_id) for s in self._store.list_cases()]
+        return [
+            self._projection(s.case.case_id, check_live=not self._live_required)
+            for s in self._store.list_cases()
+        ]
 
     def get_change(self, case_id: str) -> dict:
         self._require_case(case_id)
@@ -463,6 +487,9 @@ class AssuranceWebRepository:
                 raise AssuranceWebConflictError(
                     "approval event must reference the latest policy decision"
                 )
+            self._require_live_freshness_in_transaction(
+                unit_of_work.connection, case_id
+            )
             unit_of_work.append_human_decision(case_id, human_decision)
             state = unit_of_work.append_event(case_id, event)
             self._touch_web_case(
@@ -490,6 +517,10 @@ class AssuranceWebRepository:
                     if cached_case_id != case_id:
                         raise AssuranceWebError(
                             "idempotency result does not match its case"
+                        )
+                    if operation == "decide":
+                        self._require_live_freshness_in_transaction(
+                            unit_of_work.connection, case_id
                         )
                     return cached
                 change(unit_of_work)
@@ -527,12 +558,19 @@ class AssuranceWebRepository:
         projection = self.get_change(case_id)
         return {"canonical": self._passport_canonical(projection), "markdown": self._passport_markdown(projection)}
 
-    def _projection(self, case_id: str) -> dict:
+    def _projection(self, case_id: str, *, check_live: bool = True) -> dict:
         with self._store._transaction(write=False) as unit_of_work:
-            return self._projection_in_transaction(unit_of_work, case_id)
+            return self._projection_in_transaction(
+                unit_of_work, case_id, check_live=check_live
+            )
 
     def _projection_in_transaction(
-        self, unit_of_work, case_id: str, *, require_run_pointers: bool = True
+        self,
+        unit_of_work,
+        case_id: str,
+        *,
+        require_run_pointers: bool = True,
+        check_live: bool = True,
     ) -> dict:
         state = unit_of_work.load_case(case_id)
         binding = unit_of_work.get_binding(case_id)
@@ -540,22 +578,140 @@ class AssuranceWebRepository:
         web = self._load_web_case_in_transaction(
             unit_of_work.connection, case_id
         )
-        runs = self._load_web_runs_in_transaction(
-            unit_of_work.connection,
-            case_id,
-            require_pointers=require_run_pointers,
-        )
+        try:
+            runs = self._load_web_runs_in_transaction(
+                unit_of_work.connection,
+                case_id,
+                require_pointers=require_run_pointers,
+            )
+        except AssuranceWebError:
+            if not self._live_required:
+                raise
+            # A live-required projection must remain readable even when its
+            # persisted run baseline is corrupt; the live overlay reports the
+            # unavailable reason and never falls back to the legacy boolean.
+            runs = ()
         release_observations = (
             self._store._list_release_observations_in_transaction(
                 unit_of_work.connection, case_id
             )
         )
+        live_baseline = None
+        if self._live_required and check_live:
+            live_baseline = self._load_latest_run_baseline_in_transaction(
+                unit_of_work.connection,
+                case_id,
+                require_pointer=require_run_pointers,
+            )
+        if not self._live_required:
+            # Preserve the original private helper call shape for explicit
+            # database-only fixtures and their failure-injection tests.
+            return self._render_projection(
+                state, binding, decisions, web, release_observations, runs
+            )
         return self._render_projection(
-            state, binding, decisions, web, release_observations, runs
+            state,
+            binding,
+            decisions,
+            web,
+            release_observations,
+            runs,
+            live_baseline=live_baseline,
+            check_live=check_live,
         )
 
+    def _load_latest_run_baseline_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        case_id: str,
+        *,
+        require_pointer: bool = True,
+    ):
+        """Load only the latest committed run used by the live freshness fence."""
+
+        row = conn.execute(
+            "SELECT * FROM assurance_web_runs WHERE case_id = ? "
+            "ORDER BY committed_at DESC, run_id DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            bundle = _load_bundle_from_row(row)
+            _assert_row_columns(row, bundle)
+            if require_pointer:
+                _load_pointer(conn, row["idempotency_key"], bundle)
+            if bundle.case.case_id != case_id:
+                raise AssuranceRunPersistenceError(
+                    "stored run case binding does not match projection"
+                )
+            return (
+                bundle.freshness_source_binding,
+                bundle.git.snapshot,
+                bundle.intake.snapshot,
+            )
+        except Exception:
+            return _LIVE_BASELINE_CORRUPT
+
+    def _live_freshness_result(self, live_baseline) -> LiveFreshness:
+        checked_at = datetime.now(timezone.utc)
+        if self._freshness_checker is None:
+            return LiveFreshness(
+                status=FreshnessStatus.UNAVAILABLE,
+                reason_code="NO_FRESHNESS_CHECKER",
+                checked_at=checked_at,
+            )
+        if live_baseline is _LIVE_BASELINE_CORRUPT:
+            return LiveFreshness(
+                status=FreshnessStatus.UNAVAILABLE,
+                reason_code="BASELINE_CORRUPT",
+                checked_at=checked_at,
+            )
+        if live_baseline is None:
+            return LiveFreshness(
+                status=FreshnessStatus.UNAVAILABLE,
+                reason_code="BASELINE_MISSING",
+                checked_at=checked_at,
+            )
+        try:
+            result = self._freshness_checker.check(*live_baseline)
+        except Exception:
+            return LiveFreshness(
+                status=FreshnessStatus.UNAVAILABLE,
+                reason_code="FRESHNESS_CHECK_FAILED",
+                checked_at=checked_at,
+            )
+        if not isinstance(result, LiveFreshness):
+            return LiveFreshness(
+                status=FreshnessStatus.UNAVAILABLE,
+                reason_code="INVALID_FRESHNESS_RESULT",
+                checked_at=checked_at,
+            )
+        return result
+
+    def _require_live_freshness_in_transaction(
+        self, conn: sqlite3.Connection, case_id: str
+    ) -> None:
+        if not self._live_required:
+            return
+        baseline = self._load_latest_run_baseline_in_transaction(conn, case_id)
+        result = self._live_freshness_result(baseline)
+        if result.status is not FreshnessStatus.FRESH:
+            raise AssuranceWebConflictError(
+                "live freshness check did not pass: " + result.reason_code
+            )
+
     def _render_projection(
-        self, state, binding, decisions, web, release_observations, runs=()
+        self,
+        state,
+        binding,
+        decisions,
+        web,
+        release_observations,
+        runs=(),
+        *,
+        live_baseline=None,
+        check_live: bool = True,
     ) -> dict:
         evidence = self._decode_models((web or {}).get("evidence_json", "[]"), Evidence)
         findings = self._decode_models((web or {}).get("findings_json", "[]"), Finding)
@@ -654,21 +810,37 @@ class AssuranceWebRepository:
             "gate": gate,
             "digest_freshness": digest_freshness,
             "attention_reason": attention,
+            "freshness_mode": (
+                "live_required" if self._live_required else "database_only_fixture"
+            ),
         }
-        projection.update(
-            build_case_view(
-                case_id=state.case.case_id,
-                subject_digest=state.case.subject_digest,
-                revision=revision,
-                acceptance_state=state.case.state,
-                decisions=decisions,
-                release_observations=tuple(
-                    item.observation for item in release_observations
-                ),
-                digest_freshness=digest_freshness,
-                risk=(metadata or {}).get("risk"),
-            )
+        case_view = build_case_view(
+            case_id=state.case.case_id,
+            subject_digest=state.case.subject_digest,
+            revision=revision,
+            acceptance_state=state.case.state,
+            decisions=decisions,
+            release_observations=tuple(
+                item.observation for item in release_observations
+            ),
+            digest_freshness=digest_freshness,
+            risk=(metadata or {}).get("risk"),
         )
+        if self._live_required:
+            if not check_live:
+                live_result = LiveFreshness(
+                    status=FreshnessStatus.UNAVAILABLE,
+                    reason_code="FRESHNESS_NOT_CHECKED",
+                    checked_at=datetime.now(timezone.utc),
+                )
+            else:
+                live_result = self._live_freshness_result(
+                    live_baseline
+                )
+            case_view = apply_live_freshness(case_view, live_result)
+            projection["freshness"] = case_view["freshness"]
+            projection["digest_freshness"] = case_view["digest_freshness"]
+        projection.update(case_view)
         return projection
 
     def _crosscheck_legacy_run_projection(
@@ -777,7 +949,7 @@ class AssuranceWebRepository:
 
     def _passport_canonical(self, p) -> dict:
         case, binding = p["case"], p["binding"]
-        return {
+        canonical = {
             "schema": "codemesh.assurance.passport.v1",
             "case_id": case["case_id"], "subject_digest": case["subject_digest"],
             "state": case["state"], "gate": p["gate"], "revision": p["revision"], "updated_at": case["updated_at"],
@@ -790,6 +962,9 @@ class AssuranceWebRepository:
             "missing_evidence": list(case["missing_evidence"]), "conditions": list(case["conditions"]), "conflicts": list(case["conflicts"]),
             "unverified_labels": self._unverified_labels(p), "invalidation_reason": case["invalidation_reason"],
         }
+        if p.get("freshness") is not None:
+            canonical["freshness"] = p["freshness"]
+        return canonical
 
     def _passport_markdown(self, p) -> str:
         case, binding = p["case"], p["binding"]
@@ -808,6 +983,9 @@ class AssuranceWebRepository:
             lines.append("- Conditions: " + "; ".join(case["conditions"]))
         if case["conflicts"]:
             lines.append("- Conflicts: " + "; ".join(case["conflicts"]))
+        freshness = p.get("freshness")
+        if freshness is not None:
+            lines += ["", "## Live Freshness", f"- Status: **{freshness['status']}**", f"- Reason: `{freshness['reason_code']}`"]
         if case["invalidation_reason"]:
             lines.append(f"- Invalidation: {case['invalidation_reason']}")
         unverified = self._unverified_labels(p)
@@ -971,6 +1149,8 @@ class AssuranceWebRepository:
 
 @lru_cache(maxsize=1)
 def get_assurance_repository(db_path: Path | None = None) -> AssuranceWebRepository:
-    repository = AssuranceWebRepository(db_path)
-    repository.initialize()
-    return repository
+    # This is a product dependency factory.  Without an explicitly composed
+    # checker it must fail closed instead of silently exposing the old
+    # database-only freshness boolean.  Tests/fixtures construct the
+    # repository directly with the default ``live_required=False`` mode.
+    raise AssuranceWebError("assurance repository requires explicit live composition")

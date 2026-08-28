@@ -368,6 +368,8 @@ def test_delayed_lifespan_loader_runs_fake_post_chain_and_closes_once(
         assert 200 <= response.status_code < 300
         assert response.json()["case_view"]["gate"] == "PASS"
         assert response.json()["case_view"]["policy_gate"]["status"] == "PASS"
+        assert response.json()["case_view"]["freshness"]["status"] == "FRESH"
+        assert response.json()["case_view"]["freshness"]["reason_code"] == "FRESHNESS_MATCH"
 
     assert loader_calls == [True]
     assert len(requests) == 1

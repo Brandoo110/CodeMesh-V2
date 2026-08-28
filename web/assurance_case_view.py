@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from assurance.contracts import PolicyDecision
+from assurance.live_freshness import FreshnessStatus, LiveFreshness
 from assurance.release_observation import ReleaseObservation
 from assurance.state_machine import allowed_event_kinds
 
@@ -95,6 +96,31 @@ def resolve_action(
     return next((action for action in actions if action.get("code") == code), None)
 
 
+def apply_live_freshness(
+    view: Mapping[str, object], result: LiveFreshness
+) -> dict[str, object]:
+    """Overlay one server-owned live result on a previously built CaseView.
+
+    The helper is additive so the existing pure CaseView interface remains
+    useful for explicit database-only fixtures.  A non-FRESH result closes all
+    decision actions while retaining the safe passport download action.
+    """
+
+    if not isinstance(result, LiveFreshness):
+        raise TypeError("result must be a LiveFreshness")
+    overlay = dict(view)
+    overlay["freshness"] = result.model_dump(mode="json")
+    live_digest_freshness = bool(view.get("digest_freshness")) and (
+        result.status is FreshnessStatus.FRESH
+    )
+    overlay["digest_freshness"] = live_digest_freshness
+    if not live_digest_freshness:
+        overlay["allowed_actions"] = [
+            _action("download_passport")
+        ]
+    return overlay
+
+
 def _policy_gate(decisions: Sequence[object]) -> dict[str, object]:
     latest = next(
         (
@@ -181,4 +207,9 @@ def build_case_view(
     }
 
 
-__all__ = ["build_case_view", "derive_allowed_actions", "resolve_action"]
+__all__ = [
+    "apply_live_freshness",
+    "build_case_view",
+    "derive_allowed_actions",
+    "resolve_action",
+]
