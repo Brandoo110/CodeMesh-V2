@@ -322,3 +322,58 @@ export interface AssuranceDecisionRequest {
   decided_at: string;
   high_risk_confirmed: boolean;
 }
+
+export interface AssuranceRunRequest {
+  repository_path: string;
+  repository_identity: string;
+  author: string;
+  base_ref: string;
+  task_path: string;
+  policy_paths: string[];
+  adr_paths: string[];
+  runbook_paths: string[];
+  command_ids: string[];
+  changed_lines_total: number | null;
+  external_side_effects: "none_declared" | "present_declared" | "unknown";
+  provider_boundary:
+    | "within_declared_boundary"
+    | "crosses_declared_boundary"
+    | "unknown";
+}
+
+export interface AssuranceRunResponse {
+  schema_version: "v1";
+  run_id: string;
+  request_digest: string;
+  cached: boolean;
+  case_id: string;
+  case_view: AssuranceProjection;
+}
+
+export interface AssuranceArtifactReference {
+  schema_version: "v1";
+  digest: string;
+  kind: string;
+  label: string;
+  byte_size: number;
+  media_type: "text/plain";
+  integrity_status: "SHA-256 integrity verified";
+  role: "top_level" | "document" | "stdout" | "stderr";
+  path: string | null;
+  command_id: string | null;
+  stream: "stdout" | "stderr" | null;
+}
+
+export interface AssuranceArtifactIndex {
+  schema_version: "v1";
+  case_id: string;
+  evidence_id: string;
+  evidence_kind: string;
+  artifacts: AssuranceArtifactReference[];
+}
+
+export interface AssuranceArtifactContent {
+  text: string;
+  digest: string | null;
+  byte_size: number | null;
+}

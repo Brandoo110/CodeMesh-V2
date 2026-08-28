@@ -26,6 +26,8 @@ from assurance.state_machine import (
 )
 from assurance.store import AssuranceStoreError, StoreConflictError
 from web.assurance_case_view import resolve_action
+from web.assurance_artifacts import AssuranceArtifactReader
+from web.assurance_run_composition import AssuranceRunWebDependencies
 from web.assurance_store import (
     AssuranceWebConflictError,
     AssuranceWebError,
@@ -33,6 +35,7 @@ from web.assurance_store import (
     AssuranceWebRepository,
     get_assurance_repository,
 )
+from web.routes.assurance_runs import get_assurance_run_dependencies
 
 router = APIRouter(prefix="/assurance", tags=["assurance"])
 # The mutation endpoints below are historical fixture seams.  They are kept
@@ -170,6 +173,30 @@ def _unique(*groups: tuple[str, ...]) -> tuple[str, ...]:
                 seen.add(item)
                 result.append(item)
     return tuple(result)
+
+
+def _assurance_artifact_reader(
+    dependencies: AssuranceRunWebDependencies | None = Depends(
+        get_assurance_run_dependencies
+    ),
+) -> AssuranceArtifactReader:
+    if dependencies is None or dependencies.artifact_reader is None:
+        _fail(
+            503,
+            "ASSURANCE_ARTIFACTS_NOT_CONFIGURED",
+            "assurance artifact reader is not configured",
+            "NOT_CONFIGURED",
+        )
+    return dependencies.artifact_reader
+
+
+def _artifact_call(operation: Callable[[], Any]) -> Any:
+    """Map every artifact boundary miss to the same path-free 404."""
+
+    try:
+        return operation()
+    except AssuranceWebNotFoundError:
+        _fail(404, "ASSURANCE_NOT_FOUND", "artifact is unavailable", "NOT_FOUND")
 
 
 @fixture_mutation_router.post("/changes", status_code=201)
@@ -409,6 +436,39 @@ def get_evidence(
     repository: AssuranceWebRepository = Depends(get_assurance_repository),
 ) -> dict[str, Any]:
     return _call(lambda: repository.get_evidence(change_id, evidence_id))
+
+
+@router.get("/changes/{change_id}/evidence/{evidence_id}/artifacts")
+def list_assurance_artifacts(
+    change_id: str,
+    evidence_id: str,
+    reader: AssuranceArtifactReader = Depends(_assurance_artifact_reader),
+) -> dict[str, Any]:
+    index = _artifact_call(lambda: reader.list_artifacts(change_id, evidence_id))
+    return index.model_dump(mode="json")
+
+
+@router.get(
+    "/changes/{change_id}/evidence/{evidence_id}/artifacts/{digest}",
+    response_model=None,
+)
+def read_assurance_artifact(
+    change_id: str,
+    evidence_id: str,
+    digest: str,
+    reader: AssuranceArtifactReader = Depends(_assurance_artifact_reader),
+) -> PlainTextResponse:
+    artifact = _artifact_call(
+        lambda: reader.read_artifact(change_id, evidence_id, digest)
+    )
+    return PlainTextResponse(
+        content=artifact.data,
+        media_type="text/plain",
+        headers={
+            "X-Artifact-Digest": artifact.digest,
+            "X-Artifact-Size": str(artifact.byte_size),
+        },
+    )
 
 
 @router.get("/changes/{change_id}/receipt")

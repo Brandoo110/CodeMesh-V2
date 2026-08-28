@@ -5,16 +5,21 @@ import {
   CheckCircle2,
   Download,
   FileSearch,
+  Plus,
   RefreshCw,
   ShieldCheck,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  ApiError,
   downloadAssurancePassport,
+  createAssuranceRun,
   getAssuranceChange,
+  listAssuranceArtifacts,
   listAssuranceChanges,
+  readAssuranceArtifact,
   submitAssuranceDecision,
 } from "@/lib/api";
 import {
@@ -23,13 +28,43 @@ import {
 } from "@/lib/assurance-case-view";
 import type {
   AssuranceDecisionRequest,
+  AssuranceArtifactIndex,
+  AssuranceArtifactReference,
   AssuranceEvidence,
   AssuranceFinding,
   AssuranceProjection,
+  AssuranceRunRequest,
   AssuranceReceiptStep,
 } from "@/lib/types";
 
 type DecisionKind = AssuranceDecisionRequest["decision"];
+
+type RunFormState = Omit<AssuranceRunRequest, "policy_paths" | "adr_paths" | "runbook_paths" | "command_ids" | "changed_lines_total"> & {
+  policy_paths: string;
+  adr_paths: string;
+  runbook_paths: string;
+  command_ids: string;
+  changed_lines_total: string;
+};
+
+const INITIAL_RUN_FORM: RunFormState = {
+  repository_path: "",
+  repository_identity: "",
+  author: "",
+  base_ref: "main",
+  task_path: "TASK.md",
+  policy_paths: "",
+  adr_paths: "",
+  runbook_paths: "",
+  command_ids: "",
+  changed_lines_total: "",
+  external_side_effects: "unknown",
+  provider_boundary: "unknown",
+};
+
+function splitRunPaths(value: string): string[] {
+  return value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
+}
 
 const DECISION_LABELS: Record<DecisionKind, string> = {
   approve: "Accept",
@@ -110,7 +145,57 @@ function ArrayBlock({ title, values, danger = false }: { title: string; values: 
   );
 }
 
-function EvidenceDrawer({ evidence, missingRef, onClose }: { evidence: AssuranceEvidence | null; missingRef: string | null; onClose: () => void }) {
+function EvidenceDrawer({ caseId, evidence, missingRef, onClose }: { caseId: string | null; evidence: AssuranceEvidence | null; missingRef: string | null; onClose: () => void }) {
+  const [artifactIndex, setArtifactIndex] = useState<AssuranceArtifactIndex | null>(null);
+  const [artifact, setArtifact] = useState<AssuranceArtifactReference | null>(null);
+  const [content, setContent] = useState<string | null>(null);
+  const [loadingArtifacts, setLoadingArtifacts] = useState(false);
+  const [loadingContent, setLoadingContent] = useState(false);
+  const [artifactError, setArtifactError] = useState<string | null>(null);
+  const artifactSequence = useRef(0);
+
+  useEffect(() => {
+    const sequence = ++artifactSequence.current;
+    if (!caseId || !evidence) {
+      setArtifactIndex(null);
+      setArtifact(null);
+      setContent(null);
+      setArtifactError(null);
+      return () => {
+        if (artifactSequence.current === sequence) artifactSequence.current += 1;
+      };
+    }
+    setLoadingArtifacts(true);
+    setArtifactIndex(null);
+    setArtifact(null);
+    setContent(null);
+    setArtifactError(null);
+    listAssuranceArtifacts(caseId, evidence.evidence_id)
+      .then((value) => { if (artifactSequence.current === sequence) setArtifactIndex(value); })
+      .catch((cause) => { if (artifactSequence.current === sequence) setArtifactError(cause instanceof Error ? cause.message : String(cause)); })
+      .finally(() => { if (artifactSequence.current === sequence) setLoadingArtifacts(false); });
+    return () => {
+      if (artifactSequence.current === sequence) artifactSequence.current += 1;
+    };
+  }, [caseId, evidence]);
+
+  async function readArtifact(reference: AssuranceArtifactReference) {
+    if (!caseId || !evidence) return;
+    const sequence = ++artifactSequence.current;
+    setArtifact(reference);
+    setContent(null);
+    setArtifactError(null);
+    setLoadingContent(true);
+    try {
+      const value = await readAssuranceArtifact(caseId, evidence.evidence_id, reference.digest);
+      if (artifactSequence.current === sequence) setContent(value.text);
+    } catch (cause) {
+      if (artifactSequence.current === sequence) setArtifactError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (artifactSequence.current === sequence) setLoadingContent(false);
+    }
+  }
+
   return (
     <aside className="flex h-full w-[370px] flex-shrink-0 flex-col border-l border-border bg-surface">
       <div className="flex h-14 items-center justify-between border-b border-border px-5">
@@ -138,9 +223,12 @@ function EvidenceDrawer({ evidence, missingRef, onClose }: { evidence: Assurance
             <InfoBlock title="Redaction" value="未记录" />
             <InfoBlock title="Truncation" value={evidence.status === "truncated" ? "是" : "未记录"} />
             <div className="border-t border-border pt-3">
-              <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-fg-subtle">Canonical Payload</div>
-              <pre className="overflow-x-auto whitespace-pre-wrap break-all border border-border bg-canvas p-3 font-mono text-xs leading-5 text-fg-muted">{JSON.stringify(evidence, null, 2)}</pre>
+              <div className="mb-2 flex items-center justify-between"><div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-fg-subtle">Authorized Artifacts</div>{artifactIndex && <span className="text-xs text-fg-subtle">{artifactIndex.artifacts.length}</span>}</div>
+              {loadingArtifacts && <div className="text-sm text-fg-muted">正在读取服务端授权索引…</div>}
+              {artifactError && <div className="border border-error/30 bg-error/10 p-3 text-sm text-error">{artifactError}</div>}
+              {artifactIndex && <div className="space-y-2">{artifactIndex.artifacts.map((reference) => <button key={reference.digest} onClick={() => void readArtifact(reference)} className={`w-full border p-3 text-left ${artifact?.digest === reference.digest ? "border-accent bg-accent/5" : "border-border bg-canvas hover:bg-surface-hover"}`}><div className="flex items-start justify-between gap-3"><span className="text-sm font-medium text-fg">{reference.label}</span><Badge value={reference.role} /></div><div className="mt-1 break-all font-mono text-[11px] text-fg-muted">{reference.digest}</div><div className="mt-1 text-xs text-fg-subtle">{reference.byte_size} bytes · {reference.kind}</div></button>)}</div>}
             </div>
+            {artifact && <div className="border-t border-border pt-3"><div className="mb-2 flex items-center justify-between"><div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-fg-subtle">{artifact.label}</div>{loadingContent && <RefreshCw size={14} className="animate-spin text-fg-subtle" />}</div>{content !== null && <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words border border-border bg-canvas p-3 font-mono text-xs leading-5 text-fg">{content}</pre>}</div>}
           </>
         )}
       </div>
@@ -151,6 +239,10 @@ function EvidenceDrawer({ evidence, missingRef, onClose }: { evidence: Assurance
 export function AssuranceView() {
   const [cases, setCases] = useState<AssuranceProjection[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
+  const [composerOpen, setComposerOpen] = useState(false);
+  const composerOpenRef = useRef(false);
+  const loadSequence = useRef(0);
   const [detail, setDetail] = useState<AssuranceProjection | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -166,17 +258,32 @@ export function AssuranceView() {
   const [expiresAt, setExpiresAt] = useState("");
   const [highRiskConfirmed, setHighRiskConfirmed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [runForm, setRunForm] = useState<RunFormState>(INITIAL_RUN_FORM);
+  const runIdempotencyKey = useRef<string | null>(null);
+  const [runSubmitting, setRunSubmitting] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
 
-  const load = useCallback(async (quiet = false) => {
+  const load = useCallback(async (quiet = false, preferredId?: string | null) => {
+    const sequence = ++loadSequence.current;
     if (quiet) setRefreshing(true); else setLoading(true);
     try {
       const rows = await listAssuranceChanges();
-      const nextId = selectedId && rows.some((row) => row.case_id === selectedId)
-        ? selectedId
+      if (sequence !== loadSequence.current) return;
+      if (composerOpenRef.current && preferredId === undefined) {
+        setCases(rows);
+        setError(null);
+        return;
+      }
+      const currentId = preferredId ?? selectedIdRef.current;
+      const nextId = currentId && rows.some((row) => row.case_id === currentId)
+        ? currentId
         : rows[0]?.case_id ?? null;
       setCases(rows);
+      selectedIdRef.current = nextId;
       setSelectedId(nextId);
-      setDetail(nextId ? await getAssuranceChange(nextId) : null);
+      const nextDetail = nextId ? await getAssuranceChange(nextId) : null;
+      if (sequence !== loadSequence.current) return;
+      setDetail(nextDetail);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -184,7 +291,7 @@ export function AssuranceView() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [selectedId]);
+  }, []);
 
   useEffect(() => {
     void load();
@@ -233,11 +340,76 @@ export function AssuranceView() {
       && owner.trim()
       && owner.trim() === detail?.metadata?.author,
   );
+  const runCommands = splitRunPaths(runForm.command_ids);
+  const runFormReady = Boolean(
+    runForm.repository_path.trim()
+    && runForm.repository_identity.trim()
+    && runForm.author.trim()
+    && runForm.base_ref.trim()
+    && runForm.task_path.trim()
+    && runCommands.length > 0
+    && (runForm.changed_lines_total.trim() === "" || /^\d+$/.test(runForm.changed_lines_total.trim()))
+  );
 
   function openEvidence(ref: string) {
     const evidence = evidenceById.get(ref) || null;
     setDrawerEvidence(evidence);
     setDrawerMissingRef(evidence ? null : ref);
+  }
+
+  function selectCase(caseId: string | null) {
+    loadSequence.current += 1;
+    const openingComposer = caseId === null;
+    composerOpenRef.current = openingComposer;
+    setComposerOpen(openingComposer);
+    selectedIdRef.current = caseId;
+    setSelectedId(caseId);
+    if (openingComposer) {
+      setDetail(null);
+      setDrawerEvidence(null);
+      setDrawerMissingRef(null);
+      setRunError(null);
+    }
+  }
+
+  function updateRunForm<K extends keyof RunFormState>(key: K, value: RunFormState[K]) {
+    runIdempotencyKey.current = null;
+    setRunForm((current) => ({ ...current, [key]: value }));
+  }
+
+  async function submitRun() {
+    const commandIds = splitRunPaths(runForm.command_ids);
+    if (!runForm.repository_path.trim() || !runForm.repository_identity.trim() || !runForm.author.trim() || !runForm.base_ref.trim() || !runForm.task_path.trim() || commandIds.length === 0) return;
+    const request: AssuranceRunRequest = {
+      repository_path: runForm.repository_path.trim(),
+      repository_identity: runForm.repository_identity.trim(),
+      author: runForm.author.trim(),
+      base_ref: runForm.base_ref.trim(),
+      task_path: runForm.task_path.trim(),
+      policy_paths: splitRunPaths(runForm.policy_paths),
+      adr_paths: splitRunPaths(runForm.adr_paths),
+      runbook_paths: splitRunPaths(runForm.runbook_paths),
+      command_ids: commandIds,
+      changed_lines_total: runForm.changed_lines_total.trim() ? Number(runForm.changed_lines_total) : null,
+      external_side_effects: runForm.external_side_effects,
+      provider_boundary: runForm.provider_boundary,
+    };
+    if (request.changed_lines_total !== null && (!Number.isInteger(request.changed_lines_total) || request.changed_lines_total < 0)) return;
+    setRunSubmitting(true);
+    setRunError(null);
+    const idempotencyKey = runIdempotencyKey.current || `web-run-${Date.now()}-${crypto.randomUUID()}`;
+    runIdempotencyKey.current = idempotencyKey;
+    try {
+      const result = await createAssuranceRun(request, idempotencyKey);
+      runIdempotencyKey.current = null;
+      composerOpenRef.current = false;
+      setComposerOpen(false);
+      await load(true, result.case_id);
+    } catch (cause) {
+      setRunError(cause instanceof ApiError ? `服务端 ${cause.status}：${cause.message}` : cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRunSubmitting(false);
+    }
   }
 
   async function submitDecision() {
@@ -294,15 +466,15 @@ export function AssuranceView() {
       <aside className="flex w-[310px] flex-shrink-0 flex-col border-r border-border bg-surface">
         <div className="flex h-14 items-center justify-between border-b border-border px-4">
           <div><div className="text-sm font-semibold text-fg">Change Queue</div><div className="text-xs text-fg-subtle">{cases.length} 个验收对象</div></div>
-          <button onClick={() => void load(true)} className="p-2 text-fg-muted hover:bg-surface-hover hover:text-fg" title="刷新"><RefreshCw size={16} className={refreshing ? "animate-spin" : ""} /></button>
+          <div className="flex items-center gap-1"><button onClick={() => selectCase(null)} className="p-2 text-fg-muted hover:bg-surface-hover hover:text-fg" title="新建本地 Run"><Plus size={16} /></button><button onClick={() => void load(true)} className="p-2 text-fg-muted hover:bg-surface-hover hover:text-fg" title="刷新"><RefreshCw size={16} className={refreshing ? "animate-spin" : ""} /></button></div>
         </div>
         {error && <div className="border-b border-error/30 bg-error/10 px-4 py-3 text-xs text-error">{error}</div>}
         <div className="flex-1 overflow-y-auto">
-          {cases.length === 0 ? <div className="p-6 text-sm text-fg-muted">暂无 Acceptance Case。先通过本地 API 接入一个变更。</div> : cases.map((item) => {
+          {cases.length === 0 ? <div className="p-6 text-sm text-fg-muted">暂无 Acceptance Case。点击右上角＋提交本地 Run。</div> : cases.map((item) => {
             const active = item.case_id === selectedId;
             const meta = item.metadata;
             return (
-              <button key={item.case_id} onClick={() => setSelectedId(item.case_id)} className={`w-full border-b border-border px-4 py-4 text-left transition-colors ${active ? "bg-canvas" : "hover:bg-surface-hover"}`}>
+              <button key={item.case_id} onClick={() => selectCase(item.case_id)} className={`w-full border-b border-border px-4 py-4 text-left transition-colors ${active ? "bg-canvas" : "hover:bg-surface-hover"}`}>
                 <div className="mb-2 flex items-start justify-between gap-2"><span className="line-clamp-2 text-sm font-medium text-fg">{meta?.title || item.case_id}</span><div className="flex flex-wrap justify-end gap-1.5"><Badge value={item.policy_gate.status} /><Badge value={item.acceptance_state} /></div></div>
                 <div className="mb-2 flex flex-wrap gap-1.5"><Badge value={meta?.risk || "unknown"} />{!item.digest_freshness && <Badge value="STALE" />}</div>
                 <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-fg-muted"><span>Owner {meta?.owner || "未记录"}</span><span>V/P {meta?.value ?? "-"}/{meta?.priority ?? "-"}</span><span>缺证 {item.case.missing_evidence.length}</span><span>{shortDate(item.case.updated_at)}</span></div>
@@ -314,7 +486,33 @@ export function AssuranceView() {
       </aside>
 
       <main className="min-w-0 flex-1 overflow-y-auto">
-        {!detail ? <div className="flex h-full items-center justify-center text-sm text-fg-muted">从左侧选择一个 Case</div> : (
+        {composerOpen ? <div className="mx-auto max-w-[900px] px-7 py-8">
+          <section className="border border-border bg-surface p-6">
+            <div className="mb-6 flex items-start justify-between gap-4 border-b border-border pb-5"><div><div className="text-xs font-semibold uppercase tracking-[0.14em] text-fg-subtle">Local Assurance Run</div><h2 className="mt-2 text-2xl font-semibold tracking-tight text-fg">提交一次本地 Assurance Run</h2><p className="mt-2 max-w-2xl text-sm leading-6 text-fg-muted">只提交调用方原始输入；Case、Evidence、Receipt 和 Policy 由服务端生成。Artifact 读取也会继续沿用服务端授权边界。</p></div><ShieldCheck size={22} className="mt-1 flex-shrink-0 text-accent" /></div>
+            {runError && <div className="mb-4 border border-error/30 bg-error/10 p-3 text-sm text-error">{runError}</div>}
+            <form onSubmit={(event) => { event.preventDefault(); void submitRun(); }} className="space-y-5">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <label className="text-xs text-fg-muted">Repository path<span className="ml-1 text-error">*</span><input value={runForm.repository_path} onChange={(event) => updateRunForm("repository_path", event.target.value)} placeholder="/absolute/path/to/repository" className="mt-1 w-full border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+                <label className="text-xs text-fg-muted">Repository identity<span className="ml-1 text-error">*</span><input value={runForm.repository_identity} onChange={(event) => updateRunForm("repository_identity", event.target.value)} placeholder="github.com/org/repository" className="mt-1 w-full border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+                <label className="text-xs text-fg-muted">Author<span className="ml-1 text-error">*</span><input value={runForm.author} onChange={(event) => updateRunForm("author", event.target.value)} placeholder="调用方姓名或 Agent 标识" className="mt-1 w-full border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+                <label className="text-xs text-fg-muted">Base ref<span className="ml-1 text-error">*</span><input value={runForm.base_ref} onChange={(event) => updateRunForm("base_ref", event.target.value)} placeholder="main" className="mt-1 w-full border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+                <label className="text-xs text-fg-muted">Task path<span className="ml-1 text-error">*</span><input value={runForm.task_path} onChange={(event) => updateRunForm("task_path", event.target.value)} placeholder="TASK.md" className="mt-1 w-full border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+                <label className="text-xs text-fg-muted">Changed lines total<input inputMode="numeric" value={runForm.changed_lines_total} onChange={(event) => updateRunForm("changed_lines_total", event.target.value)} placeholder="可选" className="mt-1 w-full border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+              </div>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <label className="text-xs text-fg-muted">Command IDs<span className="ml-1 text-error">*</span><textarea value={runForm.command_ids} onChange={(event) => updateRunForm("command_ids", event.target.value)} placeholder="每行或逗号分隔，例如 check" rows={2} className="mt-1 w-full resize-y border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+                <label className="text-xs text-fg-muted">Policy paths（可选）<textarea value={runForm.policy_paths} onChange={(event) => updateRunForm("policy_paths", event.target.value)} placeholder="每行一个 .md 路径" rows={2} className="mt-1 w-full resize-y border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+                <label className="text-xs text-fg-muted">ADR paths（可选）<textarea value={runForm.adr_paths} onChange={(event) => updateRunForm("adr_paths", event.target.value)} placeholder="每行一个 .md 路径" rows={2} className="mt-1 w-full resize-y border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+                <label className="text-xs text-fg-muted">Runbook paths（可选）<textarea value={runForm.runbook_paths} onChange={(event) => updateRunForm("runbook_paths", event.target.value)} placeholder="每行一个 .md 路径" rows={2} className="mt-1 w-full resize-y border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent" /></label>
+              </div>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <label className="text-xs text-fg-muted">External side effects<select value={runForm.external_side_effects} onChange={(event) => updateRunForm("external_side_effects", event.target.value as RunFormState["external_side_effects"])} className="mt-1 w-full border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent"><option value="unknown">unknown</option><option value="none_declared">none_declared</option><option value="present_declared">present_declared</option></select></label>
+                <label className="text-xs text-fg-muted">Provider boundary<span className="ml-1 text-error">*</span><select value={runForm.provider_boundary} onChange={(event) => updateRunForm("provider_boundary", event.target.value as RunFormState["provider_boundary"])} className="mt-1 w-full border border-border bg-canvas px-3 py-2 text-sm text-fg outline-none focus:border-accent"><option value="unknown">unknown（服务端会返回 412）</option><option value="within_declared_boundary">within_declared_boundary</option><option value="crosses_declared_boundary">crosses_declared_boundary</option></select></label>
+              </div>
+              <div className="flex items-center justify-between gap-4 border-t border-border pt-5"><div className="text-xs leading-5 text-fg-subtle">失败或网络不确定时，保持表单不变即可复用同一 Idempotency-Key；修改任一字段后会生成新 Key。成功后自动刷新并选中新 Case。</div><button type="submit" disabled={!runFormReady || runSubmitting} className="flex items-center gap-2 bg-accent px-4 py-2 text-sm font-semibold text-canvas disabled:cursor-not-allowed disabled:opacity-40">{runSubmitting ? <RefreshCw size={15} className="animate-spin" /> : <CheckCircle2 size={15} />}提交 Run</button></div>
+            </form>
+          </section>
+        </div> : !detail ? <div className="flex h-full items-center justify-center text-sm text-fg-muted">从左侧选择一个 Case</div> : (
           <div className="mx-auto max-w-[1120px] space-y-6 px-7 py-6">
             {(!detail.digest_freshness || detail.acceptance_state === "INVALIDATED") && (
               <div className="flex items-start gap-3 border border-error/40 bg-error/10 p-4 text-error"><AlertTriangle className="mt-0.5 flex-shrink-0" size={18} /><div><div className="font-semibold">{detail.digest_freshness ? "INVALIDATED / Subject 已失效" : "STALE / Digest 已失效"}</div><div className="mt-1 text-sm">{detail.case.invalidation_reason || "当前 CaseView 绑定不再有效，禁止签收。"}</div></div></div>
@@ -392,7 +590,7 @@ export function AssuranceView() {
           </div>
         )}
       </main>
-      {(drawerEvidence || drawerMissingRef) && <EvidenceDrawer evidence={drawerEvidence} missingRef={drawerMissingRef} onClose={() => { setDrawerEvidence(null); setDrawerMissingRef(null); }} />}
+      {(drawerEvidence || drawerMissingRef) && <EvidenceDrawer caseId={detail?.case_id || selectedId} evidence={drawerEvidence} missingRef={drawerMissingRef} onClose={() => { setDrawerEvidence(null); setDrawerMissingRef(null); }} />}
     </div>
   );
 }

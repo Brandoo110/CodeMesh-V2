@@ -23,6 +23,10 @@ import type {
   StoredMessage,
   AssuranceDecisionRequest,
   AssuranceProjection,
+  AssuranceArtifactContent,
+  AssuranceArtifactIndex,
+  AssuranceRunRequest,
+  AssuranceRunResponse,
 } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
@@ -194,6 +198,55 @@ export async function listAssuranceChanges(): Promise<AssuranceProjection[]> {
 
 export async function getAssuranceChange(id: string): Promise<AssuranceProjection> {
   return request<AssuranceProjection>(`/api/assurance/changes/${encodeURIComponent(id)}`);
+}
+
+export async function createAssuranceRun(
+  payload: AssuranceRunRequest,
+  idempotencyKey: string,
+): Promise<AssuranceRunResponse> {
+  return request<AssuranceRunResponse>("/api/assurance/runs", {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function listAssuranceArtifacts(
+  caseId: string,
+  evidenceId: string,
+): Promise<AssuranceArtifactIndex> {
+  return request<AssuranceArtifactIndex>(
+    `/api/assurance/changes/${encodeURIComponent(caseId)}/evidence/${encodeURIComponent(evidenceId)}/artifacts`,
+  );
+}
+
+export async function readAssuranceArtifact(
+  caseId: string,
+  evidenceId: string,
+  digest: string,
+): Promise<AssuranceArtifactContent> {
+  const res = await fetch(
+    `${API_BASE}/api/assurance/changes/${encodeURIComponent(caseId)}/evidence/${encodeURIComponent(evidenceId)}/artifacts/${encodeURIComponent(digest)}`,
+    { headers: { Accept: "text/plain" } },
+  );
+  if (!res.ok) {
+    let detail: unknown = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail ?? body;
+    } catch {
+      // 非 JSON 错误体。
+    }
+    throw new ApiError(res.status, detail);
+  }
+  const text = await res.text();
+  const rawSize = res.headers.get("X-Artifact-Size");
+  const parsedSize = rawSize === null ? null : Number(rawSize);
+  return {
+    text,
+    digest: res.headers.get("X-Artifact-Digest"),
+    byte_size: rawSize !== null && Number.isSafeInteger(parsedSize) ? parsedSize : null,
+  };
 }
 
 export async function submitAssuranceDecision(
