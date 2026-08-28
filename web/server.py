@@ -95,6 +95,9 @@ def create_app(
                         dependencies = AssuranceRunWebDependencies(
                             service=candidate.service,
                             repository=candidate.repository,
+                            remediation_service=getattr(
+                                candidate, "remediation_service", None
+                            ),
                         )
                         # The runtime is loaded only at application startup; the
                         # ordinary factory remains free of environment reads.

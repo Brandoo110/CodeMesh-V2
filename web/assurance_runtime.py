@@ -12,36 +12,61 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping
+import inspect
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandSpec
+from assurance.contracts import Finding
+from assurance.digests import SubjectDigestInput, compute_subject_digest
 from assurance.fixed_reviewer_invoker import (
     FixedOpenAICompatibleReviewerInvoker,
     FixedReviewerEndpoint,
 )
 from assurance.live_freshness import LiveFreshnessChecker
+from assurance.remediation import RemediationPolicy, RemediationRequest, RemediationController
+from assurance.remediation_agent import StructuredRemediationAgent
+from assurance.remediation_reviewer import AssuranceRemediationReviewer
+from assurance.remediation_validation import ValidationCheck, ValidationExecutor
+from assurance.remediation_workspace import WorkspaceGrant
 from assurance.reviewer_context import SafeReviewerContextBuilder
 from assurance.run_service import (
     AssuranceRunConfig,
+    AssuranceRunBundle,
     AssuranceRunService,
+    FreshnessSourceBinding,
     ReviewerRoute,
 )
+from assurance.snapshot import GitSnapshotResult
+from orchestration.adapters import (
+    DashScopeAdapter,
+    DeepSeekAdapter,
+    GeminiAdapter,
+    MiniMaxAdapter,
+    VolcEngineAdapter,
+)
+from orchestration.adapters.base import ModelAdapter
+from web.assurance_remediation import (
+    AssuranceRemediationConfig,
+    AssuranceRemediationService,
+)
 from web.assurance_store import AssuranceWebRepository
+from web.assurance_store import RemediationContext
 
 
 _CONFIG_ENV = "CODEMESH_ASSURANCE_CONFIG"
 _API_KEY_ENV = "CODEMESH_ASSURANCE_REVIEWER_API_KEY"
+_REMEDIATION_API_KEY_ENV = "CODEMESH_ASSURANCE_REMEDIATION_API_KEY"
 _FIXED_REVIEWER_BASE_URL = "https://api.deepseek.com/v1"
 _STARTUP_ERROR_MESSAGE = "assurance runtime startup failed"
 
-_CONFIG_KEYS = frozenset(
+_CONFIG_V1_KEYS = frozenset(
     {
         "schema_version",
         "workspace_root",
@@ -56,6 +81,8 @@ _CONFIG_KEYS = frozenset(
         "reviewer",
     }
 )
+_CONFIG_V2_KEYS = _CONFIG_V1_KEYS | {"remediation"}
+_CONFIG_KEYS = _CONFIG_V1_KEYS
 _REVIEWER_KEYS = frozenset(
     {
         "provider",
@@ -64,6 +91,9 @@ _REVIEWER_KEYS = frozenset(
         "token_budget",
         "routing_rule",
     }
+)
+_REMEDIATION_KEYS = frozenset(
+    {"provider", "model_ref", "workspace_grant", "policy"}
 )
 _COMMAND_KEYS = frozenset(
     {
@@ -78,6 +108,12 @@ _COMMAND_KEYS = frozenset(
 )
 _REQUIRED_COMMAND_KEYS = _COMMAND_KEYS - {"schema_version"}
 _EXPANSION_RE = re.compile(r"(?:[$~{}]|%[^%]+%)")
+
+
+RemediationAdapterFactory = Callable[[str, str, str], ModelAdapter]
+_REMEDIATION_PROVIDERS = frozenset(
+    {"qwen", "dashscope", "gemini", "volcengine", "doubao", "minimax", "deepseek"}
+)
 
 
 class _InvalidRuntimeConfig(ValueError):
@@ -96,10 +132,20 @@ class AssuranceRuntimeStartupError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class AssuranceRemediationRuntimeConfig:
+    """Strict, server-owned remediation provider and policy configuration."""
+
+    provider: str
+    model_ref: str
+    workspace_grant: WorkspaceGrant
+    policy: RemediationPolicy
+
+
+@dataclass(frozen=True)
 class AssuranceRuntimeConfig:
     """Validated local configuration, excluding the reviewer API secret."""
 
-    schema_version: Literal["v1"]
+    schema_version: Literal["v1", "v2"]
     workspace_root: Path
     database_path: Path
     artifact_store_root: Path
@@ -110,6 +156,7 @@ class AssuranceRuntimeConfig:
     rubric_version: str
     freshness_ttl_seconds: int
     reviewer: ReviewerRoute
+    remediation: AssuranceRemediationRuntimeConfig | None = None
 
 
 @dataclass
@@ -124,15 +171,33 @@ class AssuranceRuntime:
     context_builder: SafeReviewerContextBuilder
     reviewer_invoker: FixedOpenAICompatibleReviewerInvoker
     service: AssuranceRunService
+    remediation_service: AssuranceRemediationService | None = None
+    remediation_adapter: ModelAdapter | None = field(default=None, repr=False)
+    remediation_adapter_close: Callable[[], Any] | None = field(
+        default=None, repr=False
+    )
     _closed: bool = field(default=False, init=False, repr=False)
 
     async def aclose(self) -> None:
-        """Close the reviewer client at most once."""
+        """Close all owned transports at most once with a fixed public error."""
 
         if self._closed:
             return
         self._closed = True
-        await self.reviewer_invoker.aclose()
+        close_failed = False
+        try:
+            await self.reviewer_invoker.aclose()
+        except Exception:
+            close_failed = True
+        if self.remediation_adapter_close is not None:
+            try:
+                result = self.remediation_adapter_close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                close_failed = True
+        if close_failed:
+            raise AssuranceRuntimeStartupError() from None
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -240,9 +305,40 @@ def _reviewer_route(value: object) -> ReviewerRoute:
         raise _InvalidRuntimeConfig("reviewer route is invalid") from None
 
 
+def _remediation_runtime_config(value: object) -> AssuranceRemediationRuntimeConfig:
+    remediation = _mapping(value, keys=_REMEDIATION_KEYS, label="remediation")
+    provider = _text(remediation["provider"], label="remediation.provider")
+    if provider not in _REMEDIATION_PROVIDERS:
+        raise _InvalidRuntimeConfig("remediation.provider is not supported")
+    model_ref = _text(remediation["model_ref"], label="remediation.model_ref")
+    try:
+        workspace_grant = WorkspaceGrant.model_validate(
+            remediation["workspace_grant"]
+        )
+        policy = RemediationPolicy.model_validate(remediation["policy"])
+    except (TypeError, ValueError, ValidationError):
+        raise _InvalidRuntimeConfig("remediation resources are invalid") from None
+    if type(workspace_grant) is not WorkspaceGrant or type(policy) is not RemediationPolicy:
+        raise _InvalidRuntimeConfig("remediation resources are invalid")
+    return AssuranceRemediationRuntimeConfig(
+        provider=provider,
+        model_ref=model_ref,
+        workspace_grant=workspace_grant,
+        policy=policy,
+    )
+
+
 def _parse_config(value: object) -> AssuranceRuntimeConfig:
-    config = _mapping(value, keys=_CONFIG_KEYS, label="configuration")
-    if config["schema_version"] != "v1":
+    if type(value) is not dict:
+        raise _InvalidRuntimeConfig("configuration has an invalid shape")
+    schema_version = value.get("schema_version")
+    if schema_version == "v1":
+        config = _mapping(value, keys=_CONFIG_V1_KEYS, label="configuration")
+        remediation = None
+    elif schema_version == "v2":
+        config = _mapping(value, keys=_CONFIG_V2_KEYS, label="configuration")
+        remediation = _remediation_runtime_config(config["remediation"])
+    else:
         raise _InvalidRuntimeConfig("schema_version is invalid")
     workspace = _absolute_path(config["workspace_root"], label="workspace_root")
     database = _absolute_path(config["database_path"], label="database_path")
@@ -263,7 +359,7 @@ def _parse_config(value: object) -> AssuranceRuntimeConfig:
         config["freshness_ttl_seconds"], label="freshness_ttl_seconds"
     )
     return AssuranceRuntimeConfig(
-        schema_version="v1",
+        schema_version=schema_version,
         workspace_root=workspace,
         database_path=database,
         artifact_store_root=artifact_root,
@@ -274,6 +370,7 @@ def _parse_config(value: object) -> AssuranceRuntimeConfig:
         rubric_version=versions["rubric_version"],
         freshness_ttl_seconds=freshness_ttl_seconds,
         reviewer=_reviewer_route(config["reviewer"]),
+        remediation=remediation,
     )
 
 
@@ -360,7 +457,259 @@ def _validate_paths(config: AssuranceRuntimeConfig) -> AssuranceRuntimeConfig:
         rubric_version=config.rubric_version,
         freshness_ttl_seconds=config.freshness_ttl_seconds,
         reviewer=config.reviewer,
+        remediation=config.remediation,
     )
+
+
+def _default_remediation_adapter_factory(
+    provider: str, model_ref: str, api_key: str
+) -> ModelAdapter:
+    """Construct one explicitly configured existing adapter, without routing."""
+
+    if provider in {"qwen", "dashscope"}:
+        adapter = DashScopeAdapter(api_key=api_key, model=model_ref)
+    elif provider == "gemini":
+        adapter = GeminiAdapter(api_key=api_key, model=model_ref)
+    elif provider in {"volcengine", "doubao"}:
+        adapter = VolcEngineAdapter(api_key=api_key, endpoint_id=model_ref)
+    elif provider == "minimax":
+        adapter = MiniMaxAdapter(api_key=api_key, model=model_ref)
+    elif provider == "deepseek":
+        adapter = DeepSeekAdapter(api_key=api_key, model=model_ref)
+    else:
+        raise ValueError("remediation provider is not supported")
+    if not isinstance(adapter, ModelAdapter):
+        raise TypeError("remediation adapter does not satisfy ModelAdapter")
+    return adapter
+
+
+def _adapter_close_handle(adapter: ModelAdapter) -> Callable[[], Any]:
+    """Return the only runtime-owned close seam for a remediation adapter."""
+
+    close = getattr(adapter, "aclose", None)
+    if callable(close):
+        return close
+    client = getattr(adapter, "client", None)
+    close = getattr(client, "aclose", None)
+    if close is None:
+        close = getattr(client, "close", None)
+    if callable(close):
+        return close
+    return lambda: None
+
+
+def _remediation_checks(
+    commands: tuple[CommandSpec, ...],
+) -> tuple[ValidationCheck, ...]:
+    try:
+        return tuple(
+            ValidationCheck(
+                id=command.command_id,
+                argv=command.argv,
+                visibility="agent",
+                timeout_s=command.timeout_seconds,
+                output_limit=command.max_output_bytes,
+            )
+            for command in commands
+        )
+    except (TypeError, ValueError, ValidationError):
+        raise AssuranceRuntimeStartupError() from None
+
+
+def _revalidate_remediation_root(path: object, configured_root: Path) -> Path:
+    """Recheck a server-bound source/workspace path before each preparation."""
+
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError("remediation source path is invalid")
+    try:
+        resolved = _real_directory(path, label="remediation source")
+    except (_InvalidRuntimeConfig, _PathAccessError):
+        raise ValueError("remediation source path is invalid") from None
+    if not resolved.is_relative_to(configured_root) or resolved == configured_root:
+        raise ValueError("remediation source path is outside the configured workspace")
+    return resolved
+
+
+def _scoped_run_config(
+    config: AssuranceRuntimeConfig,
+    root: Path,
+) -> AssuranceRunConfig:
+    return AssuranceRunConfig(
+        workspace_root=root,
+        allowed_commands=config.allowed_commands,
+        orchestration_version=config.orchestration_version,
+        redaction_policy_version=config.redaction_policy_version,
+        policy_version=config.policy_version,
+        rubric_version=config.rubric_version,
+        freshness_ttl_seconds=config.freshness_ttl_seconds,
+        reviewer_route=config.reviewer,
+    )
+
+
+class _RemediationGitCollector:
+    """Keep the scoped collector's facts bound to the controller subject."""
+
+    def __init__(self, collector: object, subject_getter: Callable[[], SubjectDigestInput | None]):
+        self._collector = collector
+        self._subject_getter = subject_getter
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._collector, name)
+
+    def collect(self, *args: Any, **kwargs: Any) -> GitSnapshotResult:
+        result = self._collector.collect(*args, **kwargs)
+        if type(result) is not GitSnapshotResult:
+            raise TypeError("Git collector returned an invalid result")
+        subject_input = self._subject_getter()
+        if subject_input is None:
+            return result
+        snapshot = result.snapshot
+        if (
+            snapshot.repository != subject_input.repository
+            or snapshot.base_revision != subject_input.base_revision
+            or snapshot.head_revision != subject_input.head_revision
+        ):
+            raise ValueError("scoped Git facts do not match remediation subject")
+        subject_digest = compute_subject_digest(subject_input)
+        return result.model_copy(
+            update={
+                "snapshot": snapshot.model_copy(
+                    update={"subject_digest": subject_digest}
+                ),
+                "evidence": result.evidence.model_copy(
+                    update={"subject_digest": subject_digest}
+                ),
+            }
+        )
+
+
+def _build_remediation_service(
+    *,
+    config: AssuranceRuntimeConfig,
+    remediation_api_key: str | None,
+    remediation_adapter_factory: RemediationAdapterFactory | None,
+    repository: AssuranceWebRepository,
+    artifact_store: ArtifactStore,
+    context_builder: SafeReviewerContextBuilder,
+    reviewer_invoker: FixedOpenAICompatibleReviewerInvoker,
+    service: AssuranceRunService,
+) -> tuple[
+    AssuranceRemediationService | None,
+    ModelAdapter | None,
+    Callable[[], Any] | None,
+]:
+    remediation = config.remediation
+    if remediation is None or remediation_api_key is None:
+        return None, None, None
+    factory = remediation_adapter_factory or _default_remediation_adapter_factory
+    adapter = factory(
+        remediation.provider,
+        remediation.model_ref,
+        remediation_api_key,
+    )
+    if inspect.isawaitable(adapter) or not isinstance(adapter, ModelAdapter):
+        raise TypeError("remediation adapter factory returned an invalid adapter")
+
+    agent = StructuredRemediationAgent(adapter)
+    remediation_config = AssuranceRemediationConfig(
+        workspace_grant=remediation.workspace_grant,
+        policy=remediation.policy,
+    )
+    checks = _remediation_checks(config.allowed_commands)
+
+    async def prepare_callback(
+        request: RemediationRequest,
+        *,
+        context: RemediationContext,
+    ) -> Any:
+        if type(request) is not RemediationRequest:
+            raise TypeError("remediation request is invalid")
+        if type(context) is not RemediationContext:
+            raise TypeError("remediation context is invalid")
+        baseline = context.baseline_bundle
+        selected_finding = context.selected_finding
+        source_binding = context.source_binding
+        if (
+            type(baseline) is not AssuranceRunBundle
+            or type(selected_finding) is not Finding
+            or type(source_binding) is not FreshnessSourceBinding
+            or baseline.freshness_source_binding != source_binding
+        ):
+            raise ValueError("remediation context facts are invalid")
+        source_root = _revalidate_remediation_root(
+            source_binding.repository_path,
+            config.workspace_root,
+        )
+        if (
+            request.old_case_id != baseline.case.case_id
+            or request.old_subject_digest != baseline.subject.subject_digest
+            or request.human_selected_finding_id != selected_finding.finding_id
+            or selected_finding.subject_digest != baseline.subject.subject_digest
+        ):
+            raise ValueError("remediation request is not bound to its context")
+
+        requested_subject_input: SubjectDigestInput | None = None
+
+        def subject_builder(patch_digest: str) -> tuple[SubjectDigestInput, str]:
+            nonlocal requested_subject_input
+            subject = baseline.subject
+            subject_input = SubjectDigestInput(
+                schema_version="v1",
+                repository=subject.repository,
+                base_revision=subject.base_revision,
+                head_revision=subject.head_revision,
+                normalized_diff_digest=patch_digest,
+                task_digest=subject.task_digest,
+                policy_version=subject.policy_version,
+                rubric_version=baseline.binding.rubric_version,
+                attachment_digests=(),
+            )
+            requested_subject_input = subject_input
+            return subject_input, compute_subject_digest(subject_input)
+
+        def reviewer_service_factory(workspace_root: Path) -> AssuranceRunService:
+            scoped_root = _revalidate_remediation_root(
+                workspace_root, config.workspace_root
+            )
+            scoped_config = _scoped_run_config(config, scoped_root)
+            return AssuranceRunService(
+                artifact_store=artifact_store,
+                reviewer_invoker=reviewer_invoker,
+                committer=repository,
+                context_builder=context_builder,
+                config=scoped_config,
+                git_collector=_RemediationGitCollector(
+                    service._git_collector,
+                    lambda: requested_subject_input,
+                ),
+                intake_collector=service._intake_collector,
+            )
+
+        reviewer = AssuranceRemediationReviewer(
+            baseline_bundle=baseline,
+            service_factory=reviewer_service_factory,
+        )
+
+        controller = RemediationController(
+            request=request,
+            selected_finding=selected_finding,
+            seed_root=source_root,
+            validation_executor=lambda workspace: ValidationExecutor(
+                workspace=workspace,
+                checks=checks,
+            ),
+            subject_builder=subject_builder,
+            reviewer_rerunner=reviewer,
+            workspace_parent=config.workspace_root,
+        )
+        return await controller.prepare(agent)
+
+    remediation_service = AssuranceRemediationService(
+        repository,
+        prepare_callback=prepare_callback,
+        config=remediation_config,
+    )
+    return remediation_service, adapter, _adapter_close_handle(adapter)
 
 
 def _read_config(config_ref: object) -> AssuranceRuntimeConfig | None:
@@ -377,26 +726,33 @@ def _read_config(config_ref: object) -> AssuranceRuntimeConfig | None:
         return None
 
 
-def _environment_values(environ: Mapping[str, str] | None) -> tuple[object, object] | None:
+def _environment_values(
+    environ: Mapping[str, str] | None,
+) -> tuple[object, object, str | None] | None:
     source = os.environ if environ is None else environ
     if not isinstance(source, Mapping):
         return None
     try:
         config_ref = source.get(_CONFIG_ENV)
-        api_key = source.get(_API_KEY_ENV)
+        reviewer_api_key = source.get(_API_KEY_ENV)
+        remediation_api_key = source.get(_REMEDIATION_API_KEY_ENV)
     except Exception:
         return None
     if type(config_ref) is not str or not config_ref.strip():
         return None
-    if type(api_key) is not str or not api_key.strip():
+    if type(reviewer_api_key) is not str or not reviewer_api_key.strip():
         return None
-    return config_ref, api_key
+    if type(remediation_api_key) is not str or not remediation_api_key.strip():
+        remediation_api_key = None
+    return config_ref, reviewer_api_key, remediation_api_key
 
 
 def _build_runtime(
     config: AssuranceRuntimeConfig,
-    api_key: str,
+    reviewer_api_key: str,
     reviewer_transport: httpx.AsyncBaseTransport | None,
+    remediation_api_key: str | None,
+    remediation_adapter_factory: RemediationAdapterFactory | None,
 ) -> AssuranceRuntime:
     try:
         if reviewer_transport is not None and not isinstance(
@@ -427,7 +783,7 @@ def _build_runtime(
         endpoint = FixedReviewerEndpoint(
             route=config.reviewer,
             base_url=_FIXED_REVIEWER_BASE_URL,
-            api_key=SecretStr(api_key),
+            api_key=SecretStr(reviewer_api_key),
         )
         reviewer_invoker = FixedOpenAICompatibleReviewerInvoker(
             endpoint,
@@ -440,6 +796,20 @@ def _build_runtime(
             context_builder=context_builder,
             config=service_config,
         )
+        (
+            remediation_service,
+            remediation_adapter,
+            remediation_adapter_close,
+        ) = _build_remediation_service(
+            config=config,
+            remediation_api_key=remediation_api_key,
+            remediation_adapter_factory=remediation_adapter_factory,
+            repository=repository,
+            artifact_store=artifact_store,
+            context_builder=context_builder,
+            reviewer_invoker=reviewer_invoker,
+            service=service,
+        )
     except Exception:
         raise AssuranceRuntimeStartupError() from None
     return AssuranceRuntime(
@@ -451,12 +821,16 @@ def _build_runtime(
         context_builder=context_builder,
         reviewer_invoker=reviewer_invoker,
         service=service,
+        remediation_service=remediation_service,
+        remediation_adapter=remediation_adapter,
+        remediation_adapter_close=remediation_adapter_close,
     )
 
 
 def load_assurance_runtime_from_environment(
     environ: Mapping[str, str] | None = None,
     reviewer_transport: httpx.AsyncBaseTransport | None = None,
+    remediation_adapter_factory: RemediationAdapterFactory | None = None,
 ) -> AssuranceRuntime | None:
     """Load the product runtime, or return ``None`` while it is disabled.
 
@@ -469,7 +843,7 @@ def load_assurance_runtime_from_environment(
     values = _environment_values(environ)
     if values is None:
         return None
-    config_ref, api_key = values
+    config_ref, reviewer_api_key, remediation_api_key = values
     config = _read_config(config_ref)
     if config is None:
         return None
@@ -479,7 +853,13 @@ def load_assurance_runtime_from_environment(
         return None
     except _PathAccessError:
         raise AssuranceRuntimeStartupError() from None
-    return _build_runtime(config, api_key, reviewer_transport)
+    return _build_runtime(
+        config,
+        reviewer_api_key,
+        reviewer_transport,
+        remediation_api_key,
+        remediation_adapter_factory,
+    )
 
 
 __all__ = [

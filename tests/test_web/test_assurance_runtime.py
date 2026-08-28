@@ -72,11 +72,55 @@ def _write_config(tmp_path: Path, payload: str | dict) -> Path:
     return path
 
 
-def _environment(config_path: Path, key: str = "test-secret"):
-    return {
+def _environment(
+    config_path: Path,
+    key: str = "test-secret",
+    remediation_key: str | None = None,
+):
+    environment = {
         "CODEMESH_ASSURANCE_CONFIG": str(config_path),
         "CODEMESH_ASSURANCE_REVIEWER_API_KEY": key,
     }
+    if remediation_key is not None:
+        environment["CODEMESH_ASSURANCE_REMEDIATION_API_KEY"] = remediation_key
+    return environment
+
+
+def _remediation_config(provider: str = "qwen"):
+    return {
+        "provider": provider,
+        "model_ref": "repair-model",
+        "workspace_grant": {
+            "allowed_paths": ["fix.py"],
+            "max_files": 4,
+            "max_bytes": 4096,
+        },
+        "policy": {
+            "max_attempts": 1,
+            "max_agent_iterations": 2,
+            "max_validation_calls_per_attempt": 1,
+            "total_wall_time_s": 10.0,
+            "authoritative_check_id": "check",
+        },
+    }
+
+
+class _FakeRemediationAdapter:
+    name = "fake-remediation"
+
+    def __init__(self, close_calls):
+        self.last_usage = object()
+        self._close_calls = close_calls
+
+    async def complete(self, messages, system=""):
+        return '{"action":"finalize","summary":"done"}'
+
+    async def complete_stream(self, messages, system=""):
+        if False:
+            yield ""
+
+    async def aclose(self):
+        self._close_calls.append(True)
 
 
 def test_missing_runtime_environment_is_disabled_without_initialization(
@@ -214,6 +258,77 @@ def test_valid_config_builds_one_safe_runtime_and_closes_transport_once(tmp_path
     asyncio.run(runtime.aclose())
     asyncio.run(runtime.aclose())
     assert close_calls == [True]
+
+
+def test_v2_without_remediation_secret_starts_core_without_remediation_service(
+    tmp_path,
+):
+    config = _config(tmp_path, schema_version="v2")
+    config["remediation"] = _remediation_config()
+    config_path = _write_config(tmp_path, config)
+    factory_calls = []
+
+    def factory(provider, model_ref, api_key):
+        factory_calls.append((provider, model_ref, api_key))
+        return _FakeRemediationAdapter([])
+
+    runtime = load_assurance_runtime_from_environment(
+        _environment(config_path), remediation_adapter_factory=factory
+    )
+
+    assert isinstance(runtime, AssuranceRuntime)
+    assert runtime.remediation_service is None
+    assert factory_calls == []
+
+
+@pytest.mark.parametrize("provider", ["qwen", "deepseek"])
+def test_v2_explicit_remediation_provider_uses_dedicated_secret_and_closes_once(
+    tmp_path, provider
+):
+    config = _config(tmp_path, schema_version="v2")
+    config["remediation"] = _remediation_config(provider)
+    config_path = _write_config(tmp_path, config)
+    factory_calls = []
+    close_calls = []
+
+    def factory(provider, model_ref, api_key):
+        factory_calls.append((provider, model_ref, api_key))
+        return _FakeRemediationAdapter(close_calls)
+
+    runtime = load_assurance_runtime_from_environment(
+        _environment(config_path, remediation_key="dedicated-secret"),
+        remediation_adapter_factory=factory,
+    )
+
+    assert isinstance(runtime, AssuranceRuntime)
+    assert runtime.remediation_service is not None
+    assert factory_calls == [(provider, "repair-model", "dedicated-secret")]
+    asyncio.run(runtime.aclose())
+    asyncio.run(runtime.aclose())
+    assert close_calls == [True]
+
+
+def test_remediation_source_root_accepts_posix_path_and_rejects_prefix_and_symlink(
+    tmp_path,
+):
+    configured_root = tmp_path / "workspace"
+    configured_root.mkdir()
+    source_root = configured_root / "repository"
+    source_root.mkdir()
+    sibling_root = tmp_path / "workspace-sibling"
+    sibling_root.mkdir()
+    symlink_target = tmp_path / "real-repository"
+    symlink_target.mkdir()
+    symlink_root = configured_root / "linked-repository"
+    symlink_root.symlink_to(symlink_target, target_is_directory=True)
+
+    assert runtime_module._revalidate_remediation_root(
+        source_root, configured_root
+    ) == source_root.resolve()
+    with pytest.raises(ValueError):
+        runtime_module._revalidate_remediation_root(sibling_root, configured_root)
+    with pytest.raises(ValueError):
+        runtime_module._revalidate_remediation_root(symlink_root, configured_root)
 
 
 def test_valid_config_failure_raises_fixed_sanitized_startup_error(tmp_path, monkeypatch):
