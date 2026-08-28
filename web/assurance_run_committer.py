@@ -399,6 +399,20 @@ class AssuranceRunStoreAdapter:
             request_digest=request_digest,
         )
 
+    def _commit_run_in_transaction(
+        self,
+        connection_or_unit_of_work: Any,
+        *args: Any,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> AssuranceRunResult:
+        return _commit_run_in_transaction(
+            connection_or_unit_of_work,
+            *args,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+
 
 class AssuranceRunCommitter:
     """RunCommitter implementation backed by ``AssuranceWebRepository``."""
@@ -420,6 +434,20 @@ class AssuranceRunCommitter:
     ) -> AssuranceRunResult:
         return self._adapter.commit_run(
             bundle,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+
+    def _commit_run_in_transaction(
+        self,
+        connection_or_unit_of_work: Any,
+        *args: Any,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> AssuranceRunResult:
+        return self._adapter._commit_run_in_transaction(
+            connection_or_unit_of_work,
+            *args,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
         )
@@ -466,6 +494,19 @@ def _validate_run_arguments(
         raise AssuranceRunConflictError("bundle request digest does not match call")
     if type(bundle.freshness_source_binding) is not FreshnessSourceBinding:
         raise AssuranceRunPersistenceError("bundle freshness source is invalid")
+    if type(bundle.reviewer) is not ReviewerRunRecord:
+        raise AssuranceRunPersistenceError("bundle reviewer record is invalid")
+    if type(bundle.execution_receipt) is not ExecutionReceipt:
+        raise AssuranceRunPersistenceError("bundle execution receipt is invalid")
+    try:
+        payload = {
+            name: getattr(bundle, name) for name in AssuranceRunBundle.model_fields
+        }
+        rebound = AssuranceRunBundle.model_validate(payload)
+    except (ValidationError, TypeError, ValueError, KeyError, AttributeError) as exc:
+        raise AssuranceRunPersistenceError("bundle contract is invalid") from exc
+    if type(rebound) is not AssuranceRunBundle or rebound != bundle:
+        raise AssuranceRunPersistenceError("bundle contract is not exact")
 
 
 def _public_bundle_json(bundle: AssuranceRunBundle) -> str:
@@ -510,6 +551,176 @@ def _result_pointer(
         "bundle_digest": _json_digest(bundle_json),
         "source_binding_digest": source_digest,
     }
+
+
+def _commit_run_in_transaction(
+    connection_or_unit_of_work: Any,
+    *args: Any,
+    idempotency_key: str,
+    request_digest: str,
+) -> AssuranceRunResult:
+    """Persist a run row and pointer on an already-open assurance UOW.
+
+    Accepted call forms are ``(unit_of_work, bundle)`` and
+    ``(connection, unit_of_work, bundle)``.  This helper deliberately does
+    not connect, begin, commit, or roll back; its caller owns that boundary.
+    """
+
+    if len(args) == 1:
+        unit_of_work = connection_or_unit_of_work
+        bundle = args[0]
+        conn = getattr(unit_of_work, "connection", None)
+    elif len(args) == 2:
+        conn = connection_or_unit_of_work
+        unit_of_work, bundle = args
+        if getattr(unit_of_work, "connection", None) is not conn:
+            raise TypeError("connection and unit_of_work must be the same UOW")
+    else:
+        raise TypeError(
+            "run transaction helper requires (unit_of_work, bundle) or"
+            " (connection, unit_of_work, bundle)"
+        )
+    if conn is None or not callable(getattr(conn, "execute", None)):
+        raise TypeError("an existing SQLite connection/UOW is required")
+    if not all(
+        callable(getattr(unit_of_work, name, None))
+        for name in ("load_case", "get_binding")
+    ):
+        raise TypeError("unit_of_work does not expose case replay operations")
+
+    _validate_run_schema(conn)
+    _validate_run_arguments(bundle, idempotency_key, request_digest)
+    public_json = _public_bundle_json(bundle)
+    source_json = _source_binding_json(bundle.freshness_source_binding)
+
+    existing = conn.execute(
+        f"SELECT * FROM {_RUN_TABLE} WHERE idempotency_key = ?",
+        (idempotency_key,),
+    ).fetchone()
+    pointer = conn.execute(
+        "SELECT operation, payload_digest, result_json"
+        " FROM assurance_web_idempotency WHERE idempotency_key = ?",
+        (idempotency_key,),
+    ).fetchone()
+    if existing is not None:
+        if existing["request_digest"] != request_digest:
+            raise AssuranceRunConflictError(
+                "idempotency key is bound to another request digest"
+            )
+        winner = _load_bundle_from_row(existing)
+        _assert_row_columns(existing, winner)
+        _load_pointer(conn, idempotency_key, winner)
+        _assert_canonical_draft(unit_of_work, winner)
+        if winner != bundle:
+            raise AssuranceRunConflictError(
+                "idempotency key is bound to different run content"
+            )
+        return AssuranceRunResult(
+            run_id=winner.run_id,
+            request_digest=winner.request_digest,
+            cached=True,
+            bundle=winner,
+        )
+    if pointer is not None:
+        if (
+            pointer["operation"] != _RUN_POINTER_OPERATION
+            or pointer["payload_digest"] != request_digest
+        ):
+            raise AssuranceRunConflictError(
+                "idempotency key is already used by another operation"
+            )
+        raise AssuranceRunPersistenceError(
+            "run idempotency pointer exists without its run row"
+        )
+
+    _assert_canonical_draft(unit_of_work, bundle)
+    # The Bundle contract makes this one case key equal to the evidence-gated
+    # ``case`` key.  The canonical ``assurance_cases`` row remains the DRAFT
+    # projection checked above; no evidence-gated Case is written here.
+    canonical_case_id = bundle.draft_case.case_id
+    existing_case_run = conn.execute(
+        f"SELECT idempotency_key FROM {_RUN_TABLE} WHERE case_id = ?",
+        (canonical_case_id,),
+    ).fetchone()
+    if existing_case_run is not None:
+        raise AssuranceRunConflictError(
+            "canonical case is already bound to another run"
+        )
+
+    committed_at = bundle.completed_at.isoformat()
+    try:
+        conn.execute(
+            f"INSERT INTO {_RUN_TABLE} (idempotency_key, request_digest,"
+            " run_id, case_id, subject_digest, bundle_json,"
+            " source_binding_json, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                idempotency_key,
+                request_digest,
+                bundle.run_id,
+                canonical_case_id,
+                bundle.subject.subject_digest,
+                public_json,
+                source_json,
+                committed_at,
+            ),
+        )
+        pointer_data = _result_pointer(
+            bundle,
+            bundle_json=public_json,
+            source_binding_json=source_json,
+        )
+        conn.execute(
+            "INSERT INTO assurance_web_idempotency"
+            " (idempotency_key, operation, payload_digest, result_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                idempotency_key,
+                _RUN_POINTER_OPERATION,
+                request_digest,
+                _canonical_json(pointer_data),
+                committed_at,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise AssuranceRunConflictError(
+            f"run persistence conflict: {exc}"
+        ) from exc
+
+    row = conn.execute(
+        f"SELECT * FROM {_RUN_TABLE} WHERE idempotency_key = ?",
+        (idempotency_key,),
+    ).fetchone()
+    if row is None:
+        raise AssuranceRunPersistenceError("run row disappeared during transaction")
+    stored = _load_bundle_from_row(row)
+    _assert_row_columns(row, stored)
+    _load_pointer(conn, idempotency_key, stored)
+    if stored != bundle:
+        raise AssuranceRunPersistenceError(
+            "stored run does not equal exact prepared bundle"
+        )
+    return AssuranceRunResult(
+        run_id=bundle.run_id,
+        request_digest=request_digest,
+        cached=False,
+        bundle=bundle,
+    )
+
+
+def _assert_canonical_draft(unit_of_work: Any, bundle: AssuranceRunBundle) -> None:
+    canonical_state = unit_of_work.load_case(bundle.draft_case.case_id)
+    if canonical_state.case != bundle.draft_case:
+        raise AssuranceRunConflictError(
+            "canonical case does not equal bundle draft_case"
+        )
+    if canonical_state.case.state != "DRAFT":
+        raise AssuranceRunConflictError(
+            "canonical case must remain the bundle DRAFT case"
+        )
+    if unit_of_work.get_binding(bundle.draft_case.case_id) != bundle.binding:
+        raise AssuranceRunConflictError(
+            "canonical binding does not equal bundle binding"
+        )
 
 
 def _load_bundle_from_row(row: sqlite3.Row) -> AssuranceRunBundle:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+from datetime import timedelta
 from pathlib import Path
 
 import assurance.snapshot as snapshot_module
@@ -14,6 +16,7 @@ from assurance.remediation import (
     RemediationPolicy,
     RemediationRequest,
     RemediationStatus,
+    PreparedRemediationHandoff,
 )
 from assurance.remediation_reviewer import (
     AssuranceRemediationReviewer,
@@ -22,11 +25,18 @@ from assurance.remediation_reviewer import (
 from assurance.remediation_validation import ValidationStatus
 from assurance.remediation_workspace import IsolatedWorkspace, WorkspaceGrant
 from assurance.remediation_workspace import PublicWorkspaceView
+from assurance.lifecycle_store import SQLiteAssuranceLifecycleStore
 from assurance.run_service import (
     AssuranceRunBundle,
     AssuranceRunConfig,
     ReviewerInvocationResponse,
 )
+from assurance.store import StoreConflictError
+from web.assurance_run_committer import (
+    AssuranceRunConflictError,
+    _commit_run_in_transaction,
+)
+from web.assurance_store import AssuranceWebRepository
 
 from tests.test_assurance_remediation import _FakeExecutor, _validation
 from tests.test_assurance_run_service import _service
@@ -96,6 +106,12 @@ def test_legacy_three_field_mapping_and_duck_are_not_a_prepared_rerun() -> None:
         Duck(), "architecture", digest
     ) is None
     assert PreparedReviewerRerun is not None
+
+
+def test_lifecycle_has_no_public_caller_facts_remediation_seam(tmp_path: Path) -> None:
+    store = SQLiteAssuranceLifecycleStore(tmp_path / "assurance.sqlite")
+
+    assert not hasattr(store, "commit_remediation")
 
 
 def _grant() -> WorkspaceGrant:
@@ -325,13 +341,21 @@ def test_exact_prepared_success_binds_receipt_and_hides_bundle_from_result(
         subject_builder=lambda _patch_digest: subject_input,
         reviewer_rerunner=reviewer,
     )
-    result = asyncio.run(controller.run(agent))
+    handoff = asyncio.run(controller.prepare(agent))
+    assert type(handoff) is PreparedRemediationHandoff
+    assert type(handoff.bundle) is AssuranceRunBundle
+    result = handoff.result
 
     assert result.status is RemediationStatus.SUCCEEDED
     assert type(controller_workspace[0]) is PublicWorkspaceView
     assert type(reviewer_workspace[0]) is IsolatedWorkspace
     assert factory_paths and factory_paths[0] is reviewer_workspace[0].root
     assert result.reviewer_receipts[0].reviewer.status == "success"
+    assert result.reviewer_receipts[0].reviewer == handoff.bundle.reviewer
+    assert (
+        result.reviewer_receipts[0].execution_receipt
+        == handoff.bundle.execution_receipt
+    )
     assert result.reviewer_receipts[0].execution_receipt.overall_result == "success"
     assert result.reviewer_receipts[0].execution_receipt.subject_digest == (
         result.new_subject_digest
@@ -344,6 +368,175 @@ def test_exact_prepared_success_binds_receipt_and_hides_bundle_from_result(
     assert selected_step.actual_role == "architecture"
     assert "bundle" not in result.model_dump(mode="json")
     assert "accepted" not in result.model_dump(mode="json")
+    tampered_results = (
+        result.model_copy(update={"transition_state": "not_prepared"}),
+        result.model_copy(update={"status": RemediationStatus.NOOP}),
+        result.model_copy(
+            update={
+                "reviewer_receipts": (
+                    result.reviewer_receipts[0].model_copy(
+                        update={
+                            "execution_receipt": handoff.bundle.execution_receipt.model_copy(
+                                update={"run_id": "forged-run"}
+                            )
+                        }
+                    ),
+                )
+            }
+        ),
+    )
+    for tampered in tampered_results:
+        with pytest.raises(ValueError):
+            PreparedRemediationHandoff(result=tampered, bundle=handoff.bundle)
+    with pytest.raises(ValueError):
+        PreparedRemediationHandoff(result=result)
+    bad_binding = handoff.bundle.binding.model_copy(
+        update={"subject_digest": "sha256:" + "f" * 64}
+    )
+    with pytest.raises(ValueError):
+        PreparedRemediationHandoff(
+            result=result,
+            bundle=handoff.bundle.model_copy(update={"binding": bad_binding}),
+        )
+
+    repository = AssuranceWebRepository(tmp_path / "assurance.sqlite")
+    repository.initialize()
+    with repository._store._transaction() as unit_of_work:
+        unit_of_work.create_case(baseline.draft_case, baseline.binding)
+        lifecycle_sql: list[str] = []
+        unit_of_work.connection.set_trace_callback(lifecycle_sql.append)
+        try:
+            remediation_receipt = (
+                repository._store._commit_prepared_remediation_in_transaction(
+                    unit_of_work,
+                    request=request,
+                    handoff=handoff,
+                    selected_finding=finding,
+                )
+            )
+        finally:
+            unit_of_work.connection.set_trace_callback(None)
+        assert not any(
+            statement.lstrip().upper().split(maxsplit=1)[0]
+            in {"BEGIN", "COMMIT", "ROLLBACK"}
+            for statement in lifecycle_sql
+        )
+        assert (
+            repository._store._commit_prepared_remediation_in_transaction(
+                unit_of_work,
+                request=request,
+                handoff=handoff,
+                selected_finding=finding,
+            )
+            == remediation_receipt
+        )
+        run_sql: list[str] = []
+        unit_of_work.connection.set_trace_callback(run_sql.append)
+        try:
+            committed = _commit_run_in_transaction(
+                unit_of_work,
+                handoff.bundle,
+                idempotency_key=handoff.bundle.idempotency_key,
+                request_digest=handoff.bundle.request_digest,
+            )
+        finally:
+            unit_of_work.connection.set_trace_callback(None)
+        assert not any(
+            statement.lstrip().upper().split(maxsplit=1)[0]
+            in {"BEGIN", "COMMIT", "ROLLBACK"}
+            for statement in run_sql
+        )
+        replay = _commit_run_in_transaction(
+            unit_of_work,
+            handoff.bundle,
+            idempotency_key=handoff.bundle.idempotency_key,
+            request_digest=handoff.bundle.request_digest,
+        )
+        assert remediation_receipt.new_case_id == handoff.bundle.draft_case.case_id
+        assert committed.cached is False
+        assert replay.cached is True
+        assert unit_of_work.load_case(remediation_receipt.new_case_id).case.state == "DRAFT"
+
+        with pytest.raises(StoreConflictError):
+            repository._store._commit_prepared_remediation_in_transaction(
+                unit_of_work,
+                request=request,
+                handoff=handoff,
+                selected_finding=finding.model_copy(update={"claim": "forged"}),
+            )
+
+    conn = sqlite3.connect(tmp_path / "assurance.sqlite")
+    try:
+        rows = conn.execute(
+            "SELECT case_id, bundle_json FROM assurance_web_runs"
+        ).fetchone()
+        assert rows is not None
+        stored_case_id, stored_bundle_json = rows
+        stored_bundle = json.loads(stored_bundle_json)
+        assert stored_case_id == handoff.bundle.case.case_id
+        assert stored_case_id == handoff.bundle.draft_case.case_id
+        assert stored_bundle["case"]["case_id"] == stored_case_id
+        assert stored_bundle["draft_case"]["case_id"] == stored_case_id
+        assert stored_bundle["draft_case"]["state"] == "DRAFT"
+        assert stored_bundle["case"]["state"] in {"EVIDENCE_COLLECTED", "NEEDS_EVIDENCE"}
+        assert "freshness_source_binding" not in stored_bundle
+    finally:
+        conn.close()
+
+
+def test_uow_run_helper_conflict_and_outer_rollback(tmp_path: Path, monkeypatch) -> None:
+    _, _, baseline, _, changed_bundle, _, _ = _baseline_and_changed_subject(
+        tmp_path, monkeypatch
+    )
+    repository = AssuranceWebRepository(tmp_path / "assurance.sqlite")
+    repository.initialize()
+    with repository._store._transaction() as unit_of_work:
+        unit_of_work.create_case(changed_bundle.draft_case, changed_bundle.binding)
+        _commit_run_in_transaction(
+            unit_of_work,
+            changed_bundle,
+            idempotency_key=changed_bundle.idempotency_key,
+            request_digest=changed_bundle.request_digest,
+        )
+
+    forged = changed_bundle.model_copy(
+        update={"completed_at": changed_bundle.completed_at + timedelta(seconds=1)}
+    )
+    with repository._store._transaction() as unit_of_work:
+        with pytest.raises(AssuranceRunConflictError):
+            _commit_run_in_transaction(
+                unit_of_work,
+                forged,
+                idempotency_key=changed_bundle.idempotency_key,
+                request_digest=changed_bundle.request_digest,
+            )
+
+    try:
+        with repository._store._transaction() as unit_of_work:
+            draft = baseline.draft_case
+            unit_of_work.create_case(draft, baseline.binding)
+            _commit_run_in_transaction(
+                unit_of_work,
+                baseline,
+                idempotency_key=baseline.idempotency_key,
+                request_digest=baseline.request_digest,
+            )
+            raise RuntimeError("outer rollback")
+    except RuntimeError:
+        pass
+
+    conn = sqlite3.connect(tmp_path / "assurance.sqlite")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM assurance_cases WHERE case_id = ?",
+            (baseline.draft_case.case_id,),
+        ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM assurance_web_runs WHERE idempotency_key = ?",
+            (baseline.idempotency_key,),
+        ).fetchone() == (0,)
+    finally:
+        conn.close()
 
 
 def test_role_digest_and_provenance_mismatches_fail_closed(

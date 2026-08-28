@@ -21,6 +21,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -35,7 +36,7 @@ from assurance.remediation_validation import (
     make_validation_tool_registry,
 )
 from assurance.remediation_workspace import IsolatedWorkspace, WorkspaceGrant
-from assurance.run_service import ReviewerRunRecord
+from assurance.run_service import AssuranceRunBundle, ReviewerRunRecord
 
 
 _SHA256_PREFIX = "sha256:"
@@ -296,6 +297,111 @@ class RemediationResult(BaseModel):
         return self
 
 
+def _revalidate_bundle_receipts(bundle: AssuranceRunBundle) -> bool:
+    """Re-validate receipt submodels before retaining a bundle in a handoff."""
+
+    if type(bundle) is not AssuranceRunBundle:
+        return False
+    if type(bundle.reviewer) is not ReviewerRunRecord:
+        return False
+    if type(bundle.execution_receipt) is not ExecutionReceipt:
+        return False
+    try:
+        reviewer = ReviewerRunRecord.model_validate(
+            bundle.reviewer.model_dump(mode="python")
+        )
+        execution_receipt = ExecutionReceipt.model_validate(
+            bundle.execution_receipt.model_dump(mode="python")
+        )
+        payload = {
+            name: getattr(bundle, name) for name in AssuranceRunBundle.model_fields
+        }
+        payload["reviewer"] = reviewer
+        payload["execution_receipt"] = execution_receipt
+        rebound = AssuranceRunBundle.model_validate(payload)
+    except (TypeError, ValueError, ValidationError):
+        return False
+    return type(rebound) is AssuranceRunBundle and rebound == bundle
+
+
+class PreparedRemediationHandoff(BaseModel):
+    """Non-persistable handoff between remediation preparation and its UOW."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    result: RemediationResult
+    bundle: AssuranceRunBundle | None = Field(default=None, exclude=True, repr=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_exact_models(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            raise ValueError("remediation handoff must validate from a mapping")
+        if type(data.get("result")) is not RemediationResult:
+            raise ValueError("result must be an exact RemediationResult")
+        bundle = data.get("bundle")
+        if bundle is not None and type(bundle) is not AssuranceRunBundle:
+            raise ValueError("bundle must be an exact AssuranceRunBundle")
+        return data
+
+    @model_validator(mode="after")
+    def _bind_result_to_bundle(self) -> "PreparedRemediationHandoff":
+        try:
+            rebound_result = RemediationResult.model_validate(
+                self.result.model_dump(mode="python", round_trip=True)
+            )
+        except (ValidationError, TypeError, ValueError, AttributeError, KeyError) as exc:
+            raise ValueError("remediation result failed revalidation") from exc
+        if type(rebound_result) is not RemediationResult or rebound_result != self.result:
+            raise ValueError("remediation result is not an exact validated result")
+        if rebound_result.transition_state != "prepared":
+            raise ValueError("remediation result must remain prepared")
+        if rebound_result.status is not RemediationStatus.SUCCEEDED:
+            if self.bundle is not None:
+                raise ValueError("non-success remediation must not carry a bundle")
+            return self
+        bundle = self.bundle
+        if bundle is None:
+            raise ValueError("successful remediation requires an exact bundle")
+        if not _revalidate_bundle_receipts(bundle):
+            raise ValueError("remediation bundle receipts are invalid")
+        subject_input = self.result.new_subject_input
+        if (
+            type(subject_input) is not SubjectDigestInput
+            or self.result.new_subject_digest is None
+        ):
+            raise ValueError("successful remediation must carry an exact new subject")
+        if compute_subject_digest(subject_input) != bundle.subject.subject_digest:
+            raise ValueError("remediation subject is not bound to bundle")
+        if self.result.new_subject_digest != bundle.subject.subject_digest:
+            raise ValueError("remediation digest is not bound to bundle")
+        if bundle.binding.subject_digest != bundle.subject.subject_digest:
+            raise ValueError("bundle binding is not bound to bundle subject")
+        if bundle.binding.rubric_version != bundle.reviewer.rubric_version:
+            raise ValueError("bundle binding rubric is not bound to reviewer")
+        if len(self.result.reviewer_receipts) != 1:
+            raise ValueError("successful remediation requires one reviewer receipt")
+        reviewer_receipt = self.result.reviewer_receipts[0]
+        if type(reviewer_receipt) is not ReviewerRerunReceipt:
+            raise ValueError("successful remediation must carry an exact reviewer receipt")
+        if (
+            type(reviewer_receipt.reviewer) is not ReviewerRunRecord
+            or type(reviewer_receipt.execution_receipt) is not ExecutionReceipt
+        ):
+            raise ValueError("reviewer receipt contains invalid nested receipts")
+        if (
+            self.result.rerun_roles != (reviewer_receipt.reviewer_role,)
+            or reviewer_receipt.subject_digest != bundle.subject.subject_digest
+            or reviewer_receipt.reviewer != bundle.reviewer
+            or reviewer_receipt.execution_receipt != bundle.execution_receipt
+            or reviewer_receipt.execution_receipt.run_id != bundle.run_id
+            or reviewer_receipt.execution_receipt.subject_digest
+            != bundle.subject.subject_digest
+        ):
+            raise ValueError("reviewer receipt is not bound to exact bundle facts")
+        return self
+
+
 @dataclass(frozen=True)
 class AgentAttemptResult:
     """Optional structured return value for an injected agent."""
@@ -478,6 +584,8 @@ class RemediationController:
     def _reviewer_receipt(result: Any, role: str, digest: str) -> ReviewerRerunReceipt | None:
         if type(result) is not PreparedReviewerRerun:
             return None
+        if not _revalidate_bundle_receipts(result.bundle):
+            return None
         if result.reviewer_role != role or result.bundle.subject.subject_digest != digest:
             return None
         try:
@@ -542,7 +650,9 @@ class RemediationController:
             reviewer_receipts=tuple(reviewer_receipts or ()),
         )
 
-    async def run(self, agent: object) -> RemediationResult:
+    async def _prepare_result(
+        self, agent: object
+    ) -> RemediationResult | tuple[RemediationResult, AssuranceRunBundle]:
         started = time.monotonic()
         policy = self.request.policy
         attempt_receipts: list[RemediationAttempt] = []
@@ -780,4 +890,20 @@ class RemediationController:
                 rerun_roles=(role,),
                 reviewer_receipts=[reviewer_receipt],
             )
-            return result
+            return result, reviewer_output.bundle
+
+    async def prepare(self, agent: object) -> PreparedRemediationHandoff:
+        """Prepare one remediation result and retain its exact reviewer bundle."""
+
+        prepared = await self._prepare_result(agent)
+        if isinstance(prepared, tuple):
+            result, bundle = prepared
+        else:
+            result, bundle = prepared, None
+        return PreparedRemediationHandoff(result=result, bundle=bundle)
+
+    async def run(self, agent: object) -> RemediationResult:
+        """Preserve the legacy result-only API over one preparation call."""
+
+        handoff = await self.prepare(agent)
+        return handoff.result

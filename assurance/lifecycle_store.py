@@ -24,11 +24,12 @@ from .release_observation import (
     ReleaseObservationImporter,
 )
 from .remediation import (
+    PreparedRemediationHandoff,
     RemediationRequest,
     RemediationResult,
     RemediationStatus,
 )
-from .state_machine import AcceptanceBinding, AcceptanceEvent, apply_acceptance_event
+from .state_machine import AcceptanceBinding, AcceptanceEvent
 from .store import (
     CaseNotFoundError,
     ProjectionIntegrityError,
@@ -160,8 +161,10 @@ class SQLiteAssuranceLifecycleStore(SQLiteAssuranceStore):
         finally:
             conn.close()
 
-    def commit_remediation(
+    def _commit_remediation_in_transaction(
         self,
+        connection_or_unit_of_work,
+        maybe_unit_of_work=None,
         *,
         request: RemediationRequest,
         result: RemediationResult,
@@ -170,8 +173,30 @@ class SQLiteAssuranceLifecycleStore(SQLiteAssuranceStore):
         new_binding: AcceptanceBinding,
         invalidation_event: AcceptanceEvent,
     ) -> RemediationCommitReceipt:
-        """Commit invalidation, new DRAFT case, and lineage in one transaction."""
+        """Apply one remediation transition on an already-open SQLite UOW.
 
+        This helper deliberately owns no connection lifecycle.  The optional
+        second positional argument accepts callers that already keep the raw
+        connection and UOW separately; the normal form is ``(unit_of_work,)``.
+        """
+
+        if maybe_unit_of_work is None:
+            unit_of_work = connection_or_unit_of_work
+            conn = getattr(unit_of_work, "connection", None)
+        else:
+            conn = connection_or_unit_of_work
+            unit_of_work = maybe_unit_of_work
+            if getattr(unit_of_work, "connection", None) is not conn:
+                raise TypeError("connection and unit_of_work must be the same UOW")
+        if conn is None or not callable(getattr(conn, "execute", None)):
+            raise TypeError("an existing SQLite connection/UOW is required")
+        if not all(
+            callable(getattr(unit_of_work, name, None))
+            for name in ("load_case", "get_binding", "append_event", "create_case")
+        ):
+            raise TypeError("unit_of_work does not expose the assurance ledger operations")
+
+        self._ensure_lifecycle_initialized(conn)
         self._validate_remediation_inputs(
             request,
             result,
@@ -187,92 +212,75 @@ class SQLiteAssuranceLifecycleStore(SQLiteAssuranceStore):
         new_binding_json = _canonical_model_json(new_binding)
         invalidation_json = _canonical_model_json(invalidation_event)
 
-        conn = self._connect()
+        existing = conn.execute(
+            "SELECT * FROM assurance_remediations WHERE remediation_id = ?",
+            (request.remediation_id,),
+        ).fetchone()
+        if existing is not None:
+            expected = {
+                "request_json": request_json,
+                "result_json": result_json,
+                "selected_finding_json": finding_json,
+                "new_case_json": new_case_json,
+                "new_binding_json": new_binding_json,
+                "invalidation_event_json": invalidation_json,
+            }
+            if any(existing[key] != value for key, value in expected.items()):
+                raise StoreConflictError(
+                    f"remediation_id {request.remediation_id!r} already exists"
+                    " with different content"
+                )
+            receipt = self._remediation_from_row(existing)
+            self._assert_remediation_replay(
+                unit_of_work,
+                request=request,
+                new_case=new_case,
+                new_binding=new_binding,
+                invalidation_event=invalidation_event,
+            )
+            return receipt
+
+        lineage_conflict = conn.execute(
+            "SELECT remediation_id FROM assurance_remediations"
+            " WHERE old_case_id = ? OR new_case_id = ?",
+            (request.old_case_id, new_case.case_id),
+        ).fetchone()
+        if lineage_conflict is not None:
+            raise StoreConflictError(
+                "old or new case already belongs to another remediation"
+            )
+
+        old_state = unit_of_work.load_case(request.old_case_id)
+        if old_state.case.subject_digest != request.old_subject_digest:
+            raise StoreConflictError("remediation old subject is stale")
+        new_row = conn.execute(
+            "SELECT case_id FROM assurance_cases WHERE case_id = ?",
+            (new_case.case_id,),
+        ).fetchone()
+        if new_row is not None:
+            raise StoreConflictError(f"new case_id {new_case.case_id!r} already exists")
+
+        next_old_state = unit_of_work.append_event(
+            request.old_case_id, invalidation_event
+        )
+        new_state = unit_of_work.create_case(new_case, new_binding)
+        if next_old_state.case.state != "INVALIDATED":
+            raise StoreConflictError("old case was not invalidated")
+        if new_state.case != new_case or new_state.applied_events != ():
+            raise StoreConflictError("new DRAFT case replay does not match input")
+
+        receipt = RemediationCommitReceipt(
+            remediation_id=request.remediation_id,
+            old_case_id=request.old_case_id,
+            new_case_id=new_case.case_id,
+            old_subject_digest=request.old_subject_digest,
+            new_subject_digest=new_case.subject_digest,
+            human_selected_finding_id=request.human_selected_finding_id,
+            invalidation_event_id=invalidation_event.event_id,
+            result_digest=_sha256_text(result_json),
+            committed_at=invalidation_event.occurred_at,
+        )
         try:
-            self._ensure_lifecycle_initialized(conn)
-            conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute(
-                "SELECT * FROM assurance_remediations WHERE remediation_id = ?",
-                (request.remediation_id,),
-            ).fetchone()
-            if existing is not None:
-                expected = {
-                    "request_json": request_json,
-                    "result_json": result_json,
-                    "selected_finding_json": finding_json,
-                    "new_case_json": new_case_json,
-                    "new_binding_json": new_binding_json,
-                    "invalidation_event_json": invalidation_json,
-                }
-                if any(existing[key] != value for key, value in expected.items()):
-                    raise StoreConflictError(
-                        f"remediation_id {request.remediation_id!r} already exists"
-                        " with different content"
-                    )
-                receipt = self._remediation_from_row(existing)
-                conn.commit()
-                return receipt
-
-            lineage_conflict = conn.execute(
-                "SELECT remediation_id FROM assurance_remediations"
-                " WHERE old_case_id = ? OR new_case_id = ?",
-                (request.old_case_id, new_case.case_id),
-            ).fetchone()
-            if lineage_conflict is not None:
-                raise StoreConflictError(
-                    "old or new case already belongs to another remediation"
-                )
-
-            old_state = self._load_case(conn, request.old_case_id)
-            if old_state.case.subject_digest != request.old_subject_digest:
-                raise StoreConflictError("remediation old subject is stale")
-            next_old_state = apply_acceptance_event(old_state, invalidation_event)
-            new_row = conn.execute(
-                "SELECT case_id FROM assurance_cases WHERE case_id = ?",
-                (new_case.case_id,),
-            ).fetchone()
-            if new_row is not None:
-                raise StoreConflictError(
-                    f"new case_id {new_case.case_id!r} already exists"
-                )
-
-            sequence = len(old_state.applied_events) + 1
-            conn.execute(
-                "INSERT INTO assurance_case_events"
-                " (case_id, sequence, event_id, subject_digest, event_json, recorded_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    request.old_case_id,
-                    sequence,
-                    invalidation_event.event_id,
-                    invalidation_event.subject_digest,
-                    invalidation_json,
-                    invalidation_event.occurred_at.isoformat(),
-                ),
-            )
-            conn.execute(
-                "INSERT INTO assurance_cases"
-                " (case_id, subject_digest, initial_case_json, binding_json, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (
-                    new_case.case_id,
-                    new_case.subject_digest,
-                    new_case_json,
-                    new_binding_json,
-                    new_case.created_at.isoformat(),
-                ),
-            )
-            receipt = RemediationCommitReceipt(
-                remediation_id=request.remediation_id,
-                old_case_id=request.old_case_id,
-                new_case_id=new_case.case_id,
-                old_subject_digest=request.old_subject_digest,
-                new_subject_digest=new_case.subject_digest,
-                human_selected_finding_id=request.human_selected_finding_id,
-                invalidation_event_id=invalidation_event.event_id,
-                result_digest=_sha256_text(result_json),
-                committed_at=invalidation_event.occurred_at,
-            )
             conn.execute(
                 "INSERT INTO assurance_remediations"
                 " (remediation_id, old_case_id, new_case_id, old_subject_digest,"
@@ -297,26 +305,78 @@ class SQLiteAssuranceLifecycleStore(SQLiteAssuranceStore):
                     receipt.committed_at.isoformat(),
                 ),
             )
-            if next_old_state.case.state != "INVALIDATED":
-                raise StoreConflictError("old case was not invalidated")
-            conn.commit()
-            return receipt
-        except StoreConflictError:
-            conn.rollback()
-            raise
         except sqlite3.IntegrityError as exc:
-            conn.rollback()
-            raise StoreConflictError(f"remediation persistence conflict: {exc}") from exc
-        except sqlite3.Error as exc:
-            conn.rollback()
-            raise StorePersistenceError(
-                f"failed to commit remediation {request.remediation_id!r}: {exc}"
+            raise StoreConflictError(
+                f"remediation persistence conflict: {exc}"
             ) from exc
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        return receipt
+
+    def _commit_prepared_remediation_in_transaction(
+        self,
+        connection_or_unit_of_work,
+        maybe_unit_of_work=None,
+        *,
+        request: RemediationRequest,
+        handoff: PreparedRemediationHandoff,
+        selected_finding: Finding,
+    ) -> RemediationCommitReceipt:
+        """Persist a prepared handoff without accepting caller Case/Event facts."""
+
+        if type(handoff) is not PreparedRemediationHandoff:
+            raise StoreConflictError("handoff must be an exact PreparedRemediationHandoff")
+        try:
+            handoff = PreparedRemediationHandoff(
+                result=handoff.result,
+                bundle=handoff.bundle,
+            )
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise StoreConflictError("remediation handoff failed revalidation") from exc
+        if handoff.bundle is None:
+            raise StoreConflictError("successful remediation handoff requires its bundle")
+        result = handoff.result
+        bundle = handoff.bundle
+        new_case = bundle.draft_case
+        invalidation_event = AcceptanceEvent(
+            event_id=f"remediation:{result.remediation_id}:invalidate",
+            subject_digest=result.old_subject_digest,
+            kind="INVALIDATE",
+            reason=(
+                f"remediation:{result.remediation_id}:superseded_by:{new_case.case_id}"
+            ),
+            occurred_at=new_case.created_at,
+        )
+        return self._commit_remediation_in_transaction(
+            connection_or_unit_of_work,
+            maybe_unit_of_work,
+            request=request,
+            result=result,
+            selected_finding=selected_finding,
+            new_case=new_case,
+            new_binding=bundle.binding,
+            invalidation_event=invalidation_event,
+        )
+
+    def _assert_remediation_replay(
+        self,
+        unit_of_work,
+        *,
+        request: RemediationRequest,
+        new_case: AcceptanceCase,
+        new_binding: AcceptanceBinding,
+        invalidation_event: AcceptanceEvent,
+    ) -> None:
+        old_state = unit_of_work.load_case(request.old_case_id)
+        if old_state.case.subject_digest != request.old_subject_digest:
+            raise LifecycleProjectionError("stored remediation old subject is stale")
+        if old_state.case.state != "INVALIDATED":
+            raise LifecycleProjectionError("stored remediation old case is not invalidated")
+        if not old_state.applied_events or old_state.applied_events[-1] != invalidation_event:
+            raise LifecycleProjectionError("stored remediation invalidation replay mismatch")
+        replayed_new = unit_of_work.load_case(new_case.case_id)
+        if replayed_new.case != new_case or replayed_new.applied_events != ():
+            raise LifecycleProjectionError("stored remediation new DRAFT replay mismatch")
+        if unit_of_work.get_binding(new_case.case_id) != new_binding:
+            raise LifecycleProjectionError("stored remediation binding replay mismatch")
 
     def get_remediation(self, remediation_id: str) -> RemediationCommitReceipt:
         conn = self._connect()

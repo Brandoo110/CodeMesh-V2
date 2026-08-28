@@ -236,6 +236,10 @@ class AssuranceRemediationReviewer:
 
         if type(bundle) is not AssuranceRunBundle:
             return None
+        if type(bundle.reviewer) is not ReviewerRunRecord:
+            return None
+        if type(bundle.execution_receipt) is not ExecutionReceipt:
+            return None
         try:
             reviewer = ReviewerRunRecord.model_validate(
                 bundle.reviewer.model_dump(mode="python")

@@ -18,6 +18,7 @@ from assurance.remediation import (
     RemediationResult,
     RemediationStatus,
     ReviewerRerunReceipt,
+    PreparedRemediationHandoff,
 )
 from assurance.remediation_validation import (
     ValidationCheck,
@@ -126,6 +127,56 @@ class _FakeExecutor:
 
 def _run(controller: RemediationController, agent: object):
     return asyncio.run(controller.run(agent))
+
+
+def test_prepare_returns_non_persistable_handoff_and_run_delegates_once(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "fix.py").write_text("old", encoding="utf-8")
+    request = _request(_grant("fix.py"), _policy())
+    executor = _FakeExecutor([ValidationStatus.PASSED, ValidationStatus.PASSED])
+    calls: list[str] = []
+
+    async def agent(**_: object) -> None:
+        calls.append("agent")
+        raise AssertionError("agent must not run after a passing baseline")
+
+    controller = RemediationController(
+        request=request,
+        selected_finding=_finding(),
+        seed_root=seed,
+        validation_executor=lambda _workspace: executor,
+        subject_builder=lambda patch_digest: _subject(
+            diff=patch_digest.removeprefix("sha256:"), head="new-head"
+        ),
+        reviewer_rerunner=lambda *_: None,
+    )
+
+    handoff = asyncio.run(controller.prepare(agent))
+    assert type(handoff) is PreparedRemediationHandoff
+    assert handoff.result.status is RemediationStatus.NOOP
+    assert handoff.bundle is None
+    assert "bundle" not in handoff.model_dump(mode="json")
+    assert '"bundle"' not in handoff.model_dump_json()
+
+    prepare_calls: list[object] = []
+    original_prepare = controller.prepare
+
+    async def counted_prepare(agent: object) -> PreparedRemediationHandoff:
+        prepare_calls.append(agent)
+        return await original_prepare(agent)
+
+    controller.prepare = counted_prepare  # type: ignore[method-assign]
+    second = asyncio.run(controller.run(agent))
+    assert second == handoff.result
+    assert prepare_calls == [agent]
+    assert calls == []
+    assert executor.calls == [
+        ("authoritative", "controller"),
+        ("authoritative", "controller"),
+    ]
 
 
 def test_workspace_rejects_escape_duplicate_and_symlink(tmp_path: Path) -> None:
