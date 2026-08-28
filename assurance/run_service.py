@@ -1169,6 +1169,19 @@ class AssuranceRunService:
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
+    async def prepare(
+        self, intent: AssuranceRunIntent, *, idempotency_key: str
+    ) -> AssuranceRunBundle:
+        """Prepare one complete Golden Path bundle without persistence."""
+
+        self._validate_intent(intent, idempotency_key)
+        request_digest = self._request_digest(intent)
+        return await self._prepare_bundle(
+            intent,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+
     async def run(
         self, intent: AssuranceRunIntent, *, idempotency_key: str
     ) -> AssuranceRunResult:
@@ -1182,6 +1195,33 @@ class AssuranceRunService:
         cached_result = self._coerce_result(cached, request_digest, cached=True)
         if cached_result is not None:
             return cached_result
+
+        bundle = await self._prepare_bundle(
+            intent,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+        committed = await asyncio.to_thread(
+            self._committer.commit,
+            bundle,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+        if committed is None:
+            raise AssuranceRunError("committer.commit did not return a persisted result")
+        result = self._coerce_result(committed, request_digest, cached=None)
+        if result is None:
+            raise AssuranceRunError("committer.commit did not return a persisted result")
+        return result
+
+    async def _prepare_bundle(
+        self,
+        intent: AssuranceRunIntent,
+        *,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> AssuranceRunBundle:
+        """Build the complete in-memory bundle shared by prepare and run."""
 
         await asyncio.to_thread(self._validate_workspace, intent)
         started_at = self._now()
@@ -1337,7 +1377,7 @@ class AssuranceRunService:
             policy=policy_result,
             occurred_at=fence_at,
         )
-        bundle = AssuranceRunBundle(
+        return AssuranceRunBundle(
             schema_version="v1",
             run_id=self._run_id(request_digest, idempotency_key),
             idempotency_key=idempotency_key,
@@ -1365,18 +1405,6 @@ class AssuranceRunService:
             started_at=started_at,
             completed_at=fence_at,
         )
-        committed = await asyncio.to_thread(
-            self._committer.commit,
-            bundle,
-            idempotency_key=idempotency_key,
-            request_digest=request_digest,
-        )
-        if committed is None:
-            raise AssuranceRunError("committer.commit did not return a persisted result")
-        result = self._coerce_result(committed, request_digest, cached=None)
-        if result is None:
-            raise AssuranceRunError("committer.commit did not return a persisted result")
-        return result
 
     def _validate_intent(self, intent: AssuranceRunIntent, idempotency_key: str) -> None:
         if type(intent) is not AssuranceRunIntent:

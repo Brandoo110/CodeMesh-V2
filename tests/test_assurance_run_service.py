@@ -518,6 +518,55 @@ def test_questions_request_evidence_and_cached_replay_does_not_invoke_again(tmp_
     assert reviewer.calls == 1
 
 
+def test_prepare_returns_complete_bundle_without_committer_io(tmp_path):
+    committer = _Committer()
+    service, intent = _service(tmp_path, committer=committer)
+
+    bundle = asyncio.run(service.prepare(intent, idempotency_key="prepare-only"))
+
+    assert type(bundle) is AssuranceRunBundle
+    assert bundle.idempotency_key == "prepare-only"
+    request_digest = service._request_digest(intent)
+    assert bundle.request_digest == request_digest
+    assert bundle.run_id == service._run_id(request_digest, "prepare-only")
+    assert bundle.evidence == (
+        bundle.git.evidence,
+        bundle.intake.evidence,
+        bundle.commands.evidence,
+        bundle.manifest.evidence,
+    )
+    assert bundle.policy.input.subject == bundle.subject
+    assert bundle.policy.input.risk_result == bundle.risk
+    assert bundle.policy.input.findings == bundle.findings
+    assert bundle.policy.input.execution_receipts == (bundle.execution_receipt,)
+    assert bundle.freshness_source_binding.subject == bundle.subject
+    assert committer.calls == []
+
+
+def test_run_cache_hit_skips_prepare_and_miss_prepares_once_then_commits_once(
+    tmp_path, monkeypatch
+):
+    committer = _Committer()
+    service, intent = _service(tmp_path, committer=committer)
+    prepare_calls = 0
+    original_prepare_bundle = service._prepare_bundle
+
+    async def counted_prepare_bundle(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return await original_prepare_bundle(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_prepare_bundle", counted_prepare_bundle)
+
+    first = asyncio.run(service.run(intent, idempotency_key="run-prepare-once"))
+    replay = asyncio.run(service.run(intent, idempotency_key="run-prepare-once"))
+
+    assert type(first.bundle) is AssuranceRunBundle
+    assert replay.cached is True
+    assert prepare_calls == 1
+    assert [call[0] for call in committer.calls] == ["lookup", "commit", "lookup"]
+
+
 def test_commit_race_winner_preserves_adapter_cached_value(tmp_path):
     class _RaceCommitter(_Committer):
         def commit(self, bundle, *, idempotency_key, request_digest):
