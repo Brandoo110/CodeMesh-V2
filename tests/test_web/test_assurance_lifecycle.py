@@ -19,6 +19,8 @@ from web.assurance_lifecycle import (
     AssuranceLifecycleRepository,
     get_assurance_lifecycle_repository,
 )
+from web.assurance_run_composition import AssuranceRunWebDependencies
+from web.assurance_store import AssuranceWebRepository
 from web.server import create_app
 
 
@@ -76,9 +78,16 @@ def _setup(tmp_path):
             rubric_version="rubric-v1",
         ),
     )
-    app = create_app()
+    web_repository = AssuranceWebRepository(tmp_path / "assurance.sqlite")
+    web_repository.initialize()
+    app = create_app(
+        assurance_run_dependencies=AssuranceRunWebDependencies(
+            service=object(),
+            repository=web_repository,
+        )
+    )
     app.dependency_overrides[get_assurance_lifecycle_repository] = lambda: repository
-    return repository, app, TestClient(app)
+    return repository, app, TestClient(app, client=("127.0.0.1", 8000))
 
 
 def test_manual_observation_round_trip_and_exact_retry(tmp_path):
@@ -152,16 +161,22 @@ def test_import_rejects_stale_subject_and_invalid_base64(tmp_path):
     app.dependency_overrides.clear()
 
 
-def test_remediation_lineage_endpoint_is_read_only(tmp_path):
+def test_remediation_lineage_endpoint_uses_composed_repository(tmp_path):
     _, app, client = _setup(tmp_path)
 
     response = client.get("/api/assurance/changes/case-1/remediations")
     unsupported = client.post(
         "/api/assurance/changes/case-1/remediations",
-        json={"forged": True},
+        headers={"Idempotency-Key": "remediate:unconfigured"},
+        json={
+            "remediation_id": "remediation-1",
+            "human_selected_finding_id": "finding-1",
+            "requested_by": "alice",
+            "requested_at": "2026-08-26T12:00:00Z",
+        },
     )
 
     assert response.status_code == 200
     assert response.json() == []
-    assert unsupported.status_code == 405
+    assert unsupported.status_code == 503
     app.dependency_overrides.clear()

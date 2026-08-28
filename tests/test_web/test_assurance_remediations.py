@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import sqlite3
 
 import pytest
+from fastapi.testclient import TestClient
 
+from web.assurance_remediation import (
+    AssuranceRemediationRequest,
+    AssuranceRemediationService,
+)
+from web.assurance_run_composition import AssuranceRunWebDependencies
 from web.assurance_store import (
     AssuranceWebConflictError,
     AssuranceWebError,
     AssuranceWebNotFoundError,
 )
+from web.routes.assurance_runs import get_assurance_run_client
+from web.server import create_app
 from tests.test_web.test_assurance_run_store import (
     _db_rows,
     _ExplodingFreshness,
@@ -33,6 +42,127 @@ def _seed_remediation(tmp_path, monkeypatch):
         request_digest=baseline.request_digest,
     )
     return repository, baseline, changed_bundle, request, handoff
+
+
+def test_default_remediation_post_is_stably_not_configured():
+    client = TestClient(create_app(), client=("127.0.0.1", 8000))
+
+    response = client.post(
+        "/api/assurance/changes/case-1/remediations",
+        headers={"Idempotency-Key": "remediate:default"},
+        json={
+            "remediation_id": "remediation-1",
+            "human_selected_finding_id": "finding-1",
+            "requested_by": "alice",
+            "requested_at": "2026-08-26T12:00:00Z",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": "ASSURANCE_REMEDIATION_NOT_CONFIGURED",
+        "message": "assurance remediation service is not configured",
+        "reason_codes": ["NOT_CONFIGURED"],
+    }
+
+
+def test_configured_remediation_post_commits_and_replays_without_reprepare(
+    tmp_path, monkeypatch
+):
+    repository, _, _, request, handoff = _seed_remediation(tmp_path, monkeypatch)
+    prepare_calls = []
+
+    def request_factory(context, intent, **_):
+        return request
+
+    async def prepare_callback(request, context):
+        prepare_calls.append(request.remediation_id)
+        return handoff
+
+    service = AssuranceRemediationService(
+        repository,
+        request_factory=request_factory,
+        prepare_callback=prepare_callback,
+    )
+    app = create_app(
+        assurance_run_dependencies=AssuranceRunWebDependencies(
+            service=object(),
+            repository=repository,
+            remediation_service=service,
+        )
+    )
+    app.dependency_overrides[get_assurance_run_client] = lambda: "127.0.0.1"
+    payload = {
+        "remediation_id": request.remediation_id,
+        "human_selected_finding_id": request.human_selected_finding_id,
+        "requested_by": request.requested_by,
+        "requested_at": request.requested_at.isoformat(),
+    }
+
+    try:
+        with TestClient(app) as client:
+            first = client.post(
+                f"/api/assurance/changes/{request.old_case_id}/remediations",
+                headers={"Idempotency-Key": "remediate:web"},
+                json=payload,
+            )
+            replay = client.post(
+                f"/api/assurance/changes/{request.old_case_id}/remediations",
+                headers={"Idempotency-Key": "remediate:web"},
+                json=payload,
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first.status_code == 201
+    assert first.json()["cached"] is False
+    assert first.json()["case_view"]["case"]["state"] == "DRAFT"
+    assert replay.status_code == 200
+    assert replay.json()["cached"] is True
+    assert replay.json()["receipt"] == first.json()["receipt"]
+    assert replay.json()["case_view"]["case"]["state"] == "DRAFT"
+    assert prepare_calls == [request.remediation_id]
+
+
+def test_replay_conflict_with_invalid_projection_reraises_conflict():
+    class InvalidProjectionRepository:
+        def load_remediation_context(self, case_id, human_selected_finding_id):
+            raise AssuranceWebConflictError("old Case is already invalidated")
+
+        def lookup_remediation_replay(self, request, idempotency_key):
+            pytest.fail("invalid projection must not reach replay lookup")
+
+        def commit_prepared_remediation(self, request, handoff, idempotency_key):
+            pytest.fail("invalid projection must not reach commit")
+
+        def get_change(self, case_id):
+            return {"case": "not-an-acceptance-case"}
+
+    prepare_calls = []
+
+    def prepare_callback(**_):
+        prepare_calls.append(True)
+
+    service = AssuranceRemediationService(
+        InvalidProjectionRepository(),
+        prepare_callback=prepare_callback,
+    )
+    intent = AssuranceRemediationRequest(
+        remediation_id="remediation-invalid-projection",
+        human_selected_finding_id="finding-1",
+        requested_by="alice",
+        requested_at="2026-08-26T12:00:00Z",
+    )
+
+    with pytest.raises(AssuranceWebConflictError, match="already invalidated"):
+        asyncio.run(
+            service.remediate(
+                "case-1",
+                intent,
+                idempotency_key="remediate:invalid-projection",
+            )
+        )
+    assert prepare_calls == []
 
 
 def test_load_remediation_context_uses_immutable_run_not_web_projection(

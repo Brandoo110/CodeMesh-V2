@@ -133,6 +133,7 @@ def test_p7_router_exposes_only_declared_observation_and_read_routes():
             ("GET",),
         ),
         ("/assurance/changes/{case_id}/remediations", ("GET",)),
+        ("/assurance/changes/{case_id}/remediations", ("POST",)),
     }
 
     operation_words = (
@@ -200,6 +201,7 @@ def test_p7_boundary_modules_do_not_import_external_operation_clients():
         ROOT / "assurance" / "release_observation.py",
         ROOT / "assurance" / "lifecycle_store.py",
         ROOT / "web" / "assurance_lifecycle.py",
+        ROOT / "web" / "assurance_remediation.py",
         ROOT / "web" / "routes" / "assurance_lifecycle.py",
     )
     forbidden_roots = {

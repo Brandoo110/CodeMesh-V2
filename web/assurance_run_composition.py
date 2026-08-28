@@ -14,6 +14,7 @@ from assurance.run_service import (
     ReviewerInvoker,
 )
 from web.assurance_artifacts import AssuranceArtifactReader
+from web.assurance_remediation import AssuranceRemediationService
 from web.assurance_store import AssuranceWebRepository
 
 
@@ -24,6 +25,7 @@ class AssuranceRunWebDependencies:
     service: AssuranceRunService
     repository: AssuranceWebRepository
     artifact_reader: AssuranceArtifactReader | None = None
+    remediation_service: AssuranceRemediationService | None = None
 
     def __post_init__(self) -> None:
         """Bind the reader to the Service's already-owned ArtifactStore.
@@ -44,6 +46,18 @@ class AssuranceRunWebDependencies:
             raise ValueError(
                 "product run dependencies require a live-required repository"
             )
+
+        if self.remediation_service is not None:
+            remediation_repository = getattr(
+                self.remediation_service, "repository", None
+            )
+            if (
+                remediation_repository is not None
+                and remediation_repository is not self.repository
+            ):
+                raise ValueError(
+                    "remediation service must use the composed repository"
+                )
 
         if self.artifact_reader is not None:
             if type(self.artifact_reader) is not AssuranceArtifactReader:
@@ -75,6 +89,7 @@ def build_assurance_run_web_dependencies(
     config: AssuranceRunConfig,
     reviewer_invoker: ReviewerInvoker,
     context_builder: ReviewerContextBuilder,
+    remediation_service: AssuranceRemediationService | None = None,
 ) -> AssuranceRunWebDependencies:
     """Build a durable Run Service and its matching Web Repository.
 
@@ -117,6 +132,7 @@ def build_assurance_run_web_dependencies(
         service=service,
         repository=repository,
         artifact_reader=AssuranceArtifactReader(repository, artifact_store),
+        remediation_service=remediation_service,
     )
 
 

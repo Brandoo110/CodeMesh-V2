@@ -173,14 +173,25 @@ def create_app(
     async def _request_validation_handler(request, exc):
         # FastAPI's default validation payload includes the original input,
         # which could disclose a path, pseudo-key, or another forbidden value.
-        # Keep the sanitation local to the product Run boundary; legacy routes
-        # retain FastAPI's normal validation response.
-        if request.url.path == "/api/assurance/runs":
+        # Keep the sanitation local to the product Run/Remediation boundaries;
+        # legacy routes retain FastAPI's normal validation response.
+        if request.url.path == "/api/assurance/runs" or (
+            request.url.path.startswith("/api/assurance/changes/")
+            and request.url.path.endswith("/remediations")
+        ):
             return JSONResponse(
                 status_code=422,
                 content={
-                    "code": "ASSURANCE_RUN_INVALID",
-                    "message": "assurance run request is invalid",
+                    "code": (
+                        "ASSURANCE_REMEDIATION_INVALID"
+                        if request.url.path.endswith("/remediations")
+                        else "ASSURANCE_RUN_INVALID"
+                    ),
+                    "message": (
+                        "assurance remediation request is invalid"
+                        if request.url.path.endswith("/remediations")
+                        else "assurance run request is invalid"
+                    ),
                     "reason_codes": ["REQUEST_INVALID"],
                 },
             )

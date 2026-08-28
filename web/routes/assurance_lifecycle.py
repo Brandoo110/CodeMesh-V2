@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from assurance.release_observation import (
@@ -21,9 +23,29 @@ from assurance.store import (
     CaseNotFoundError,
     StoreConflictError,
 )
+from assurance.lifecycle_store import RemediationCommitReceipt
+from web.assurance_remediation import (
+    AssuranceRemediationError,
+    AssuranceRemediationNotConfiguredError,
+    AssuranceRemediationPreparationError,
+    AssuranceRemediationRequest,
+    AssuranceRemediationResult,
+    AssuranceRemediationValidationError,
+)
 from web.assurance_lifecycle import (
     AssuranceLifecycleRepository,
     get_assurance_lifecycle_repository,
+)
+from web.assurance_store import (
+    AssuranceWebConflictError,
+    AssuranceWebError,
+    AssuranceWebNotFoundError,
+    AssuranceWebPreconditionError,
+)
+from web.routes.assurance_runs import (
+    _is_loopback,
+    get_assurance_run_client,
+    get_assurance_run_dependencies,
 )
 
 
@@ -34,6 +56,17 @@ class ReleaseObservationImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     payload_base64: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+
+
+class AssuranceRemediationResponse(BaseModel):
+    """The only fields exposed by the remediation endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["v1"] = "v1"
+    cached: bool
+    receipt: RemediationCommitReceipt
+    case_view: dict[str, Any]
 
 
 def _detail(code: str, message: str, *reason_codes: str) -> dict[str, Any]:
@@ -51,6 +84,14 @@ def _fail(status: int, code: str, message: str, *reasons: str) -> None:
 def _call(operation: Callable[[], Any]) -> Any:
     try:
         return operation()
+    except AssuranceWebNotFoundError as exc:
+        _fail(404, "ASSURANCE_NOT_FOUND", str(exc), "NOT_FOUND")
+    except AssuranceWebPreconditionError as exc:
+        _fail(412, "ASSURANCE_PRECONDITION", str(exc), "PRECONDITION_FAILED")
+    except AssuranceWebConflictError as exc:
+        _fail(409, "ASSURANCE_CONFLICT", str(exc), "CONFLICT")
+    except AssuranceWebError as exc:
+        _fail(500, "ASSURANCE_STORE_ERROR", str(exc), type(exc).__name__)
     except CaseNotFoundError as exc:
         _fail(404, "ASSURANCE_NOT_FOUND", str(exc), "NOT_FOUND")
     except ReleaseObservationSubjectMismatch as exc:
@@ -63,6 +104,83 @@ def _call(operation: Callable[[], Any]) -> Any:
         _fail(422, "ASSURANCE_INVALID", str(exc), type(exc).__name__)
     except (ReleaseObservationArtifactError, AssuranceStoreError) as exc:
         _fail(500, "ASSURANCE_STORE_ERROR", str(exc), type(exc).__name__)
+
+
+def _remediation_error(
+    status_code: int, code: str, message: str, *reason_codes: str
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content=_detail(code, message, *reason_codes),
+    )
+
+
+def _map_remediation_exception(exc: BaseException) -> JSONResponse:
+    """Map remediation failures to fixed, non-sensitive public errors."""
+
+    if isinstance(exc, AssuranceRemediationNotConfiguredError):
+        return _remediation_error(
+            503,
+            "ASSURANCE_REMEDIATION_NOT_CONFIGURED",
+            "assurance remediation service is not configured",
+            "NOT_CONFIGURED",
+        )
+    if isinstance(exc, (AssuranceWebNotFoundError, CaseNotFoundError)):
+        return _remediation_error(
+            404,
+            "ASSURANCE_NOT_FOUND",
+            "assurance remediation Case or Finding was not found",
+            "NOT_FOUND",
+        )
+    if isinstance(exc, AssuranceWebPreconditionError):
+        return _remediation_error(
+            412,
+            "ASSURANCE_REMEDIATION_PRECONDITION",
+            "assurance remediation precondition was not satisfied",
+            "FRESHNESS_REQUIRED",
+        )
+    if isinstance(exc, (AssuranceWebConflictError, StoreConflictError)):
+        return _remediation_error(
+            409,
+            "ASSURANCE_REMEDIATION_CONFLICT",
+            "assurance remediation conflicts with existing state",
+            "REMEDIATION_CONFLICT",
+        )
+    if isinstance(exc, AssuranceRemediationValidationError):
+        return _remediation_error(
+            422,
+            "ASSURANCE_REMEDIATION_INVALID",
+            "assurance remediation request is invalid",
+            "REQUEST_INVALID",
+        )
+    if isinstance(exc, (ValidationError, TypeError, ValueError)):
+        return _remediation_error(
+            422,
+            "ASSURANCE_REMEDIATION_INVALID",
+            "assurance remediation request is invalid",
+            "REQUEST_INVALID",
+        )
+    if isinstance(
+        exc,
+        (
+            AssuranceRemediationPreparationError,
+            AssuranceRemediationError,
+            AssuranceWebError,
+            AssuranceStoreError,
+        ),
+    ):
+        return _remediation_error(
+            500,
+            "ASSURANCE_REMEDIATION_FAILED",
+            "assurance remediation failed",
+            "REMEDIATION_FAILED",
+        )
+    return _remediation_error(
+        500,
+        "ASSURANCE_REMEDIATION_FAILED",
+        "assurance remediation failed",
+        "REMEDIATION_FAILED",
+    )
 
 
 @router.post(
@@ -118,11 +236,105 @@ def list_release_observations(
 @router.get("/changes/{case_id}/remediations")
 def list_remediations(
     case_id: str,
-    repository: AssuranceLifecycleRepository = Depends(
-        get_assurance_lifecycle_repository
-    ),
+    dependencies=Depends(get_assurance_run_dependencies),
 ) -> list[dict[str, Any]]:
-    return _call(lambda: repository.list_remediations(case_id))
+    if dependencies is None:
+        _fail(
+            503,
+            "ASSURANCE_REMEDIATION_NOT_CONFIGURED",
+            "assurance remediation repository is not configured",
+            "NOT_CONFIGURED",
+        )
+    return _call(lambda: dependencies.repository.list_remediations(case_id))
 
 
-__all__ = ["router"]
+@router.post(
+    "/changes/{case_id}/remediations",
+    response_model=AssuranceRemediationResponse,
+)
+async def create_remediation(
+    case_id: str,
+    request: AssuranceRemediationRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    dependencies=Depends(get_assurance_run_dependencies),
+    client_host: str | None = Depends(get_assurance_run_client),
+) -> JSONResponse:
+    """Prepare/commit one server-owned remediation transition."""
+
+    # This guard intentionally precedes all dependency/service work.  The
+    # dependency getters only retrieve app state; repository calls begin
+    # below, after the loopback decision.
+    if not _is_loopback(client_host):
+        return _remediation_error(
+            403,
+            "ASSURANCE_REMEDIATION_LOOPBACK_REQUIRED",
+            "assurance remediation endpoint requires a loopback client",
+            "LOOPBACK_REQUIRED",
+        )
+    if idempotency_key is None or not idempotency_key.strip():
+        return _remediation_error(
+            422,
+            "ASSURANCE_REMEDIATION_INVALID",
+            "assurance remediation request is invalid",
+            "IDEMPOTENCY_KEY_REQUIRED",
+        )
+    try:
+        if len(idempotency_key.encode("utf-8")) > 256:
+            return _remediation_error(
+                422,
+                "ASSURANCE_REMEDIATION_INVALID",
+                "assurance remediation request is invalid",
+                "IDEMPOTENCY_KEY_TOO_LONG",
+            )
+    except UnicodeEncodeError:
+        return _remediation_error(
+            422,
+            "ASSURANCE_REMEDIATION_INVALID",
+            "assurance remediation request is invalid",
+            "IDEMPOTENCY_KEY_INVALID",
+        )
+    if dependencies is None or dependencies.remediation_service is None:
+        return _remediation_error(
+            503,
+            "ASSURANCE_REMEDIATION_NOT_CONFIGURED",
+            "assurance remediation service is not configured",
+            "NOT_CONFIGURED",
+        )
+
+    try:
+        result = await dependencies.remediation_service.remediate(
+            case_id,
+            request,
+            idempotency_key=idempotency_key,
+        )
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        return _map_remediation_exception(exc)
+
+    try:
+        response = AssuranceRemediationResponse(
+            schema_version="v1",
+            cached=result.cached,
+            receipt=result.receipt,
+            case_view=result.case_view,
+        )
+    except (ValidationError, TypeError, ValueError, AttributeError):
+        return _remediation_error(
+            500,
+            "ASSURANCE_REMEDIATION_FAILED",
+            "assurance remediation failed",
+            "REMEDIATION_FAILED",
+        )
+    return JSONResponse(
+        status_code=200 if response.cached else 201,
+        content=response.model_dump(mode="json"),
+    )
+
+
+__all__ = [
+    "AssuranceRemediationRequest",
+    "AssuranceRemediationResponse",
+    "create_remediation",
+    "router",
+]
