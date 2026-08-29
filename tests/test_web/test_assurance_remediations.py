@@ -20,6 +20,7 @@ from assurance.remediation import (
 from web.assurance_remediation import (
     AssuranceRemediationRequest,
     AssuranceRemediationNotAppliedError,
+    AssuranceRemediationPreparationError,
     AssuranceRemediationService,
 )
 from web.assurance_run_composition import AssuranceRunWebDependencies
@@ -335,6 +336,156 @@ def test_remediation_agent_error_reason_codes_are_fixed_and_non_sensitive(
         ],
     }
     assert reason_code not in response.body.decode("utf-8")
+
+
+def test_preparation_error_requires_fixed_stage_and_reason_and_keeps_cause_private():
+    cause = RuntimeError("provider secret /private/prompt.json")
+
+    error = AssuranceRemediationPreparationError(
+        stage="CONTROLLER_PREPARATION",
+        reason_code="RUNTIME",
+    )
+    error.__cause__ = cause
+
+    assert str(error) == "assurance remediation preparation failed"
+    assert error.stage == "CONTROLLER_PREPARATION"
+    assert error.reason_code == "RUNTIME"
+    assert error.__cause__ is cause
+
+    with pytest.raises(ValueError):
+        AssuranceRemediationPreparationError(
+            stage="untrusted-stage",
+            reason_code="RUNTIME",
+        )
+    with pytest.raises(ValueError):
+        AssuranceRemediationPreparationError(
+            stage="CONTROLLER_PREPARATION",
+            reason_code="untrusted-reason",
+        )
+
+
+def test_preparation_error_response_is_stage_aware_and_non_sensitive():
+    error = AssuranceRemediationPreparationError(
+        stage="SOURCE_RUNTIME",
+        reason_code="IO",
+    )
+    error.__cause__ = OSError("provider secret /private/prompt.json")
+
+    response = _map_remediation_exception(error)
+    payload = json.loads(response.body.decode("utf-8"))
+
+    assert response.status_code == 500
+    assert payload == {
+        "code": "ASSURANCE_REMEDIATION_FAILED",
+        "message": "assurance remediation failed",
+        "reason_codes": ["REMEDIATION_FAILED"],
+        "stage": "SOURCE_RUNTIME",
+        "reason": "IO",
+    }
+    assert "provider secret" not in response.body.decode("utf-8")
+    assert "/private/prompt.json" not in response.body.decode("utf-8")
+    assert "OSError" not in response.body.decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("stage", "failure", "reason"),
+    (
+        ("CONTEXT", ValueError("context /private/context.json"), "VALUE"),
+        ("REQUEST_BINDING", TypeError("request /private/request.json"), "TYPE"),
+        (
+            "CONTROLLER_PREPARATION",
+            RuntimeError("provider secret /private/prompt.json"),
+            "RUNTIME",
+        ),
+        ("COMMIT_PROJECTION", OSError("database /private/assurance.sqlite"), "IO"),
+    ),
+)
+def test_preparation_failures_are_classified_at_their_low_risk_stage(
+    tmp_path, monkeypatch, stage, failure, reason
+):
+    repository, _, _, request, handoff = _seed_remediation(tmp_path, monkeypatch)
+
+    def request_factory(context, intent, **_):
+        if stage == "REQUEST_BINDING":
+            raise failure
+        return request
+
+    async def prepare_callback(request, context):
+        if stage == "CONTROLLER_PREPARATION":
+            raise failure
+        return handoff
+
+    if stage == "CONTEXT":
+        def load_context(*_args, **_kwargs):
+            raise failure
+
+        repository.load_remediation_context = load_context
+    elif stage == "COMMIT_PROJECTION":
+        def commit(*_args, **_kwargs):
+            raise failure
+
+        repository.commit_prepared_remediation = commit
+
+    service = AssuranceRemediationService(
+        repository,
+        request_factory=request_factory,
+        prepare_callback=prepare_callback,
+    )
+
+    with pytest.raises(AssuranceRemediationPreparationError) as raised:
+        asyncio.run(
+            service.remediate(
+                request.old_case_id,
+                AssuranceRemediationRequest(
+                    remediation_id=request.remediation_id,
+                    human_selected_finding_id=request.human_selected_finding_id,
+                    requested_by=request.requested_by,
+                    requested_at=request.requested_at,
+                ),
+                idempotency_key=f"remediate:mvp-08d:{stage.lower()}",
+            )
+        )
+
+    assert raised.value.stage == stage
+    assert raised.value.reason_code == reason
+    assert raised.value.__cause__ is failure
+    assert str(raised.value) == "assurance remediation preparation failed"
+
+
+def test_classified_preparation_error_is_not_wrapped_again(tmp_path, monkeypatch):
+    repository, _, _, request, _ = _seed_remediation(tmp_path, monkeypatch)
+    classified = AssuranceRemediationPreparationError(
+        stage="SOURCE_RUNTIME",
+        reason_code="TIMEOUT",
+    )
+
+    def request_factory(context, intent, **_):
+        return request
+
+    async def prepare_callback(request, context):
+        raise classified
+
+    service = AssuranceRemediationService(
+        repository,
+        request_factory=request_factory,
+        prepare_callback=prepare_callback,
+    )
+
+    with pytest.raises(AssuranceRemediationPreparationError) as raised:
+        asyncio.run(
+            service.remediate(
+                request.old_case_id,
+                AssuranceRemediationRequest(
+                    remediation_id=request.remediation_id,
+                    human_selected_finding_id=request.human_selected_finding_id,
+                    requested_by=request.requested_by,
+                    requested_at=request.requested_at,
+                ),
+                idempotency_key="remediate:mvp-08d:classified",
+            )
+        )
+
+    assert raised.value is classified
 
 
 def test_direct_remediation_post_rejects_policy_pass_before_prepare(

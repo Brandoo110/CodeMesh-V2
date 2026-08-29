@@ -30,7 +30,12 @@ from assurance.fixed_reviewer_invoker import (
     FixedReviewerEndpoint,
 )
 from assurance.live_freshness import LiveFreshnessChecker
-from assurance.remediation import RemediationPolicy, RemediationRequest, RemediationController
+from assurance.remediation import (
+    RemediationController,
+    RemediationPolicy,
+    RemediationRequest,
+)
+from assurance.store import StoreConflictError
 from assurance.remediation_agent import StructuredRemediationAgent
 from assurance.remediation_reviewer import AssuranceRemediationReviewer
 from assurance.remediation_validation import ValidationCheck, ValidationExecutor
@@ -54,9 +59,13 @@ from orchestration.adapters import (
 from orchestration.adapters.base import ModelAdapter
 from web.assurance_remediation import (
     AssuranceRemediationConfig,
+    AssuranceRemediationError,
+    AssuranceRemediationPreparationError,
     AssuranceRemediationService,
+    RemediationPreparationStage,
+    _preparation_reason_code,
 )
-from web.assurance_store import AssuranceWebRepository
+from web.assurance_store import AssuranceWebError, AssuranceWebRepository
 from web.assurance_store import RemediationContext
 
 
@@ -621,7 +630,7 @@ def _build_remediation_service(
     )
     checks = _remediation_checks(config.allowed_commands)
 
-    async def prepare_callback(
+    async def _compose_preparation_controller(
         request: RemediationRequest,
         *,
         context: RemediationContext,
@@ -706,7 +715,39 @@ def _build_remediation_service(
             reviewer_rerunner=reviewer,
             workspace_parent=config.workspace_root,
         )
-        return await controller.prepare(agent)
+        return controller
+
+    async def prepare_callback(
+        request: RemediationRequest,
+        *,
+        context: RemediationContext,
+    ) -> Any:
+        try:
+            controller = await _compose_preparation_controller(
+                request,
+                context=context,
+            )
+        except AssuranceRemediationPreparationError:
+            raise
+        except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
+            raise
+        except Exception as exc:
+            raise AssuranceRemediationPreparationError(
+                stage=RemediationPreparationStage.SOURCE_RUNTIME.value,
+                reason_code=_preparation_reason_code(exc),
+            ) from exc
+
+        try:
+            return await controller.prepare(agent)
+        except AssuranceRemediationPreparationError:
+            raise
+        except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
+            raise
+        except Exception as exc:
+            raise AssuranceRemediationPreparationError(
+                stage=RemediationPreparationStage.CONTROLLER_PREPARATION.value,
+                reason_code=_preparation_reason_code(exc),
+            ) from exc
 
     remediation_service = AssuranceRemediationService(
         repository,

@@ -32,6 +32,8 @@ from web.assurance_remediation import (
     AssuranceRemediationRequest,
     AssuranceRemediationResult,
     AssuranceRemediationValidationError,
+    RemediationPreparationReason,
+    RemediationPreparationStage,
 )
 from web.assurance_lifecycle import (
     AssuranceLifecycleRepository,
@@ -145,11 +147,20 @@ def _call(operation: Callable[[], Any]) -> Any:
 
 
 def _remediation_error(
-    status_code: int, code: str, message: str, *reason_codes: str
+    status_code: int,
+    code: str,
+    message: str,
+    *reason_codes: str,
+    stage: str | None = None,
+    reason: str | None = None,
 ) -> JSONResponse:
+    content = _detail(code, message, *reason_codes)
+    if stage is not None and reason is not None:
+        content["stage"] = stage
+        content["reason"] = reason
     return JSONResponse(
         status_code=status_code,
-        content=_detail(code, message, *reason_codes),
+        content=content,
     )
 
 
@@ -200,6 +211,29 @@ def _map_remediation_exception(exc: BaseException) -> JSONResponse:
             "assurance remediation request is invalid",
             "REQUEST_INVALID",
         )
+    if isinstance(exc, AssuranceRemediationPreparationError):
+        stage = getattr(exc, "stage", None)
+        reason = getattr(exc, "reason_code", None)
+        if (
+            type(stage) is str
+            and stage in {item.value for item in RemediationPreparationStage}
+            and type(reason) is str
+            and reason in {item.value for item in RemediationPreparationReason}
+        ):
+            return _remediation_error(
+                500,
+                "ASSURANCE_REMEDIATION_FAILED",
+                "assurance remediation failed",
+                "REMEDIATION_FAILED",
+                stage=stage,
+                reason=reason,
+            )
+        return _remediation_error(
+            500,
+            "ASSURANCE_REMEDIATION_FAILED",
+            "assurance remediation failed",
+            "REMEDIATION_FAILED",
+        )
     if isinstance(exc, (ValidationError, TypeError, ValueError)):
         return _remediation_error(
             422,
@@ -210,7 +244,6 @@ def _map_remediation_exception(exc: BaseException) -> JSONResponse:
     if isinstance(
         exc,
         (
-            AssuranceRemediationPreparationError,
             AssuranceRemediationError,
             AssuranceWebError,
             AssuranceStoreError,

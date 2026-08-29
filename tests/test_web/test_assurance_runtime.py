@@ -20,6 +20,7 @@ from web.assurance_runtime import (
     AssuranceRuntimeStartupError,
     load_assurance_runtime_from_environment,
 )
+from web.assurance_remediation import AssuranceRemediationPreparationError
 from orchestration.adapters import DeepSeekAdapter
 from web.routes.assurance_runs import get_assurance_run_client
 from web.server import create_app
@@ -309,6 +310,36 @@ def test_v2_explicit_remediation_provider_uses_dedicated_secret_and_closes_once(
     asyncio.run(runtime.aclose())
     asyncio.run(runtime.aclose())
     assert close_calls == [True]
+
+
+def test_runtime_prepare_callback_classifies_source_composition_failures(
+    tmp_path,
+):
+    config = _config(tmp_path, schema_version="v2")
+    config["remediation"] = _remediation_config()
+    config_path = _write_config(tmp_path, config)
+
+    runtime = load_assurance_runtime_from_environment(
+        _environment(config_path, remediation_key="dedicated-secret"),
+        remediation_adapter_factory=lambda *_: _FakeRemediationAdapter([]),
+    )
+    assert runtime is not None
+    assert runtime.remediation_service is not None
+
+    try:
+        with pytest.raises(AssuranceRemediationPreparationError) as raised:
+            asyncio.run(
+                runtime.remediation_service.prepare_callback(
+                    object(),
+                    context=object(),
+                )
+            )
+    finally:
+        asyncio.run(runtime.aclose())
+
+    assert raised.value.stage == "SOURCE_RUNTIME"
+    assert raised.value.reason_code == "TYPE"
+    assert str(raised.value) == "assurance remediation preparation failed"
 
 
 def test_deepseek_complete_defaults_and_json_mode_use_exact_request_kwargs(

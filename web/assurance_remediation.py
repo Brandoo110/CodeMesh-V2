@@ -12,6 +12,7 @@ import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Protocol
 
 from pydantic import (
@@ -32,8 +33,10 @@ from assurance.remediation import (
     RemediationStatus,
 )
 from assurance.remediation_workspace import WorkspaceGrant
+from assurance.store import StoreConflictError
 from web.assurance_store import (
     AssuranceWebConflictError,
+    AssuranceWebError,
     AssuranceWebRepository,
     RemediationContext,
 )
@@ -129,8 +132,73 @@ class AssuranceRemediationValidationError(
     """The service boundary or a trusted factory returned invalid facts."""
 
 
+class RemediationPreparationStage(str, Enum):
+    """Low-risk seams where preparation can fail before an atomic commit."""
+
+    CONTEXT = "CONTEXT"
+    REQUEST_BINDING = "REQUEST_BINDING"
+    SOURCE_RUNTIME = "SOURCE_RUNTIME"
+    CONTROLLER_PREPARATION = "CONTROLLER_PREPARATION"
+    COMMIT_PROJECTION = "COMMIT_PROJECTION"
+
+
+class RemediationPreparationReason(str, Enum):
+    """Stable, non-sensitive reason taxonomy for preparation failures."""
+
+    VALIDATION = "VALIDATION"
+    TYPE = "TYPE"
+    VALUE = "VALUE"
+    IO = "IO"
+    TIMEOUT = "TIMEOUT"
+    RUNTIME = "RUNTIME"
+
+
+_PREPARATION_STAGE_VALUES = frozenset(stage.value for stage in RemediationPreparationStage)
+_PREPARATION_REASON_VALUES = frozenset(reason.value for reason in RemediationPreparationReason)
+
+
+def _preparation_reason_code(error: BaseException) -> str:
+    """Classify an internal exception without copying its details outward."""
+
+    if isinstance(error, TimeoutError):
+        return RemediationPreparationReason.TIMEOUT.value
+    if isinstance(error, ValidationError):
+        return RemediationPreparationReason.VALIDATION.value
+    if isinstance(error, TypeError):
+        return RemediationPreparationReason.TYPE.value
+    if isinstance(error, (OSError, IOError)):
+        return RemediationPreparationReason.IO.value
+    if isinstance(error, ValueError):
+        return RemediationPreparationReason.VALUE.value
+    return RemediationPreparationReason.RUNTIME.value
+
+
 class AssuranceRemediationPreparationError(AssuranceRemediationError):
-    """The injected preparation seam failed before any repository write."""
+    """A bounded preparation seam failed before any repository write."""
+
+    def __init__(
+        self,
+        *,
+        stage: str | RemediationPreparationStage,
+        reason_code: str | RemediationPreparationReason,
+    ) -> None:
+        if isinstance(stage, RemediationPreparationStage):
+            stage = stage.value
+        if isinstance(reason_code, RemediationPreparationReason):
+            reason_code = reason_code.value
+        if type(stage) is not str or stage not in _PREPARATION_STAGE_VALUES:
+            raise ValueError("preparation stage is not recognized")
+        if type(reason_code) is not str or reason_code not in _PREPARATION_REASON_VALUES:
+            raise ValueError("preparation reason is not recognized")
+        self.stage = stage
+        self.reason_code = reason_code
+        super().__init__("assurance remediation preparation failed")
+
+    @property
+    def reason(self) -> str:
+        """Stable alias used by the public failure receipt."""
+
+        return self.reason_code
 
 
 class AssuranceRemediationNotAppliedError(AssuranceRemediationError):
@@ -170,6 +238,20 @@ async def _await_if_needed(value: Any) -> Any:
 
 async def _invoke(function: Callable[..., Any], values: dict[str, Any]) -> Any:
     return await _await_if_needed(function(**_filtered_kwargs(function, values)))
+
+
+def _raise_preparation_failure(
+    stage: RemediationPreparationStage,
+    error: BaseException,
+) -> None:
+    """Raise one fixed receipt while retaining the original cause internally."""
+
+    if isinstance(error, AssuranceRemediationPreparationError):
+        raise error
+    raise AssuranceRemediationPreparationError(
+        stage=stage.value,
+        reason_code=_preparation_reason_code(error),
+    ) from error
 
 
 def _server_request_factory(
@@ -364,25 +446,39 @@ class AssuranceRemediationService:
                 case_view=case_view,
                 cached=True,
             )
+        except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
+            raise
+        except Exception as exc:
+            _raise_preparation_failure(RemediationPreparationStage.CONTEXT, exc)
         if not isinstance(context, RemediationContext):
-            raise AssuranceRemediationValidationError(
-                "repository returned invalid remediation context"
+            _raise_preparation_failure(
+                RemediationPreparationStage.CONTEXT,
+                TypeError("repository returned invalid remediation context"),
             )
 
-        request = await _invoke(
-            self.request_factory,
-            {
-                "context": context,
-                "intent": intent,
-                "body": intent,
-                "request": intent,
-                "idempotency_key": idempotency_key,
-                "config": self.config,
-            },
-        )
+        try:
+            request = await _invoke(
+                self.request_factory,
+                {
+                    "context": context,
+                    "intent": intent,
+                    "body": intent,
+                    "request": intent,
+                    "idempotency_key": idempotency_key,
+                    "config": self.config,
+                },
+            )
+        except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
+            raise
+        except Exception as exc:
+            _raise_preparation_failure(
+                RemediationPreparationStage.REQUEST_BINDING,
+                exc,
+            )
         if type(request) is not RemediationRequest:
-            raise AssuranceRemediationValidationError(
-                "request factory must return an exact RemediationRequest"
+            _raise_preparation_failure(
+                RemediationPreparationStage.REQUEST_BINDING,
+                TypeError("request factory returned an invalid remediation request"),
             )
         if (
             request.old_case_id != context.old_case_id
@@ -390,27 +486,46 @@ class AssuranceRemediationService:
             or request.human_selected_finding_id
             != intent.human_selected_finding_id
         ):
-            raise AssuranceRemediationValidationError(
-                "request factory returned context-mismatched remediation facts"
+            _raise_preparation_failure(
+                RemediationPreparationStage.REQUEST_BINDING,
+                ValueError("request factory returned context-mismatched facts"),
             )
         self._request_cache[(case_id, idempotency_key)] = request
 
-        replay = await _invoke(
-            self.repository.lookup_remediation_replay,
-            {"request": request, "idempotency_key": idempotency_key},
-        )
+        try:
+            replay = await _invoke(
+                self.repository.lookup_remediation_replay,
+                {"request": request, "idempotency_key": idempotency_key},
+            )
+        except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
+            raise
+        except Exception as exc:
+            _raise_preparation_failure(
+                RemediationPreparationStage.COMMIT_PROJECTION,
+                exc,
+            )
         if replay is not None:
             if type(replay) is not RemediationCommitReceipt:
-                raise AssuranceRemediationValidationError(
-                    "repository returned an invalid cached remediation receipt"
+                _raise_preparation_failure(
+                    RemediationPreparationStage.COMMIT_PROJECTION,
+                    TypeError("repository returned an invalid cached receipt"),
                 )
-            case_view = await _invoke(
-                self.repository.get_change,
-                {"case_id": replay.new_case_id},
-            )
+            try:
+                case_view = await _invoke(
+                    self.repository.get_change,
+                    {"case_id": replay.new_case_id},
+                )
+            except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
+                raise
+            except Exception as exc:
+                _raise_preparation_failure(
+                    RemediationPreparationStage.COMMIT_PROJECTION,
+                    exc,
+                )
             if not isinstance(case_view, dict):
-                raise AssuranceRemediationValidationError(
-                    "repository returned an invalid remediation CaseView"
+                _raise_preparation_failure(
+                    RemediationPreparationStage.COMMIT_PROJECTION,
+                    TypeError("repository returned an invalid remediation CaseView"),
                 )
             return AssuranceRemediationResult(
                 receipt=replay,
@@ -428,15 +543,17 @@ class AssuranceRemediationService:
                     "baseline_bundle": context.baseline_bundle,
                 },
             )
-        except AssuranceRemediationPreparationError:
+        except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
             raise
         except Exception as exc:
-            raise AssuranceRemediationPreparationError(
-                "assurance remediation preparation failed"
-            ) from exc
+            _raise_preparation_failure(
+                RemediationPreparationStage.CONTROLLER_PREPARATION,
+                exc,
+            )
         if type(prepared) is not PreparedRemediationHandoff:
-            raise AssuranceRemediationValidationError(
-                "prepare callback must return an exact PreparedRemediationHandoff"
+            _raise_preparation_failure(
+                RemediationPreparationStage.CONTROLLER_PREPARATION,
+                TypeError("prepare callback returned an invalid handoff"),
             )
         if (
             prepared.result.status is not RemediationStatus.SUCCEEDED
@@ -447,25 +564,43 @@ class AssuranceRemediationService:
                 reason_code=prepared.result.reason_code,
             )
 
-        receipt = await _invoke(
-            self.repository.commit_prepared_remediation,
-            {
-                "request": request,
-                "handoff": prepared,
-                "idempotency_key": idempotency_key,
-            },
-        )
-        if type(receipt) is not RemediationCommitReceipt:
-            raise AssuranceRemediationValidationError(
-                "repository returned an invalid remediation receipt"
+        try:
+            receipt = await _invoke(
+                self.repository.commit_prepared_remediation,
+                {
+                    "request": request,
+                    "handoff": prepared,
+                    "idempotency_key": idempotency_key,
+                },
             )
-        case_view = await _invoke(
-            self.repository.get_change,
-            {"case_id": receipt.new_case_id},
-        )
+        except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
+            raise
+        except Exception as exc:
+            _raise_preparation_failure(
+                RemediationPreparationStage.COMMIT_PROJECTION,
+                exc,
+            )
+        if type(receipt) is not RemediationCommitReceipt:
+            _raise_preparation_failure(
+                RemediationPreparationStage.COMMIT_PROJECTION,
+                TypeError("repository returned an invalid remediation receipt"),
+            )
+        try:
+            case_view = await _invoke(
+                self.repository.get_change,
+                {"case_id": receipt.new_case_id},
+            )
+        except (AssuranceRemediationError, AssuranceWebError, StoreConflictError):
+            raise
+        except Exception as exc:
+            _raise_preparation_failure(
+                RemediationPreparationStage.COMMIT_PROJECTION,
+                exc,
+            )
         if not isinstance(case_view, dict):
-            raise AssuranceRemediationValidationError(
-                "repository returned an invalid remediation CaseView"
+            _raise_preparation_failure(
+                RemediationPreparationStage.COMMIT_PROJECTION,
+                TypeError("repository returned an invalid remediation CaseView"),
             )
         return AssuranceRemediationResult(
             receipt=receipt,
@@ -499,6 +634,8 @@ __all__ = [
     "AssuranceRemediationResult",
     "AssuranceRemediationService",
     "AssuranceRemediationValidationError",
+    "RemediationPreparationReason",
+    "RemediationPreparationStage",
     "RemediationPrepareCallback",
     "RemediationRequestFactory",
 ]
