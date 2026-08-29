@@ -199,6 +199,7 @@ def test_deepseek_route_explicitly_disables_thinking():
     assert len(seen) == 1
     payload = json.loads(seen[0].content)
     assert payload["thinking"] == {"type": "disabled"}
+    assert payload["response_format"] == {"type": "json_object"}
     assert payload["max_tokens"] == 4096
     asyncio.run(invoker.aclose())
 

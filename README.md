@@ -184,6 +184,8 @@ applies to any remediation provider call.
    preserve bounded deterministic JSON; even when `deepseek-v4-pro` is chosen
    for complex review, this quickstart remains bounded non-thinking and does
    not claim a dynamic thinking mode.
+   It also requests the provider JSON mode (`response_format={"type": "json_object"}`)
+   so the bounded deterministic JSON contract is explicit.
    The remediation role is
    explicitly `qwen` and has its own model and policy. Replace its
    `workspace_grant.allowed_paths` with one or more real, existing

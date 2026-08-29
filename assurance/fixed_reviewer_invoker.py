@@ -266,6 +266,7 @@ class FixedOpenAICompatibleReviewerInvoker:
                 provider_options["extra_body"] = {
                     "thinking": {"type": "disabled"}
                 }
+                provider_options["response_format"] = {"type": "json_object"}
             response = await asyncio.wait_for(
                 self._client.chat.completions.create(
                     model=route.model_ref,
