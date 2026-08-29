@@ -134,6 +134,15 @@ itself requires your explicit authorization for this invocation; if you have
 not granted that authorization, do not run this quickstart. The same rule
 applies to any remediation provider call.
 
+Reviewer operability is deliberately bounded: `max_retries=0` means one
+provider request per run. The Case API's `Idempotency-Key` owns replay and
+conflict handling; `response_format` requests provider JSON and does not
+change that Case API contract. Observability includes reviewer status, schema
+status, and errors; prompt, raw-response, and canonical digests; the
+`ExecutionReceipt`; and the Case/Passport views. There is no independent
+runtime kill-switch: safe stop or rollback means stopping the local service or
+rolling back the provider option. Any failure fails closed.
+
 1. Copy the strict v2 example and edit every `ABSOLUTE/PATH` placeholder so it
    names an existing path on this machine:
 
@@ -317,8 +326,14 @@ The current status is the local v2 Change Acceptance entry point described
 above: one fixed DeepSeek strong reviewer, deterministic policy gate, persisted
 case/evidence/passport reads, and optional explicitly configured remediation.
 Older P1-P5/P6 labels and evaluation material describe historical slices and do
-not mean that the specialist council is currently promoted or that a real
-provider run has happened. The council remains an unpromoted experiment.
+not mean that the specialist council is currently promoted. At commit
+`6fc42037d75600907eef5ed0820ca3a5309c81b2`, local dogfood run `run_d73c...`
+for case `case_4665...` used DeepSeek V4 Flash and recorded four successful,
+FRESH evidence artifacts, reviewer success with a valid schema, a successful
+execution receipt, six findings, two questions, and zero blocking findings.
+The resulting gate remains `NEEDS_EVIDENCE/NEEDS_HUMAN`: this is not a
+production result or final human approval. The council remains an unpromoted
+experiment.
 
 ## License
 

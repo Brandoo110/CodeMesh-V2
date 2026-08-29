@@ -195,6 +195,7 @@ def test_deepseek_route_explicitly_disables_thinking():
 
     result = asyncio.run(invoker.invoke(_prompt(), run_id="run-1", route=route))
 
+    assert invoker._client.max_retries == 0
     assert result.status == "success"
     assert len(seen) == 1
     payload = json.loads(seen[0].content)

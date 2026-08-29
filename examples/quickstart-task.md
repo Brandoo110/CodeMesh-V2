@@ -1,18 +1,16 @@
 ---
-title: Bound DeepSeek V4 reviewer output
+title: Document reviewer operability evidence
 owner: CodeMesh maintainers
 ---
 
 # Scope
 
-This task spec documents the CodeMesh V2 fixed-reviewer transport change for the
-real local Change Acceptance quickstart. The DeepSeek route must explicitly
-disable provider thinking and request provider JSON mode while retaining the
-existing one-shot bounded JSON contract; other providers keep their exact
-payload. Reviewer provider execution after this fix and real dogfood remain
-pending.
+This task spec documents the operability evidence for the CodeMesh V2 fixed
+reviewer in the real local Change Acceptance quickstart. It records the
+bounded request contract, the Case API replay boundary, observable evidence,
+and the honest stop/rollback boundary. A human decision is still pending.
 
-- [ ] Confirm `route.provider == "deepseek"` adds `extra_body: {"thinking": {"type": "disabled"}}` and `response_format: {"type": "json_object"}`, keeps `max_tokens: 4096`, and sends exactly one request.
-- [ ] Confirm every non-DeepSeek provider retains its exact prior request payload, with no thinking field, tools, fallback, or response-format additions.
-- [ ] Confirm the fixed quickstart README wording describes bounded non-thinking transport and provider JSON mode for both `deepseek-v4-flash` and explicitly selected `deepseek-v4-pro`, without claiming a dynamic thinking mode.
-- [ ] Confirm the focused DeepSeek transport test and the adjacent fixed-reviewer test file pass, with no real provider or dogfood claim.
+- [ ] Confirm the fixed reviewer uses `max_retries=0` and sends one provider request per run; the focused test keeps `len(seen) == 1`.
+- [ ] Confirm Case API `Idempotency-Key` exclusively owns replay/conflict behavior and provider `response_format` does not change that contract.
+- [ ] Confirm observability covers reviewer status/schema/error, prompt/raw/canonical digests, `ExecutionReceipt`, and Case/Passport reads; document that there is no independent runtime kill-switch, so safe stop/rollback means stopping the local service or rolling back the provider option, with failures failing closed.
+- [ ] Confirm the focused DeepSeek test and generic exact-payload test pass. Human review/decision remains pending; this evidence does not create approval or close a Case question.

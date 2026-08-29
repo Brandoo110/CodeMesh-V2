@@ -29,3 +29,9 @@
 本轮专项记录（2026-08-29，DeepSeek V4 bounded non-thinking）：真实 run `run_9afdd...` 已实际使用 `deepseek-v4-flash`，FRESH 且 4 evidence success；但默认 high thinking 在 4096 output budget 达到 `finish_reason=length`，结果为 BLOCKED。本修复后待新 run，dogfood 尚未完成；无新增 hardening。
 
 本轮专项记录（2026-08-29，DeepSeek V4 JSON mode）：真实 run `run_af01...` 已实际使用 DeepSeek V4/non-thinking，FRESH 且 4 evidence success，但状态为 `invalid_json`。Raw artifact 为 4736 bytes，包含单一 ``` fence；去 fence 后是合法 dict，keys 为 `findings`、`questions`、`rubric_hash`、`schema_version`、`subject_digest`，但严格 parser 不应剥 fence。本修复后待新 run，dogfood 尚未完成；无新增 hardening。
+
+本轮专项记录（2026-08-29，真实 reviewer dogfood operability closeout）：在 commit `6fc42037d75600907eef5ed0820ca3a5309c81b2`，真实本地 run `run_d73c...` / case `case_4665...` 使用 DeepSeek V4 Flash，取得 4 evidence success、`FRESH`、reviewer success、schema valid、receipt success，记录 6 findings、2 questions、0 blocking findings；Gate 仍为 `NEEDS_EVIDENCE/NEEDS_HUMAN`。这证明当前 reviewer 成功边界，不是生产证据或最终人批准。
+
+本轮待回答的两个 operability questions 是：如何保证每次 run 不因 reviewer 重试而产生额外 provider 请求，以及服务停止/回滚时有哪些真实控制面。当前边界为 `max_retries=0`、每次 run 一次 provider request，Case `Idempotency-Key` 负责 replay/conflict，失败 fail-closed；没有独立 runtime kill-switch，安全停止/回滚依靠停止本地服务或回滚 provider option。无新增 hardening。
+
+后续 operability gap：建立 dedicated provider status taxonomy，并补充 usage/cost capture。两项均未完成，不阻塞当前已记录的真实 reviewer success 事实。
