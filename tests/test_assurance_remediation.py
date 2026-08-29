@@ -364,8 +364,16 @@ def test_agent_receives_public_view_and_tools_hide_controller_workspace(tmp_path
     request = _request(_grant("fix.py"), _policy())
     executor = _FakeExecutor([ValidationStatus.FAILED, ValidationStatus.PASSED])
     seen: dict[str, bool] = {}
+    received_findings: list[object] = []
 
-    async def agent(*, workspace: object, tools: object, **_: object) -> None:
+    async def agent(
+        *,
+        workspace: object,
+        tools: object,
+        selected_finding: object | None = None,
+        **_: object,
+    ) -> None:
+        received_findings.append(selected_finding)
         seen.update(
             {
                 "resolve": hasattr(workspace, "resolve"),
@@ -376,9 +384,10 @@ def test_agent_receives_public_view_and_tools_hide_controller_workspace(tmp_path
         )
         workspace.write_text("fix.py", "repaired")  # type: ignore[attr-defined]
 
+    finding = _finding()
     controller = RemediationController(
         request=request,
-        selected_finding=_finding(),
+        selected_finding=finding,
         seed_root=seed,
         validation_executor=lambda _workspace: executor,
         subject_builder=lambda patch_digest: _subject(
@@ -399,6 +408,8 @@ def test_agent_receives_public_view_and_tools_hide_controller_workspace(tmp_path
         "controller_path": False,
         "tools_workspace": False,
     }
+    assert len(received_findings) == 1
+    assert received_findings[0] is finding
 
 
 def test_external_bound_executor_is_rejected(tmp_path: Path) -> None:

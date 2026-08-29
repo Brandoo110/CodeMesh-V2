@@ -550,6 +550,7 @@ class RemediationController:
             "request": self.request,
             "case_id": self.request.old_case_id,
             "finding_id": self.request.human_selected_finding_id,
+            "selected_finding": self.selected_finding,
             "attempt": attempt,
             "workspace": workspace.public_view(),
             "tools": tools,

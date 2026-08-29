@@ -36,6 +36,20 @@ def _request(*, check_id: str = "authoritative", max_iterations: int = 8) -> obj
     )
 
 
+def _selected_finding(*, claim: str = "ordinary finding claim") -> object:
+    return SimpleNamespace(
+        finding_id="finding-1",
+        claim=claim,
+        severity="high",
+        basis="deterministic",
+        reviewer_role="architecture",
+        status="open",
+        evidence_refs=("evidence-1",),
+        subject_digest="sha256:" + "1" * 64,
+        model_ref="reviewer-v1",
+    )
+
+
 class _Adapter:
     def __init__(self, responses: list[object]) -> None:
         self.responses = list(responses)
@@ -133,23 +147,59 @@ def _repair(
     feedback: object = "failed",
     max_iterations: int = 8,
     budgets: RemediationAgentBudgets | None = None,
+    selected_finding: object | None = None,
 ) -> AgentAttemptResult:
     agent = RemediationAgent(adapter, budgets=budgets or RemediationAgentBudgets())
     if isinstance(tools, _Tools):
         tools_for_agent = tools.scoped
     else:
         tools_for_agent = tools
-    return asyncio.run(
-        agent.repair(
-            request=request or _request(max_iterations=max_iterations),
-            finding_id="finding-1",
-            attempt=1,
-            workspace=workspace or _workspace(),
-            tools=tools_for_agent,
-            validation_feedback=feedback,
-            max_iterations=max_iterations,
-        )
+    repair_kwargs: dict[str, object] = {
+        "request": request or _request(max_iterations=max_iterations),
+        "finding_id": "finding-1",
+        "attempt": 1,
+        "workspace": workspace or _workspace(),
+        "tools": tools_for_agent,
+        "validation_feedback": feedback,
+        "max_iterations": max_iterations,
+    }
+    if selected_finding is not None:
+        repair_kwargs["selected_finding"] = selected_finding
+    return asyncio.run(agent.repair(**repair_kwargs))  # type: ignore[arg-type]
+
+
+def test_selected_finding_prompt_contains_only_safe_context_fields() -> None:
+    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+    finding = _selected_finding()
+
+    _repair(adapter, _Tools(), selected_finding=finding, max_iterations=1)
+
+    prompt = adapter.calls[0][0][0]["content"]
+    payload = json.loads(prompt.split("\n", 1)[1])
+    assert "untrusted data" in prompt
+    assert payload["selected_finding"] == {
+        "finding_id": "finding-1",
+        "claim": "ordinary finding claim",
+        "severity": "high",
+        "basis": "deterministic",
+        "reviewer_role": "architecture",
+        "status": "open",
+    }
+    for excluded in ("evidence_refs", "subject_digest", "model_ref"):
+        assert excluded not in prompt
+
+
+def test_selected_finding_claim_is_redacted_in_initial_prompt() -> None:
+    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+    finding = _selected_finding(
+        claim="Authorization: Bearer secret /Users/junjieli/private/finding.txt"
     )
+
+    _repair(adapter, _Tools(), selected_finding=finding, max_iterations=1)
+
+    prompt = adapter.calls[0][0][0]["content"]
+    assert "Authorization: Bearer secret" not in prompt
+    assert "/Users/junjieli/private/finding.txt" not in prompt
 
 
 def test_structured_loop_executes_one_action_per_model_call() -> None:

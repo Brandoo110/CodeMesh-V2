@@ -351,6 +351,24 @@ def _get_value(value: object, key: str) -> object:
     return getattr(value, key, None)
 
 
+def _safe_selected_finding(
+    finding: object,
+    budgets: RemediationAgentBudgets,
+) -> dict[str, object]:
+    limit = max(1, budgets.max_observation_bytes // 4)
+    return {
+        key: _safe_scalar(_get_value(finding, key), limit)
+        for key in (
+            "finding_id",
+            "claim",
+            "severity",
+            "basis",
+            "reviewer_role",
+            "status",
+        )
+    }
+
+
 def _safe_feedback(feedback: object, budgets: RemediationAgentBudgets) -> object:
     if feedback is None:
         return None
@@ -403,6 +421,7 @@ def _initial_message(
     *,
     request: object,
     finding_id: object,
+    selected_finding: object | None = None,
     attempt: object,
     workspace: object,
     validation_feedback: object,
@@ -429,6 +448,8 @@ def _initial_message(
         "attempt": _safe_scalar(attempt, 32),
         "validation_feedback": _safe_feedback(validation_feedback, budgets),
     }
+    if selected_finding is not None:
+        payload["selected_finding"] = _safe_selected_finding(selected_finding, budgets)
     # Keep each untrusted field bounded, but do not clip the complete message
     # here.  ``repair`` must be able to observe and reject an over-sized total
     # context instead of silently hiding part of the request.
@@ -628,6 +649,7 @@ class RemediationAgent:
         *,
         request: object,
         finding_id: str,
+        selected_finding: object | None = None,
         attempt: int,
         workspace: PublicWorkspaceView,
         tools: ScopedValidationTools,
@@ -652,6 +674,7 @@ class RemediationAgent:
                 "content": _initial_message(
                     request=request,
                     finding_id=finding_id,
+                    selected_finding=selected_finding,
                     attempt=attempt,
                     workspace=workspace,
                     validation_feedback=validation_feedback,
