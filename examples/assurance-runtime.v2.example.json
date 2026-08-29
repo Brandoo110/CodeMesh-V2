@@ -21,7 +21,7 @@
   "freshness_ttl_seconds": 300,
   "reviewer": {
     "provider": "deepseek",
-    "model_ref": "deepseek-chat",
+    "model_ref": "deepseek-v4-flash",
     "timeout_seconds": 60,
     "token_budget": 4096,
     "routing_rule": "single_general.v0:fixed"

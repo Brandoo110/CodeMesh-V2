@@ -176,14 +176,18 @@ applies to any remediation provider call.
    `cwd: "."`, replace the absolute runtime path placeholders, and replace
    `allowed_paths` with real paths from the target repository.
 
-   The example fixes the reviewer role to `deepseek`; this is the current
-   reviewer contract. The remediation role is explicitly `qwen` and has its
-   own model and policy. Replace its `workspace_grant.allowed_paths` with one
-   or more real, existing repository-relative paths in the target repository;
-   this field is not an absolute filesystem path. You may explicitly change
-   the remediation provider, including to `deepseek`, but a DeepSeek
-   remediation call requires your authorization for that invocation; it is
-   never a fallback or implicit route.
+   The example fixes the reviewer role to `deepseek` with model
+   `deepseek-v4-flash`, the current supported V2 quickstart option. For more
+   complex review, you may explicitly select `deepseek-v4-pro`. Legacy
+   DeepSeek model names are retired; see the [DeepSeek updates](https://api-docs.deepseek.com/updates/).
+   The remediation role is
+   explicitly `qwen` and has its own model and policy. Replace its
+   `workspace_grant.allowed_paths` with one or more real, existing
+   repository-relative paths in the target repository; this field is not an
+   absolute filesystem path. You may explicitly change the remediation
+   provider, including to `deepseek`, but a DeepSeek remediation call requires
+   your authorization for that invocation; it is never a fallback or implicit
+   route.
 
 2. Inject secrets only through the two environment variables below. Do not put
    keys in JSON, command arguments, shell history, or committed files:
