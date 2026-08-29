@@ -319,7 +319,107 @@ def test_decision_idempotency_replay_rechecks_live_freshness(tmp_path):
             {"decision_id": human.decision_id},
         )
 
-    assert _write_counts(repository, bundle.case.case_id) == before
+    assert _write_counts(repository, bundle.case.case_id) == (
+        before[0],
+        before[1] + 1,
+        before[2],
+    )
+    assert repository.get_change(bundle.case.case_id)["case"]["state"] == "INVALIDATED"
+
+
+def test_live_stale_detail_persists_idempotent_invalidation(tmp_path):
+    repository, bundle, root = _durable_run(tmp_path)
+    task_path = root / "repo" / "TASK.md"
+    original_task = task_path.read_text(encoding="utf-8")
+    task_path.write_text(original_task + "\nchanged before detail\n", encoding="utf-8")
+
+    before = _write_counts(repository, bundle.case.case_id)
+    detail = repository.get_change(bundle.case.case_id)
+    after_detail = _write_counts(repository, bundle.case.case_id)
+
+    assert after_detail == (before[0], before[1] + 1, before[2])
+    assert detail["case"]["state"] == "INVALIDATED"
+    assert detail["freshness"]["status"] == "STALE"
+    assert detail["timeline"][-1]["kind"] == "INVALIDATE"
+
+    passport = repository.get_passport(bundle.case.case_id)
+    assert passport["canonical"]["state"] == "INVALIDATED"
+    assert "State: **INVALIDATED**" in passport["markdown"]
+    assert _write_counts(repository, bundle.case.case_id) == after_detail
+
+    task_path.write_text(original_task, encoding="utf-8")
+    recovered = repository.get_change(bundle.case.case_id)
+    assert recovered["freshness"]["status"] == "FRESH"
+    assert recovered["case"]["state"] == "INVALIDATED"
+    assert _write_counts(repository, bundle.case.case_id) == after_detail
+
+
+def test_decision_replay_does_not_resurrect_persisted_invalidation(tmp_path):
+    repository, bundle, root = _durable_run(tmp_path)
+    human, event = _decision_args(bundle, suffix="resurrection")
+    repository.decide(
+        bundle.case.case_id,
+        human,
+        event,
+        "decision-live-resurrection",
+        {"decision_id": human.decision_id},
+    )
+
+    task_path = root / "repo" / "TASK.md"
+    original_task = task_path.read_text(encoding="utf-8")
+    task_path.write_text(original_task + "\nchanged before replay\n", encoding="utf-8")
+    stale = repository.get_change(bundle.case.case_id)
+    assert stale["case"]["state"] == "INVALIDATED"
+    before_replay = _write_counts(repository, bundle.case.case_id)
+
+    task_path.write_text(original_task, encoding="utf-8")
+    with pytest.raises(AssuranceWebConflictError, match="invalidated"):
+        repository.decide(
+            bundle.case.case_id,
+            human,
+            event,
+            "decision-live-resurrection",
+            {"decision_id": human.decision_id},
+        )
+
+    assert _write_counts(repository, bundle.case.case_id) == before_replay
+    recovered = repository.get_change(bundle.case.case_id)
+    assert recovered["freshness"]["status"] == "FRESH"
+    assert recovered["case"]["state"] == "INVALIDATED"
+    assert _write_counts(repository, bundle.case.case_id) == before_replay
+
+
+def test_live_stale_invalidation_avoids_existing_event_id(tmp_path):
+    repository, bundle, root = _durable_run(tmp_path)
+    base_event_id = f"live-freshness:{bundle.subject.subject_digest}:invalidate"
+    repository.collect(
+        bundle.case.case_id,
+        AcceptanceEvent(
+            event_id=base_event_id,
+            subject_digest=bundle.subject.subject_digest,
+            kind="COLLECT_EVIDENCE",
+            evidence_refs=(bundle.evidence[0].evidence_id,),
+            occurred_at=bundle.case.updated_at,
+        ),
+        None,
+        "freshness-colliding-event",
+        {"event_id": base_event_id},
+    )
+    task_path = root / "repo" / "TASK.md"
+    task_path.write_text(
+        task_path.read_text(encoding="utf-8") + "\nchanged after colliding event\n",
+        encoding="utf-8",
+    )
+
+    before = _write_counts(repository, bundle.case.case_id)
+    detail = repository.get_change(bundle.case.case_id)
+    after = _write_counts(repository, bundle.case.case_id)
+
+    assert after == (before[0], before[1] + 1, before[2])
+    assert detail["case"]["state"] == "INVALIDATED"
+    assert detail["timeline"][-1]["kind"] == "INVALIDATE"
+    assert detail["timeline"][-1]["id"].startswith(base_event_id)
+    assert detail["timeline"][-1]["id"] != base_event_id
 
 
 def test_product_run_dependencies_reject_database_only_repository(tmp_path):
@@ -411,10 +511,14 @@ def test_live_decision_fence_returns_409_without_writes(tmp_path, mutation):
         )
     after = _write_counts(repository, bundle.case.case_id)
 
-    assert after == before
+    expected_event_delta = 1 if mutation == "task" else 0
+    assert after == (before[0], before[1] + expected_event_delta, before[2])
     projection = repository.get_change(bundle.case.case_id)
     assert projection["freshness"]["reason_code"] == reason_code
     assert projection["case"]["human_decision_refs"] == []
+    assert projection["case"]["state"] == (
+        "INVALIDATED" if mutation == "task" else bundle.case.state
+    )
 
     app = create_app()
     app.dependency_overrides[get_assurance_repository] = lambda: repository

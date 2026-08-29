@@ -72,6 +72,15 @@ class AssuranceWebConflictError(AssuranceWebError):
 class AssuranceWebPreconditionError(AssuranceWebConflictError):
     """A live freshness/precondition fence rejected the operation."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        freshness: LiveFreshness | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.freshness = freshness
+
 
 class AssuranceWebNotFoundError(AssuranceWebError):
     """Case or supplemental resource does not exist."""
@@ -1520,6 +1529,10 @@ class AssuranceWebRepository:
                         self._require_live_freshness_in_transaction(
                             unit_of_work.connection, case_id
                         )
+                        if unit_of_work.load_case(case_id).case.state == "INVALIDATED":
+                            raise AssuranceWebConflictError(
+                                "decision replay cannot resurrect invalidated Case"
+                            )
                     return cached
                 change(unit_of_work)
                 result = self._projection_in_transaction(
@@ -1537,6 +1550,19 @@ class AssuranceWebRepository:
             raise AssuranceWebNotFoundError(
                 f"case {case_id!r} not found"
             ) from exc
+        except AssuranceWebPreconditionError as exc:
+            freshness = exc.freshness
+            if (
+                operation == "decide"
+                and freshness is not None
+                and freshness.status is FreshnessStatus.STALE
+            ):
+                self._persist_live_invalidation(
+                    case_id,
+                    reason_code=freshness.reason_code,
+                    checked_at=freshness.checked_at,
+                )
+            raise
 
     def get_evidence(self, case_id: str, evidence_id: str) -> dict:
         self._require_case(case_id)
@@ -1558,9 +1584,26 @@ class AssuranceWebRepository:
 
     def _projection(self, case_id: str, *, check_live: bool = True) -> dict:
         with self._store._transaction(write=False) as unit_of_work:
-            return self._projection_in_transaction(
+            projection = self._projection_in_transaction(
                 unit_of_work, case_id, check_live=check_live
             )
+        freshness = projection.get("freshness")
+        if (
+            self._live_required
+            and check_live
+            and isinstance(freshness, dict)
+            and freshness.get("status") == FreshnessStatus.STALE.value
+        ):
+            self._persist_live_invalidation(
+                case_id,
+                reason_code=freshness["reason_code"],
+                checked_at=datetime.fromisoformat(freshness["checked_at"]),
+            )
+            with self._store._transaction(write=False) as unit_of_work:
+                return self._projection_in_transaction(
+                    unit_of_work, case_id, check_live=check_live
+                )
+        return projection
 
     def _projection_in_transaction(
         self,
@@ -1700,7 +1743,44 @@ class AssuranceWebRepository:
         result = self._live_freshness_result(baseline)
         if result.status is not FreshnessStatus.FRESH:
             raise AssuranceWebPreconditionError(
-                "live freshness check did not pass: " + result.reason_code
+                "live freshness check did not pass: " + result.reason_code,
+                freshness=result,
+            )
+
+    def _persist_live_invalidation(
+        self,
+        case_id: str,
+        *,
+        reason_code: str,
+        checked_at: datetime,
+    ) -> None:
+        """Persist one deterministic INVALIDATE event for confirmed live STALE."""
+
+        with self._store._transaction() as unit_of_work:
+            state = unit_of_work.load_case(case_id)
+            if state.case.state == "INVALIDATED":
+                return
+            base_event_id = (
+                f"live-freshness:{state.case.subject_digest}:invalidate"
+            )
+            event_id = base_event_id
+            suffix = 0
+            used_event_ids = {event.event_id for event in state.applied_events}
+            while event_id in used_event_ids:
+                suffix += 1
+                event_id = f"{base_event_id}:{suffix}"
+            event = AcceptanceEvent(
+                event_id=event_id,
+                subject_digest=state.case.subject_digest,
+                kind="INVALIDATE",
+                reason=f"live_freshness:{reason_code}",
+                occurred_at=max(checked_at, state.case.updated_at),
+            )
+            next_state = unit_of_work.append_event(case_id, event)
+            self._touch_web_case(
+                unit_of_work.connection,
+                case_id,
+                next_state.case.updated_at,
             )
 
     def _render_projection(
