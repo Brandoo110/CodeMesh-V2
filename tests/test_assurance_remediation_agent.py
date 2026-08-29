@@ -10,6 +10,7 @@ import pytest
 from assurance.remediation import AgentAttemptResult
 from assurance.remediation_agent import (
     RemediationAgent,
+    RemediationAgentActionSchemaError,
     RemediationAgentBudgets,
     RemediationAgentBudgetError,
     RemediationAgentProtocolError,
@@ -169,7 +170,7 @@ def _repair(
 
 
 def test_selected_finding_prompt_contains_only_safe_context_fields() -> None:
-    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+    adapter = _Adapter(['{"action":"write","path":"fix.py","content":"new"}'])
     finding = _selected_finding()
 
     _repair(adapter, _Tools(), selected_finding=finding, max_iterations=1)
@@ -190,7 +191,7 @@ def test_selected_finding_prompt_contains_only_safe_context_fields() -> None:
 
 
 def test_selected_finding_claim_is_redacted_in_initial_prompt() -> None:
-    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+    adapter = _Adapter(['{"action":"write","path":"fix.py","content":"new"}'])
     finding = _selected_finding(
         claim="Authorization: Bearer secret /Users/junjieli/private/finding.txt"
     )
@@ -202,63 +203,70 @@ def test_selected_finding_claim_is_redacted_in_initial_prompt() -> None:
     assert "/Users/junjieli/private/finding.txt" not in prompt
 
 
-def test_system_prompt_prioritizes_bounded_single_file_repair() -> None:
-    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+def test_system_prompt_exposes_only_observation_and_mutation_actions() -> None:
+    adapter = _Adapter(['{"action":"write","path":"fix.py","content":"new"}'])
 
     _repair(adapter, _Tools(), max_iterations=1)
 
     system_prompt = " ".join(adapter.calls[0][1].split()).casefold()
-    assert "known single-file path: skip list" in system_prompt
-    assert "read, edit once, validate, finalize after pass" in system_prompt
+    assert '"action":"list"' in system_prompt
+    assert '"action":"read"' in system_prompt
+    assert '"action":"replace"' in system_prompt
+    assert '"action":"write"' in system_prompt
+    assert '"action":"run_validation"' not in system_prompt
+    assert '"action":"finalize"' not in system_prompt
 
 
-def test_structured_loop_executes_one_action_per_model_call() -> None:
-    class Adapter:
-        def __init__(self) -> None:
-            self.responses = [
-                '{"action":"list"}',
-                '{"action":"read","path":"fix.py"}',
-                '{"action":"replace","path":"fix.py","old_text":"old","new_text":"new"}',
-                '{"action":"write","path":"fix.py","content":"newer"}',
-                '{"action":"run_validation","check_id":"authoritative"}',
-                '{"action":"finalize","summary":"done"}',
-            ]
-            self.calls: list[tuple[list[dict[str, str]], str]] = []
-
-        async def complete(
-            self, messages: list[dict[str, str]], system: str = ""
-        ) -> str:
-            self.calls.append(([dict(message) for message in messages], system))
-            return self.responses.pop(0)
-
-    adapter = Adapter()
+@pytest.mark.parametrize(
+    ("response", "tool_names"),
+    (
+        (
+            '{"action":"replace","path":"fix.py","old_text":"old",'
+            '"new_text":"new"}',
+            ("read", "write"),
+        ),
+        ('{"action":"write","path":"fix.py","content":"new"}', ("write",)),
+    ),
+)
+def test_successful_mutation_is_terminal_and_uses_fixed_summary(
+    response: str,
+    tool_names: tuple[str, ...],
+) -> None:
+    adapter = _Adapter([response, '{"action":"read","path":"fix.py"}'])
     tools = _Tools()
-    workspace = _workspace()
-    request = _request(max_iterations=6)
 
-    result = _repair(
-        adapter,
-        tools,
-        workspace=workspace,
-        request=request,
-        max_iterations=6,
-    )
+    result = _repair(adapter, tools, max_iterations=6)
 
     assert type(result) is AgentAttemptResult
-    assert result.iterations == 6
-    assert [call[0] for call in tools.calls] == [
-        "list",
-        "read",
-        "read",
-        "write",
-        "write",
-        "validate",
-    ]
-    assert "fix.py" in adapter.calls[1][0][-1]["content"]
-    assert "old" in adapter.calls[2][0][-1]["content"]
-    assert "edited" in adapter.calls[3][0][-1]["content"]
-    assert "wrote" in adapter.calls[4][0][-1]["content"]
-    assert "untrusted" in adapter.calls[1][1].lower()
+    assert result.iterations == 1
+    assert result.summary == "mutation_applied"
+    assert len(adapter.calls) == 1
+    assert [name for name, _ in tools.calls] == list(tool_names)
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        '{"action":"run_validation","check_id":"authoritative"}',
+        '{"action":"finalize","summary":"done"}',
+    ),
+)
+def test_deprecated_actions_are_rejected_by_schema(response: str) -> None:
+    adapter = _Adapter([response])
+    tools = _Tools()
+
+    with pytest.raises(RemediationAgentActionSchemaError):
+        _repair(adapter, tools, max_iterations=1)
+
+    assert len(adapter.calls) == 1
+    assert tools.calls == []
+
+
+def test_deprecated_action_classes_are_not_exported() -> None:
+    import assurance.remediation_agent as remediation_agent
+
+    assert not hasattr(remediation_agent, "RunValidationAction")
+    assert not hasattr(remediation_agent, "FinalizeAction")
 
 
 @pytest.mark.parametrize(
@@ -304,19 +312,6 @@ def test_invalid_response_is_rejected_before_any_tool(
             None,
             "RemediationAgentActionPolicyError",
         ),
-        (
-            [
-                '{"action":"write","path":"fix.py","content":"new"}',
-                '{"action":"write","path":"fix.py","content":"new"}',
-            ],
-            None,
-            "RemediationAgentRepeatedActionError",
-        ),
-        (
-            ['{"action":"run_validation","check_id":"authoritative"}'],
-            _request(check_id=None),
-            "RemediationAgentInternalProtocolError",
-        ),
     ),
 )
 def test_protocol_failures_use_specific_safe_subclasses(
@@ -341,7 +336,7 @@ def test_protocol_failures_use_specific_safe_subclasses(
 def test_model_adapter_surface_is_complete_only() -> None:
     class CompleteOnlyAdapter:
         def __init__(self) -> None:
-            self.responses = ['{"action":"finalize","summary":"done"}']
+            self.responses = ['{"action":"write","path":"fix.py","content":"new"}']
             self.complete_calls = 0
 
         def __getattribute__(self, name: str) -> object:
@@ -434,34 +429,6 @@ def test_old_text_non_unique_and_workspace_quota_errors_propagate() -> None:
         _repair(quota_adapter, quota_tools, max_iterations=1)
 
 
-def test_unauthorized_validation_does_not_call_validation_tool() -> None:
-    adapter = _Adapter(['{"action":"run_validation","check_id":"other"}'])
-    tools = _Tools()
-
-    with pytest.raises(RemediationAgentProtocolError):
-        _repair(adapter, tools, max_iterations=1)
-
-    assert tools.calls == []
-
-
-def test_validation_budget_and_duplicate_action_both_fail_closed() -> None:
-    # The repeated identical action is rejected before a third validation can
-    # reach the tool surface.
-    adapter = _Adapter(
-        [
-            '{"action":"run_validation","check_id":"authoritative"}',
-            '{"action":"list"}',
-            '{"action":"run_validation","check_id":"authoritative"}',
-        ]
-    )
-    tools = _Tools()
-
-    with pytest.raises(RemediationAgentProtocolError, match="repeated"):
-        _repair(adapter, tools, max_iterations=3)
-
-    assert [name for name, _ in tools.calls] == ["validate", "list"]
-
-
 def test_oversized_response_and_content_are_rejected_without_tool() -> None:
     budgets = RemediationAgentBudgets(
         max_response_bytes=64,
@@ -518,7 +485,7 @@ def test_observation_and_next_prompt_are_clipped_and_redacted() -> None:
     adapter = _Adapter(
         [
             '{"action":"read","path":"fix.py"}',
-            '{"action":"finalize","summary":"done"}',
+            '{"action":"write","path":"fix.py","content":"new"}',
         ]
     )
     tools = _Tools()
@@ -548,7 +515,7 @@ def test_oversized_initial_context_fails_before_model_call() -> None:
         max_content_bytes=128,
         max_summary_bytes=32,
     )
-    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+    adapter = _Adapter(['{"action":"list"}'])
     tools = _Tools()
     paths = tuple(f"file-{index}-" + "x" * 100 for index in range(8))
 
@@ -568,12 +535,12 @@ def test_oversized_loop_context_uses_context_budget_error() -> None:
     budgets = RemediationAgentBudgets(
         max_response_bytes=1024,
         max_observation_bytes=64,
-        max_context_bytes=1400,
+        max_context_bytes=1300,
         max_action_bytes=512,
         max_content_bytes=128,
         max_summary_bytes=32,
     )
-    adapter = _Adapter(['{"action":"list"}', '{"action":"finalize","summary":"done"}'])
+    adapter = _Adapter(['{"action":"list"}', '{"action":"read","path":"fix.py"}'])
     tools = _Tools()
 
     with pytest.raises(RemediationAgentBudgetError, match="context") as raised:
@@ -584,72 +551,22 @@ def test_oversized_loop_context_uses_context_budget_error() -> None:
     assert [name for name, _ in tools.calls] == ["list"]
 
 
-def test_repeated_action_and_max_iterations_do_not_loop_forever() -> None:
-    repeated_adapter = _Adapter(
-        [
-            '{"action":"write","path":"fix.py","content":"new"}',
-            '{"action":"write","path":"fix.py","content":"new"}',
-            '{"action":"write","path":"fix.py","content":"new"}',
-        ]
-    )
-    repeated_tools = _Tools()
-    with pytest.raises(RemediationAgentProtocolError, match="repeated"):
-        _repair(repeated_adapter, repeated_tools, max_iterations=3)
-    assert len(repeated_adapter.calls) == 2
-    assert [name for name, _ in repeated_tools.calls] == ["write"]
-
-    limited_adapter = _Adapter(
+def test_repeated_observations_and_max_iterations_do_not_loop_forever() -> None:
+    adapter = _Adapter(
         [
             '{"action":"list"}',
             '{"action":"read","path":"fix.py"}',
             '{"action":"list"}',
         ]
     )
-    limited_tools = _Tools()
+    tools = _Tools()
+
     with pytest.raises(RemediationAgentBudgetError, match="iteration") as raised:
-        _repair(limited_adapter, limited_tools, max_iterations=2)
+        _repair(adapter, tools, max_iterations=2)
+
     assert type(raised.value).__name__ == "RemediationAgentIterationBudgetError"
-    assert len(limited_adapter.calls) == 2
-    assert [name for name, _ in limited_tools.calls] == ["list", "read"]
-
-
-@pytest.mark.parametrize(
-    ("action", "tool_name"),
-    (
-        ('{"action":"list"}', "list"),
-        ('{"action":"read","path":"fix.py"}', "read"),
-    ),
-)
-def test_repeated_observation_actions_can_finalize_within_iteration_cap(
-    action: str,
-    tool_name: str,
-) -> None:
-    adapter = _Adapter(
-        [action, action, '{"action":"finalize","summary":"done"}']
-    )
-    tools = _Tools()
-
-    result = _repair(adapter, tools, max_iterations=3)
-
-    assert result.iterations == 3
-    assert [name for name, _ in tools.calls] == [tool_name, tool_name]
-
-
-def test_finalize_without_mutation_returns_safe_truncated_result() -> None:
-    adapter = _Adapter(
-        ['{"action":"finalize","summary":"Authorization: Bearer hidden"}']
-    )
-    tools = _Tools()
-    result = _repair(
-        adapter,
-        tools,
-        max_iterations=1,
-        budgets=RemediationAgentBudgets(max_summary_bytes=12),
-    )
-
-    assert result.iterations == 1
-    assert "hidden" not in result.summary
-    assert tools.calls == []
+    assert len(adapter.calls) == 2
+    assert [name for name, _ in tools.calls] == ["list", "read"]
 
 
 def test_adapter_exception_is_not_wrapped_or_prompted() -> None:
@@ -681,7 +598,7 @@ def test_dangerous_duck_tool_is_rejected_at_repair_entry() -> None:
         async def run_validation(self, check_id: str) -> str:
             raise AssertionError("duck tool must not be called")
 
-    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+    adapter = _Adapter(['{"action":"list"}'])
     with pytest.raises(TypeError, match="ScopedValidationTools"):
         asyncio.run(
             RemediationAgent(adapter).repair(
@@ -711,7 +628,7 @@ def test_replace_empty_old_text_is_rejected_before_tool() -> None:
 def test_iteration_limits_are_strict_and_reject_model_copy_tampering(
     policy_limit: object,
 ) -> None:
-    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+    adapter = _Adapter(['{"action":"list"}'])
     tools = _Tools()
     request = _request(max_iterations=3)
     request.policy.max_agent_iterations = policy_limit
@@ -729,14 +646,15 @@ def test_iteration_limit_uses_strict_minimum_of_controller_and_policy() -> None:
             '{"action":"list"}',
             '{"action":"read","path":"fix.py"}',
             '{"action":"write","path":"fix.py","content":"new"}',
-            '{"action":"finalize","summary":"too late"}',
+            '{"action":"read","path":"fix.py"}',
         ]
     )
     tools = _Tools()
     request = _request(max_iterations=3)
 
-    with pytest.raises(RemediationAgentBudgetError, match="iteration"):
-        _repair(adapter, tools, request=request, max_iterations=4)
+    result = _repair(adapter, tools, request=request, max_iterations=4)
+    assert result.iterations == 3
+    assert result.summary == "mutation_applied"
     assert len(adapter.calls) == 3
     assert [name for name, _ in tools.calls] == ["list", "read", "write"]
 
@@ -755,7 +673,7 @@ def test_nonfinite_structured_observation_is_stably_redacted() -> None:
     adapter = _Adapter(
         [
             '{"action":"read","path":"fix.py"}',
-            '{"action":"finalize","summary":"done"}',
+            '{"action":"write","path":"fix.py","content":"new"}',
         ]
     )
     tools = _Tools()

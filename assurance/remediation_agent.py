@@ -148,24 +148,12 @@ class WriteAction(_StrictAction):
     content: StrictStr
 
 
-class RunValidationAction(_StrictAction):
-    action: Literal["run_validation"]
-    check_id: StrictStr = Field(min_length=1)
-
-
-class FinalizeAction(_StrictAction):
-    action: Literal["finalize"]
-    summary: StrictStr = Field(min_length=0)
-
-
 RemediationAction: TypeAlias = Annotated[
     Union[
         ListAction,
         ReadAction,
         ReplaceAction,
         WriteAction,
-        RunValidationAction,
-        FinalizeAction,
     ],
     Field(discriminator="action"),
 ]
@@ -185,14 +173,11 @@ action schema.  Do not use Markdown fences, prose, comments, or extra JSON
 fields.  The only actions are: {"action":"list"};
 {"action":"read","path":"..."};
 {"action":"replace","path":"...","old_text":"...","new_text":"..."};
-{"action":"write","path":"...","content":"..."};
-{"action":"run_validation","check_id":"..."}; and
-{"action":"finalize","summary":"..."}.
+{"action":"write","path":"...","content":"..."}.
 
-Paths must be canonical relative paths.  Validation accepts only the
-server-authorized check ID supplied in the request context.  Use one action at
-a time and wait for the next untrusted observation before choosing another.
-Known single-file path: skip list; read, edit once, validate, finalize after pass.
+Paths must be canonical relative paths.  Use list/read for observation, then
+submit at most one replace/write mutation.  A successful mutation is terminal;
+the controller owns authoritative validation and review after the agent exits.
 """
 
 
@@ -504,41 +489,6 @@ def _stringify_observation(value: object) -> str:
         return str(value)
 
 
-def _safe_validation_observation(value: object, budgets: RemediationAgentBudgets) -> str:
-    raw = _stringify_observation(value)
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return _safe_text(raw, budgets.max_observation_bytes)
-    if not isinstance(parsed, Mapping):
-        return _safe_text(raw, budgets.max_observation_bytes)
-    allowed = (
-        "check_id",
-        "status",
-        "reason_code",
-        "exit_code",
-        "duration_ms",
-        "truncated",
-        "failure_fingerprint",
-        "stdout_tail",
-        "stderr_tail",
-    )
-    filtered = {
-        key: _safe_scalar(parsed[key], max(1, budgets.max_observation_bytes // 4))
-        for key in allowed
-        if key in parsed
-    }
-    if not filtered:
-        return _safe_text(raw, budgets.max_observation_bytes)
-    return json.dumps(
-        filtered,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-
-
 def _observation_message(
     action: RemediationAction,
     result: object,
@@ -561,8 +511,6 @@ def _observation_message(
             )
         else:
             text = _safe_text(result, budgets.max_observation_bytes)
-    elif isinstance(action, RunValidationAction):
-        text = _safe_validation_observation(result, budgets)
     else:
         text = _safe_text(_stringify_observation(result), budgets.max_observation_bytes)
     wrapped = "<untrusted_observation>\n" + text + "\n</untrusted_observation>"
@@ -580,23 +528,11 @@ async def _call_tool(tools: object, name: str, *args: object) -> object:
         result = tools.edit_file(args[0], args[1], args[2])
     elif name == "write_file":
         result = tools.write_file(args[0], args[1])
-    elif name == "run_validation":
-        result = tools.run_validation(args[0])
     else:
         raise RemediationAgentInternalProtocolError("unsupported tool operation")
     if inspect.isawaitable(result):
         return await result
     return result
-
-
-def _authoritative_check_id(request: object) -> str:
-    policy = _get_value(request, "policy")
-    check_id = _get_value(policy, "authoritative_check_id")
-    if type(check_id) is not str or not check_id:
-        raise RemediationAgentInternalProtocolError(
-            "request has no server-authorized check ID"
-        )
-    return check_id
 
 
 def _strict_positive_int(value: object, label: str) -> int:
@@ -624,7 +560,6 @@ def _validate_action_budget(
 async def _execute_action(
     action: RemediationAction,
     *,
-    request: object,
     tools: object,
 ) -> object:
     if type(tools) is not ScopedValidationTools:
@@ -640,14 +575,6 @@ async def _execute_action(
     if isinstance(action, WriteAction):
         path = _canonical_action_path(action.path)
         return await _call_tool(tools, "write_file", path, action.content)
-    if isinstance(action, RunValidationAction):
-        if action.check_id != _authoritative_check_id(request):
-            raise RemediationAgentActionPolicyError(
-                "validation check is not authorized"
-            )
-        return await _call_tool(tools, "run_validation", action.check_id)
-    if isinstance(action, FinalizeAction):
-        return None
     raise RemediationAgentInternalProtocolError("unsupported remediation action")
 
 
@@ -683,7 +610,7 @@ class RemediationAgent:
         validation_feedback: object,
         max_iterations: int,
     ) -> AgentAttemptResult:
-        """Run bounded model/action turns until an explicit ``finalize``."""
+        """Run bounded observation turns until one successful mutation."""
 
         if type(tools) is not ScopedValidationTools:
             raise TypeError("tools must be an exact ScopedValidationTools")
@@ -735,13 +662,13 @@ class RemediationAgent:
                     )
                 seen_actions.add(digest)
 
-            if isinstance(action, FinalizeAction):
+            result = await _execute_action(action, tools=tools)
+            if isinstance(action, (ReplaceAction, WriteAction)):
                 return AgentAttemptResult(
-                    summary=_safe_text(action.summary, self._budgets.max_summary_bytes),
+                    summary="mutation_applied",
                     iterations=iterations,
                 )
 
-            result = await _execute_action(action, request=request, tools=tools)
             messages.append(
                 {
                     "role": "assistant",
@@ -777,7 +704,6 @@ __all__ = [
     "AgentBudgets",
     "AgentLoopBudgets",
     "DEFAULT_AGENT_BUDGETS",
-    "FinalizeAction",
     "ListAction",
     "JsonRemediationAgent",
     "ReadAction",
@@ -800,7 +726,6 @@ __all__ = [
     "RemediationAgentResponseBudgetError",
     "RemediationAgentResponseError",
     "ReplaceAction",
-    "RunValidationAction",
     "StructuredRemediationAgent",
     "SYSTEM_PROMPT",
     "WorkspaceRemediationAgent",

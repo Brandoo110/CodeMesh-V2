@@ -20,6 +20,7 @@ from assurance.remediation import (
     ReviewerRerunReceipt,
     PreparedRemediationHandoff,
 )
+from assurance.remediation_agent import RemediationAgent
 from assurance.remediation_validation import (
     ValidationCheck,
     ValidationExecutor,
@@ -227,6 +228,59 @@ def test_baseline_pass_is_noop_and_does_not_build_subject(tmp_path: Path) -> Non
     assert result.rerun_roles == ()
     assert built == []
     assert executor.calls == [("authoritative", "controller")]
+
+
+def test_real_agent_mutation_returns_to_controller_validation_then_reviewer(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "fix.py").write_text("old", encoding="utf-8")
+    request = _request(_grant("fix.py"), _policy(max_attempts=1))
+    executor = _FakeExecutor([ValidationStatus.FAILED, ValidationStatus.PASSED])
+
+    class MutationAdapter:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[dict[str, str]], str]] = []
+
+        async def complete(
+            self, messages: list[dict[str, str]], system: str = ""
+        ) -> str:
+            self.calls.append(([dict(message) for message in messages], system))
+            return '{"action":"write","path":"fix.py","content":"repaired"}'
+
+    adapter = MutationAdapter()
+    reviewer_calls: list[dict[str, object]] = []
+
+    def reviewer(**kwargs: object) -> None:
+        reviewer_calls.append(kwargs)
+        return None
+
+    controller = RemediationController(
+        request=request,
+        selected_finding=_finding(),
+        seed_root=seed,
+        validation_executor=lambda _workspace: executor,
+        subject_builder=lambda patch_digest: _subject(
+            diff=patch_digest.removeprefix("sha256:"), head="new-head"
+        ),
+        reviewer_rerunner=reviewer,
+    )
+
+    result = _run(controller, RemediationAgent(adapter))
+
+    assert result.status is RemediationStatus.BLOCKED
+    assert result.reason_code == "reviewer_subject_mismatch"
+    assert len(adapter.calls) == 1
+    assert executor.calls == [
+        ("authoritative", "controller"),
+        ("authoritative", "controller"),
+    ]
+    assert len(reviewer_calls) == 1
+    assert reviewer_calls[0]["reviewer_role"] == "architecture"
+    assert reviewer_calls[0]["subject_digest"] == compute_subject_digest(
+        reviewer_calls[0]["subject_input"]
+    )
 
 
 def test_attempt_budget_is_fixed_and_does_not_prepare_transition(tmp_path: Path) -> None:
