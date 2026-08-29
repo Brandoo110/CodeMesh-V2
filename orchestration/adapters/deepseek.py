@@ -41,10 +41,12 @@ class DeepSeekAdapter:
         api_key: str | None = None,
         model: str | None = None,
         base_url: str = "https://api.deepseek.com/v1",
+        json_mode: bool = False,
     ):
         self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
         # 优先看 env，方便 .env 切换；默认 V4 Pro
         self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+        self.json_mode = json_mode
         self.client = AsyncOpenAI(api_key=self.api_key, base_url=base_url)
         # 初始化为 0，调用后更新
         self.last_usage = Usage()
@@ -62,13 +64,21 @@ class DeepSeekAdapter:
         401 / 400 等 deterministic 错误立刻抛。
         """
         full = self._build_messages(messages, system)
+        request_kwargs = {
+            "model": self.model,
+            "messages": full,
+            "temperature": 0 if self.json_mode else 0.3,
+        }
+        if self.json_mode:
+            request_kwargs.update(
+                {
+                    "response_format": {"type": "json_object"},
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                }
+            )
 
         async def _call():
-            return await self.client.chat.completions.create(
-                model=self.model,
-                messages=full,  # type: ignore[arg-type]
-                temperature=0.3,
-            )
+            return await self.client.chat.completions.create(**request_kwargs)
 
         resp = await async_retry(_call)
         # 记录 token 数，方便成本层算账

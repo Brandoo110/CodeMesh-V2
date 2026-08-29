@@ -475,7 +475,11 @@ def _default_remediation_adapter_factory(
     elif provider == "minimax":
         adapter = MiniMaxAdapter(api_key=api_key, model=model_ref)
     elif provider == "deepseek":
-        adapter = DeepSeekAdapter(api_key=api_key, model=model_ref)
+        adapter = DeepSeekAdapter(
+            api_key=api_key,
+            model=model_ref,
+            json_mode=True,
+        )
     else:
         raise ValueError("remediation provider is not supported")
     if not isinstance(adapter, ModelAdapter):

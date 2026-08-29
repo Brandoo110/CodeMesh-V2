@@ -2,12 +2,14 @@ import asyncio
 import json
 from pathlib import Path
 import re
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 import web.assurance_runtime as runtime_module
+import orchestration.adapters.deepseek as deepseek_module
 from assurance.artifacts import ArtifactStore
 from assurance.fixed_reviewer_invoker import FixedOpenAICompatibleReviewerInvoker
 from assurance.reviewer_context import SafeReviewerContextBuilder
@@ -18,6 +20,7 @@ from web.assurance_runtime import (
     AssuranceRuntimeStartupError,
     load_assurance_runtime_from_environment,
 )
+from orchestration.adapters import DeepSeekAdapter
 from web.routes.assurance_runs import get_assurance_run_client
 from web.server import create_app
 from tests.test_assurance_run_service import _repository
@@ -306,6 +309,99 @@ def test_v2_explicit_remediation_provider_uses_dedicated_secret_and_closes_once(
     asyncio.run(runtime.aclose())
     asyncio.run(runtime.aclose())
     assert close_calls == [True]
+
+
+def test_deepseek_complete_defaults_and_json_mode_use_exact_request_kwargs(
+    monkeypatch,
+):
+    calls = []
+
+    class _FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"ok":true}')
+                    )
+                ],
+            )
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+    monkeypatch.setattr(deepseek_module, "AsyncOpenAI", _FakeClient)
+    messages = [{"role": "user", "content": "return json"}]
+
+    default = DeepSeekAdapter(api_key="secret", model="deepseek-chat")
+    structured = DeepSeekAdapter(
+        api_key="secret", model="deepseek-chat", json_mode=True
+    )
+    assert asyncio.run(default.complete(messages, system="system")) == '{"ok":true}'
+    assert asyncio.run(structured.complete(messages, system="system")) == '{"ok":true}'
+
+    expected_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "return json"},
+    ]
+    assert calls == [
+        {
+            "model": "deepseek-chat",
+            "messages": expected_messages,
+            "temperature": 0.3,
+        },
+        {
+            "model": "deepseek-chat",
+            "messages": expected_messages,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "extra_body": {"thinking": {"type": "disabled"}},
+        },
+    ]
+
+
+def test_default_remediation_factory_enables_json_mode_only_for_deepseek(
+    monkeypatch,
+):
+    calls = []
+
+    class _FakeAdapter:
+        name = "fake"
+
+        def __init__(self, **kwargs):
+            self.last_usage = object()
+            self.kwargs = kwargs
+            calls.append(kwargs)
+
+        async def complete(self, messages, system=""):
+            return ""
+
+        async def complete_stream(self, messages, system=""):
+            if False:
+                yield ""
+
+    monkeypatch.setattr(runtime_module, "DeepSeekAdapter", _FakeAdapter)
+    monkeypatch.setattr(runtime_module, "DashScopeAdapter", _FakeAdapter)
+
+    deepseek = runtime_module._default_remediation_adapter_factory(
+        "deepseek", "repair-model", "dedicated-secret"
+    )
+    qwen = runtime_module._default_remediation_adapter_factory(
+        "qwen", "repair-model", "dedicated-secret"
+    )
+
+    assert deepseek.kwargs == {
+        "api_key": "dedicated-secret",
+        "model": "repair-model",
+        "json_mode": True,
+    }
+    assert qwen.kwargs == {
+        "api_key": "dedicated-secret",
+        "model": "repair-model",
+    }
+    assert calls == [deepseek.kwargs, qwen.kwargs]
 
 
 def test_remediation_source_root_accepts_posix_path_and_rejects_prefix_and_symlink(
