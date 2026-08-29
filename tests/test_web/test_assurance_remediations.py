@@ -12,6 +12,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from assurance.contracts import PolicyDecision
+from assurance.remediation import (
+    PreparedRemediationHandoff,
+    RemediationResult,
+    RemediationStatus,
+)
 from web.assurance_remediation import (
     AssuranceRemediationRequest,
     AssuranceRemediationService,
@@ -154,6 +159,102 @@ def test_configured_remediation_post_commits_and_replays_without_reprepare(
     assert replay.json()["receipt"] == first.json()["receipt"]
     assert replay.json()["case_view"]["case"]["state"] == "DRAFT"
     assert prepare_calls == [request.remediation_id]
+
+
+def test_non_success_remediation_post_is_not_applied_without_commit(
+    tmp_path, monkeypatch
+):
+    repository, _, _, request, _ = _seed_remediation(tmp_path, monkeypatch)
+    non_success = RemediationResult(
+        remediation_id=request.remediation_id,
+        human_selected_finding_id=request.human_selected_finding_id,
+        status=RemediationStatus.FAILED,
+        reason_code="secret:/tmp/internal",
+        old_case_id=request.old_case_id,
+        old_subject_digest=request.old_subject_digest,
+        attempts=0,
+        validation_calls=1,
+    )
+    handoff = PreparedRemediationHandoff(result=non_success)
+    prepare_calls = []
+    commit_calls = []
+    original_commit = repository.commit_prepared_remediation
+
+    def request_factory(context, intent, **_):
+        return request
+
+    async def prepare_callback(request, context):
+        prepare_calls.append(request.remediation_id)
+        return handoff
+
+    def commit_prepared_remediation(*args, **kwargs):
+        commit_calls.append((args, kwargs))
+        return original_commit(*args, **kwargs)
+
+    repository.commit_prepared_remediation = commit_prepared_remediation
+    service = AssuranceRemediationService(
+        repository,
+        request_factory=request_factory,
+        prepare_callback=prepare_callback,
+    )
+    app = create_app(
+        assurance_run_dependencies=AssuranceRunWebDependencies(
+            service=object(),
+            repository=repository,
+            remediation_service=service,
+        )
+    )
+    app.dependency_overrides[get_assurance_run_client] = lambda: "127.0.0.1"
+    payload = {
+        "remediation_id": request.remediation_id,
+        "human_selected_finding_id": request.human_selected_finding_id,
+        "requested_by": request.requested_by,
+        "requested_at": request.requested_at.isoformat(),
+    }
+    tables = (
+        "assurance_cases",
+        "assurance_case_events",
+        "assurance_web_cases",
+        "assurance_web_runs",
+        "assurance_remediations",
+        "assurance_web_idempotency",
+    )
+
+    def snapshot():
+        return {
+            table: [
+                tuple(row)
+                for row in _db_rows(repository, f"SELECT * FROM {table} ORDER BY rowid")
+            ]
+            for table in tables
+        }
+
+    before = snapshot()
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/assurance/changes/{request.old_case_id}/remediations",
+                headers={"Idempotency-Key": "remediate:not-applied"},
+                json=payload,
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert "secret:/tmp/internal" not in response.text
+    assert response.json() == {
+        "code": "ASSURANCE_REMEDIATION_NOT_APPLIED",
+        "message": "assurance remediation was not applied",
+        "reason_codes": [
+            "REMEDIATION_NOT_APPLIED",
+            RemediationStatus.FAILED.value,
+            "PREPARATION_NOT_APPLIED",
+        ],
+    }
+    assert prepare_calls == [request.remediation_id]
+    assert commit_calls == []
+    assert snapshot() == before
 
 
 def test_direct_remediation_post_rejects_policy_pass_before_prepare(

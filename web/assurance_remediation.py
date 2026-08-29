@@ -29,6 +29,7 @@ from assurance.remediation import (
     PreparedRemediationHandoff,
     RemediationPolicy,
     RemediationRequest,
+    RemediationStatus,
 )
 from assurance.remediation_workspace import WorkspaceGrant
 from web.assurance_store import (
@@ -130,6 +131,15 @@ class AssuranceRemediationValidationError(
 
 class AssuranceRemediationPreparationError(AssuranceRemediationError):
     """The injected preparation seam failed before any repository write."""
+
+
+class AssuranceRemediationNotAppliedError(AssuranceRemediationError):
+    """Preparation completed without a successful bundle to persist."""
+
+    def __init__(self, *, status: RemediationStatus, reason_code: str) -> None:
+        self.status = status
+        self.reason_code = reason_code
+        super().__init__("assurance remediation was not applied")
 
 
 def _filtered_kwargs(
@@ -428,6 +438,14 @@ class AssuranceRemediationService:
             raise AssuranceRemediationValidationError(
                 "prepare callback must return an exact PreparedRemediationHandoff"
             )
+        if (
+            prepared.result.status is not RemediationStatus.SUCCEEDED
+            or prepared.bundle is None
+        ):
+            raise AssuranceRemediationNotAppliedError(
+                status=prepared.result.status,
+                reason_code=prepared.result.reason_code,
+            )
 
         receipt = await _invoke(
             self.repository.commit_prepared_remediation,
@@ -475,6 +493,7 @@ __all__ = [
     "AssuranceRemediationConfig",
     "AssuranceRemediationError",
     "AssuranceRemediationNotConfiguredError",
+    "AssuranceRemediationNotAppliedError",
     "AssuranceRemediationPreparationError",
     "AssuranceRemediationRequest",
     "AssuranceRemediationResult",

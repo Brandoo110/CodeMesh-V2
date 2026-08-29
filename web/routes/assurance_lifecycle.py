@@ -27,6 +27,7 @@ from assurance.lifecycle_store import RemediationCommitReceipt
 from web.assurance_remediation import (
     AssuranceRemediationError,
     AssuranceRemediationNotConfiguredError,
+    AssuranceRemediationNotAppliedError,
     AssuranceRemediationPreparationError,
     AssuranceRemediationRequest,
     AssuranceRemediationResult,
@@ -50,6 +51,29 @@ from web.routes.assurance_runs import (
 
 
 router = APIRouter(prefix="/assurance", tags=["assurance-lifecycle"])
+
+
+_REMEDIATION_NOT_APPLIED_REASON_CODES = {
+    "initial_validation_passed": "INITIAL_VALIDATION_PASSED",
+    "total_wall_time_exhausted": "TOTAL_WALL_TIME_EXHAUSTED",
+    "agent_timeout": "AGENT_TIMEOUT",
+    "agent_iteration_budget_exhausted": "AGENT_ITERATION_BUDGET_EXHAUSTED",
+    "no_workspace_change": "NO_WORKSPACE_CHANGE",
+    "max_repair_attempts": "MAX_REPAIR_ATTEMPTS",
+    "subject_builder_invalid": "SUBJECT_BUILDER_INVALID",
+    "subject_digest_unchanged": "SUBJECT_DIGEST_UNCHANGED",
+    "reviewer_subject_mismatch": "REVIEWER_SUBJECT_MISMATCH",
+}
+
+
+def _public_remediation_not_applied_reason(reason_code: object) -> str:
+    if isinstance(reason_code, str) and reason_code.startswith("agent_error:"):
+        return "AGENT_ERROR"
+    if isinstance(reason_code, str):
+        return _REMEDIATION_NOT_APPLIED_REASON_CODES.get(
+            reason_code, "PREPARATION_NOT_APPLIED"
+        )
+    return "PREPARATION_NOT_APPLIED"
 
 
 class ReleaseObservationImportRequest(BaseModel):
@@ -118,6 +142,15 @@ def _remediation_error(
 def _map_remediation_exception(exc: BaseException) -> JSONResponse:
     """Map remediation failures to fixed, non-sensitive public errors."""
 
+    if isinstance(exc, AssuranceRemediationNotAppliedError):
+        return _remediation_error(
+            409,
+            "ASSURANCE_REMEDIATION_NOT_APPLIED",
+            "assurance remediation was not applied",
+            "REMEDIATION_NOT_APPLIED",
+            exc.status.value,
+            _public_remediation_not_applied_reason(exc.reason_code),
+        )
     if isinstance(exc, AssuranceRemediationNotConfiguredError):
         return _remediation_error(
             503,
