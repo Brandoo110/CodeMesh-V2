@@ -13,6 +13,8 @@ from assurance.remediation_agent import (
     RemediationAgentActionSchemaError,
     RemediationAgentBudgets,
     RemediationAgentBudgetError,
+    RemediationAgentContextBudgetError,
+    RemediationAgentPathError,
     RemediationAgentProtocolError,
 )
 from assurance.remediation_validation import (
@@ -162,7 +164,6 @@ def _repair(
         "workspace": workspace or _workspace(),
         "tools": tools_for_agent,
         "validation_feedback": feedback,
-        "max_iterations": max_iterations,
     }
     if selected_finding is not None:
         repair_kwargs["selected_finding"] = selected_finding
@@ -203,34 +204,113 @@ def test_selected_finding_claim_is_redacted_in_initial_prompt() -> None:
     assert "/Users/junjieli/private/finding.txt" not in prompt
 
 
-def test_system_prompt_exposes_only_observation_and_mutation_actions() -> None:
+def test_initial_prompt_contains_sorted_redacted_snapshots_before_provider() -> None:
+    events: list[str] = []
+
+    class RecordingTools(_Tools):
+        def list_files(self) -> object:
+            events.append("list")
+            return super().list_files()
+
+        def read_file(self, path: str) -> object:
+            events.append("read")
+            return super().read_file(path)
+
+        def write_file(self, path: str, content: str) -> object:
+            events.append("write")
+            return super().write_file(path, content)
+
+    class RecordingAdapter(_Adapter):
+        async def complete(
+            self, messages: list[dict[str, str]], system: str = ""
+        ) -> object:
+            events.append("provider")
+            return await super().complete(messages, system)
+
+    adapter = RecordingAdapter(
+        ['{"action":"write","path":"fix.py","content":"new"}']
+    )
+    tools = RecordingTools()
+    tools.list_result = ("z.py", "a.py")
+    tools.read_result = (
+        "Authorization: Bearer snapshot-secret /Users/junjieli/private/a.py"
+    )
+
+    _repair(adapter, tools, selected_finding=_selected_finding(), max_iterations=1)
+
+    prompt = adapter.calls[0][0][0]["content"]
+    payload = json.loads(prompt.split("\n", 1)[1])
+    assert [item["path"] for item in payload["file_snapshots"]] == ["a.py", "z.py"]
+    assert all(
+        item["content"] == "[REDACTED] [REDACTED]"
+        for item in payload["file_snapshots"]
+    )
+    assert payload["selected_finding"]["finding_id"] == "finding-1"
+    assert "snapshot-secret" not in prompt
+    assert "/Users/junjieli/private/a.py" not in prompt
+    assert [name for name, _ in tools.calls] == ["list", "read", "read", "write"]
+    assert events == ["list", "read", "read", "provider", "write"]
+
+
+def test_snapshot_path_violation_fails_before_provider_call() -> None:
+    adapter = _Adapter(['{"action":"write","path":"fix.py","content":"new"}'])
+    tools = _Tools()
+    tools.list_result = ("/tmp/not-allowed.py",)
+
+    with pytest.raises(RemediationAgentPathError):
+        _repair(adapter, tools, max_iterations=1)
+
+    assert adapter.calls == []
+    assert [name for name, _ in tools.calls] == ["list"]
+
+
+def test_snapshot_context_budget_fails_before_provider_call() -> None:
+    budgets = RemediationAgentBudgets(
+        max_response_bytes=4096,
+        max_observation_bytes=128,
+        max_context_bytes=256,
+        max_action_bytes=512,
+        max_content_bytes=128,
+        max_summary_bytes=32,
+    )
+    adapter = _Adapter(['{"action":"write","path":"fix.py","content":"new"}'])
+    tools = _Tools()
+    tools.list_result = ("a.py", "b.py")
+    tools.read_result = "x" * 256
+
+    with pytest.raises(RemediationAgentContextBudgetError):
+        _repair(adapter, tools, max_iterations=1, budgets=budgets)
+
+    assert adapter.calls == []
+    assert [name for name, _ in tools.calls] == ["list", "read", "read"]
+
+
+def test_system_prompt_exposes_only_mutation_actions() -> None:
     adapter = _Adapter(['{"action":"write","path":"fix.py","content":"new"}'])
 
     _repair(adapter, _Tools(), max_iterations=1)
 
     system_prompt = " ".join(adapter.calls[0][1].split()).casefold()
-    assert '"action":"list"' in system_prompt
-    assert '"action":"read"' in system_prompt
     assert '"action":"replace"' in system_prompt
     assert '"action":"write"' in system_prompt
+    assert '"action":"list"' not in system_prompt
+    assert '"action":"read"' not in system_prompt
     assert '"action":"run_validation"' not in system_prompt
     assert '"action":"finalize"' not in system_prompt
 
 
 @pytest.mark.parametrize(
-    ("response", "tool_names"),
+    "response",
     (
         (
             '{"action":"replace","path":"fix.py","old_text":"old",'
-            '"new_text":"new"}',
-            ("read", "write"),
+            '"new_text":"new"}'
         ),
-        ('{"action":"write","path":"fix.py","content":"new"}', ("write",)),
+        '{"action":"write","path":"fix.py","content":"new"}',
     ),
 )
 def test_successful_mutation_is_terminal_and_uses_fixed_summary(
     response: str,
-    tool_names: tuple[str, ...],
 ) -> None:
     adapter = _Adapter([response, '{"action":"read","path":"fix.py"}'])
     tools = _Tools()
@@ -241,7 +321,12 @@ def test_successful_mutation_is_terminal_and_uses_fixed_summary(
     assert result.iterations == 1
     assert result.summary == "mutation_applied"
     assert len(adapter.calls) == 1
-    assert [name for name, _ in tools.calls] == list(tool_names)
+    expected_tools = ["list", "read"]
+    if response.startswith('{"action":"replace"'):
+        expected_tools.extend(("read", "write"))
+    else:
+        expected_tools.append("write")
+    assert [name for name, _ in tools.calls] == expected_tools
 
 
 @pytest.mark.parametrize(
@@ -259,12 +344,16 @@ def test_deprecated_actions_are_rejected_by_schema(response: str) -> None:
         _repair(adapter, tools, max_iterations=1)
 
     assert len(adapter.calls) == 1
-    assert tools.calls == []
+    assert [name for name, _ in tools.calls] == ["list", "read"]
 
 
 def test_deprecated_action_classes_are_not_exported() -> None:
     import assurance.remediation_agent as remediation_agent
 
+    assert not hasattr(remediation_agent, "ListAction")
+    assert not hasattr(remediation_agent, "ReadAction")
+    assert not hasattr(remediation_agent, "RemediationAgentIterationBudgetError")
+    assert not hasattr(remediation_agent, "RemediationAgentRepeatedActionError")
     assert not hasattr(remediation_agent, "RunValidationAction")
     assert not hasattr(remediation_agent, "FinalizeAction")
 
@@ -280,7 +369,7 @@ def test_deprecated_action_classes_are_not_exported() -> None:
         '[{"action":"list"}]',
     ],
 )
-def test_invalid_response_is_rejected_before_any_tool(
+def test_invalid_response_is_rejected_without_mutation(
     response: str,
 ) -> None:
     adapter = _Adapter([response])
@@ -290,7 +379,7 @@ def test_invalid_response_is_rejected_before_any_tool(
         _repair(adapter, tools, max_iterations=2)
 
     assert len(adapter.calls) == 1
-    assert tools.calls == []
+    assert [name for name, _ in tools.calls] == ["list", "read"]
 
 
 @pytest.mark.parametrize(
@@ -303,7 +392,16 @@ def test_invalid_response_is_rejected_before_any_tool(
             "RemediationAgentActionSchemaError",
         ),
         (
-            [json.dumps({"action": "read", "path": "../fix.py"})],
+            [
+                json.dumps(
+                    {
+                        "action": "replace",
+                        "path": "../fix.py",
+                        "old_text": "old",
+                        "new_text": "new",
+                    }
+                )
+            ],
             None,
             "RemediationAgentPathError",
         ),
@@ -376,13 +474,24 @@ def test_model_adapter_surface_is_complete_only() -> None:
     ],
 )
 def test_noncanonical_or_private_path_is_rejected_before_tool(path: str) -> None:
-    adapter = _Adapter([json.dumps({"action": "read", "path": path})])
+    adapter = _Adapter(
+        [
+            json.dumps(
+                {
+                    "action": "replace",
+                    "path": path,
+                    "old_text": "old",
+                    "new_text": "new",
+                }
+            )
+        ]
+    )
     tools = _Tools()
 
     with pytest.raises(RemediationAgentProtocolError):
         _repair(adapter, tools, max_iterations=1)
 
-    assert tools.calls == []
+    assert [name for name, _ in tools.calls] == ["list", "read"]
 
 
 def test_symlink_escape_is_left_to_public_workspace_tool_and_fails_closed(
@@ -402,7 +511,7 @@ def test_symlink_escape_is_left_to_public_workspace_tool_and_fails_closed(
             SimpleNamespace(validate=lambda *_args, **_kwargs: None), 1
         )
         tools = ScopedValidationTools(isolated.public_view(), executor)
-        adapter = _Adapter(['{"action":"read","path":"link.txt"}'])
+        adapter = _Adapter(['{"action":"write","path":"link.txt","content":"new"}'])
 
         with pytest.raises(WorkspaceViolation):
             _repair(adapter, tools, workspace=isolated.public_view(), max_iterations=1)
@@ -416,7 +525,7 @@ def test_old_text_non_unique_and_workspace_quota_errors_propagate() -> None:
     tools.read_result = "old old"
     with pytest.raises(WorkspaceViolation, match="old_string"):
         _repair(adapter, tools, max_iterations=1)
-    assert [name for name, _ in tools.calls] == ["read"]
+    assert [name for name, _ in tools.calls] == ["list", "read", "read"]
 
     class QuotaTools(_Tools):
         def write_file(self, path: str, content: str) -> object:
@@ -427,6 +536,7 @@ def test_old_text_non_unique_and_workspace_quota_errors_propagate() -> None:
     quota_tools = QuotaTools()
     with pytest.raises(WorkspaceViolation, match="quota"):
         _repair(quota_adapter, quota_tools, max_iterations=1)
+    assert [name for name, _ in quota_tools.calls] == ["list", "read", "write"]
 
 
 def test_oversized_response_and_content_are_rejected_without_tool() -> None:
@@ -444,7 +554,7 @@ def test_oversized_response_and_content_are_rejected_without_tool() -> None:
     with pytest.raises(RemediationAgentBudgetError) as response_raised:
         _repair(response_adapter, response_tools, max_iterations=1, budgets=budgets)
     assert type(response_raised.value).__name__ == "RemediationAgentResponseBudgetError"
-    assert response_tools.calls == []
+    assert [name for name, _ in response_tools.calls] == ["list", "read"]
 
     content_adapter = _Adapter(
         ['{"action":"write","path":"fix.py","content":"123456789"}']
@@ -453,7 +563,7 @@ def test_oversized_response_and_content_are_rejected_without_tool() -> None:
     with pytest.raises(RemediationAgentBudgetError) as content_raised:
         _repair(content_adapter, content_tools, max_iterations=1, budgets=budgets)
     assert type(content_raised.value).__name__ == "RemediationAgentContentBudgetError"
-    assert content_tools.calls == []
+    assert [name for name, _ in content_tools.calls] == ["list", "read"]
 
     action_budgets = RemediationAgentBudgets(
         max_response_bytes=4096,
@@ -470,40 +580,7 @@ def test_oversized_response_and_content_are_rejected_without_tool() -> None:
     with pytest.raises(RemediationAgentBudgetError) as action_raised:
         _repair(action_adapter, action_tools, max_iterations=1, budgets=action_budgets)
     assert type(action_raised.value).__name__ == "RemediationAgentActionBudgetError"
-    assert action_tools.calls == []
-
-
-def test_observation_and_next_prompt_are_clipped_and_redacted() -> None:
-    budgets = RemediationAgentBudgets(
-        max_response_bytes=4096,
-        max_observation_bytes=96,
-        max_context_bytes=4096,
-        max_action_bytes=512,
-        max_content_bytes=128,
-        max_summary_bytes=32,
-    )
-    adapter = _Adapter(
-        [
-            '{"action":"read","path":"fix.py"}',
-            '{"action":"write","path":"fix.py","content":"new"}',
-        ]
-    )
-    tools = _Tools()
-    tools.read_result = (
-        "Authorization: Bearer super-secret-token "
-        "/Users/junjieli/private/file "
-        + "x" * 1000
-    )
-
-    result = _repair(adapter, tools, max_iterations=2, budgets=budgets)
-
-    assert result.iterations == 2
-    next_prompt = adapter.calls[1][0]
-    serialized = json.dumps(next_prompt, ensure_ascii=False)
-    assert "super-secret-token" not in serialized
-    assert "/Users/junjieli/private/file" not in serialized
-    assert sum(len(item["content"].encode()) for item in next_prompt) < 4096
-    assert any("TRUNCATED" in item["content"] for item in next_prompt)
+    assert [name for name, _ in action_tools.calls] == ["list", "read"]
 
 
 def test_oversized_initial_context_fails_before_model_call() -> None:
@@ -515,7 +592,7 @@ def test_oversized_initial_context_fails_before_model_call() -> None:
         max_content_bytes=128,
         max_summary_bytes=32,
     )
-    adapter = _Adapter(['{"action":"list"}'])
+    adapter = _Adapter(['{"action":"write","path":"fix.py","content":"new"}'])
     tools = _Tools()
     paths = tuple(f"file-{index}-" + "x" * 100 for index in range(8))
 
@@ -529,43 +606,6 @@ def test_oversized_initial_context_fails_before_model_call() -> None:
         )
     assert type(raised.value).__name__ == "RemediationAgentContextBudgetError"
     assert adapter.calls == []
-
-
-def test_oversized_loop_context_uses_context_budget_error() -> None:
-    budgets = RemediationAgentBudgets(
-        max_response_bytes=1024,
-        max_observation_bytes=64,
-        max_context_bytes=1300,
-        max_action_bytes=512,
-        max_content_bytes=128,
-        max_summary_bytes=32,
-    )
-    adapter = _Adapter(['{"action":"list"}', '{"action":"read","path":"fix.py"}'])
-    tools = _Tools()
-
-    with pytest.raises(RemediationAgentBudgetError, match="context") as raised:
-        _repair(adapter, tools, max_iterations=2, budgets=budgets)
-
-    assert type(raised.value).__name__ == "RemediationAgentContextBudgetError"
-    assert len(adapter.calls) == 1
-    assert [name for name, _ in tools.calls] == ["list"]
-
-
-def test_repeated_observations_and_max_iterations_do_not_loop_forever() -> None:
-    adapter = _Adapter(
-        [
-            '{"action":"list"}',
-            '{"action":"read","path":"fix.py"}',
-            '{"action":"list"}',
-        ]
-    )
-    tools = _Tools()
-
-    with pytest.raises(RemediationAgentBudgetError, match="iteration") as raised:
-        _repair(adapter, tools, max_iterations=2)
-
-    assert type(raised.value).__name__ == "RemediationAgentIterationBudgetError"
-    assert len(adapter.calls) == 2
     assert [name for name, _ in tools.calls] == ["list", "read"]
 
 
@@ -578,7 +618,7 @@ def test_adapter_exception_is_not_wrapped_or_prompted() -> None:
         _repair(adapter, tools, max_iterations=1)
 
     assert raised.value is error
-    assert tools.calls == []
+    assert [name for name, _ in tools.calls] == ["list", "read"]
 
 
 def test_dangerous_duck_tool_is_rejected_at_repair_entry() -> None:
@@ -608,7 +648,6 @@ def test_dangerous_duck_tool_is_rejected_at_repair_entry() -> None:
                 workspace=_workspace(),
                 tools=DangerousDuck(),
                 validation_feedback="failed",
-                max_iterations=1,
             )
         )
     assert adapter.calls == []
@@ -621,70 +660,25 @@ def test_replace_empty_old_text_is_rejected_before_tool() -> None:
     tools = _Tools()
     with pytest.raises(RemediationAgentProtocolError, match="old_text"):
         _repair(adapter, tools, max_iterations=1)
-    assert tools.calls == []
-
-
-@pytest.mark.parametrize("policy_limit", [True, 0, -1, "3"])
-def test_iteration_limits_are_strict_and_reject_model_copy_tampering(
-    policy_limit: object,
-) -> None:
-    adapter = _Adapter(['{"action":"list"}'])
-    tools = _Tools()
-    request = _request(max_iterations=3)
-    request.policy.max_agent_iterations = policy_limit
-
-    with pytest.raises(RemediationAgentBudgetError) as raised:
-        _repair(adapter, tools, request=request, max_iterations=3)
-    assert type(raised.value).__name__ == "RemediationAgentConfigurationBudgetError"
-    assert adapter.calls == []
-    assert tools.calls == []
-
-
-def test_iteration_limit_uses_strict_minimum_of_controller_and_policy() -> None:
-    adapter = _Adapter(
-        [
-            '{"action":"list"}',
-            '{"action":"read","path":"fix.py"}',
-            '{"action":"write","path":"fix.py","content":"new"}',
-            '{"action":"read","path":"fix.py"}',
-        ]
-    )
-    tools = _Tools()
-    request = _request(max_iterations=3)
-
-    result = _repair(adapter, tools, request=request, max_iterations=4)
-    assert result.iterations == 3
-    assert result.summary == "mutation_applied"
-    assert len(adapter.calls) == 3
-    assert [name for name, _ in tools.calls] == ["list", "read", "write"]
+    assert [name for name, _ in tools.calls] == ["list", "read"]
 
 
 @pytest.mark.parametrize("path", ["%2e%2e/fix.py", "src/%2fsecret", "src/%5Csecret"])
 def test_percent_encoded_path_escape_is_rejected_before_tool(path: str) -> None:
-    adapter = _Adapter([json.dumps({"action": "read", "path": path})])
+    adapter = _Adapter(
+        [
+            json.dumps(
+                {
+                    "action": "replace",
+                    "path": path,
+                    "old_text": "old",
+                    "new_text": "new",
+                }
+            )
+        ]
+    )
     tools = _Tools()
 
     with pytest.raises(RemediationAgentProtocolError):
         _repair(adapter, tools, max_iterations=1)
-    assert tools.calls == []
-
-
-def test_nonfinite_structured_observation_is_stably_redacted() -> None:
-    adapter = _Adapter(
-        [
-            '{"action":"read","path":"fix.py"}',
-            '{"action":"write","path":"fix.py","content":"new"}',
-        ]
-    )
-    tools = _Tools()
-    tools.read_result = {
-        "score": float("nan"),
-        "upper": float("inf"),
-        "lower": float("-inf"),
-    }
-
-    _repair(adapter, tools, max_iterations=2)
-    next_prompt = json.dumps(adapter.calls[1][0], ensure_ascii=False)
-    assert "NaN" not in next_prompt
-    assert "Infinity" not in next_prompt
-    assert "-Infinity" not in next_prompt
+    assert [name for name, _ in tools.calls] == ["list", "read"]

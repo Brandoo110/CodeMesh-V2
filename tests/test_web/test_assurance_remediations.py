@@ -271,10 +271,6 @@ def test_non_success_remediation_post_is_not_applied_without_commit(
             "AGENT_RESPONSE_BUDGET_ERROR",
         ),
         (
-            "agent_error:RemediationAgentConfigurationBudgetError",
-            "AGENT_CONFIGURATION_BUDGET_ERROR",
-        ),
-        (
             "agent_error:RemediationAgentActionBudgetError",
             "AGENT_ACTION_BUDGET_ERROR",
         ),
@@ -285,10 +281,6 @@ def test_non_success_remediation_post_is_not_applied_without_commit(
         (
             "agent_error:RemediationAgentContextBudgetError",
             "AGENT_CONTEXT_BUDGET_ERROR",
-        ),
-        (
-            "agent_error:RemediationAgentIterationBudgetError",
-            "AGENT_ITERATION_BUDGET_ERROR",
         ),
         (
             "agent_error:RemediationAgentProtocolError",
@@ -309,10 +301,6 @@ def test_non_success_remediation_post_is_not_applied_without_commit(
         (
             "agent_error:RemediationAgentActionPolicyError",
             "ACTION_POLICY_ERROR",
-        ),
-        (
-            "agent_error:RemediationAgentRepeatedActionError",
-            "REPEATED_ACTION_ERROR",
         ),
         (
             "agent_error:RemediationAgentInternalProtocolError",
