@@ -7,9 +7,12 @@ does not claim to be an OS or container sandbox.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import shutil
+import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -18,6 +21,8 @@ from assurance.digests import normalize_repo_path
 
 
 CONTROLLER_PRIVATE_DIR = ".codemesh_eval"
+_DURABLE_SNAPSHOT_DIR = "remediation_snapshots"
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class WorkspaceViolation(ValueError):
@@ -93,6 +98,10 @@ class IsolatedWorkspace:
     seed_root: Path
     grant: WorkspaceGrant
     _temporary: tempfile.TemporaryDirectory[str]
+    _published_path: Path | None = field(default=None, init=False, repr=False)
+    _published_identity: tuple[str, str] | None = field(
+        default=None, init=False, repr=False
+    )
 
     @classmethod
     def prepare(
@@ -125,6 +134,83 @@ class IsolatedWorkspace:
             grant=grant,
             _temporary=temporary,
         )
+
+    @staticmethod
+    def _ensure_real_directory(path: Path, *, create: bool = False) -> Path:
+        """Validate one directory and every ancestor without following links."""
+
+        if not isinstance(path, Path) or not path.is_absolute():
+            raise WorkspaceViolation("durable workspace root must be absolute")
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                if not create or current != path:
+                    raise WorkspaceViolation(
+                        "durable workspace directory is unavailable"
+                    ) from None
+                try:
+                    current.mkdir(mode=0o700)
+                    info = current.lstat()
+                except OSError as exc:
+                    raise WorkspaceViolation(
+                        "durable workspace directory cannot be created"
+                    ) from exc
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise WorkspaceViolation(
+                    "durable workspace directory must be a real directory"
+                )
+        return path
+
+    def publish(
+        self, *, parent: Path, remediation_id: str, subject_digest: str
+    ) -> Path:
+        """Move the repaired workspace into a deterministic durable namespace.
+
+        The target name is a content-free hash of the remediation identity and
+        new subject.  The namespace is controller-owned and every existing
+        path component is checked with ``lstat`` before the atomic move, so a
+        collision or symlink can never cause an overwrite or an escape.
+        """
+
+        if type(remediation_id) is not str or not remediation_id.strip():
+            raise WorkspaceViolation("remediation_id must be nonblank")
+        if type(subject_digest) is not str or _SHA256_RE.fullmatch(subject_digest) is None:
+            raise WorkspaceViolation("subject_digest must be a sha256 digest")
+        identity = (remediation_id, subject_digest)
+        if self._published_path is not None:
+            if self._published_identity == identity and self._published_path.is_dir():
+                return self._published_path
+            raise WorkspaceViolation("workspace has already been published")
+        parent = self._ensure_real_directory(parent)
+        controller_dir = self._ensure_real_directory(
+            parent / CONTROLLER_PRIVATE_DIR, create=True
+        )
+        snapshot_dir = self._ensure_real_directory(
+            controller_dir / _DURABLE_SNAPSHOT_DIR, create=True
+        )
+        source = self._ensure_real_directory(self.root)
+        token = hashlib.sha256(
+            (remediation_id + "\0" + subject_digest).encode("utf-8")
+        ).hexdigest()
+        target = snapshot_dir / token
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise WorkspaceViolation("durable workspace target already exists")
+
+        try:
+            source.rename(target)
+        except OSError as exc:
+            raise WorkspaceViolation("durable workspace publish failed") from exc
+        self.root = target
+        self._published_path = target
+        self._published_identity = identity
+        return target
 
     @staticmethod
     def _canonical(relative_path: str | Path) -> str:

@@ -29,6 +29,7 @@ from assurance.remediation_validation import (
 )
 from assurance.remediation_workspace import (
     IsolatedWorkspace,
+    PublicWorkspaceView,
     WorkspaceGrant,
     WorkspaceViolation,
 )
@@ -199,6 +200,82 @@ def test_workspace_rejects_escape_duplicate_and_symlink(tmp_path: Path) -> None:
             workspace.read_text("src/other.py")
         with pytest.raises(WorkspaceViolation):
             workspace.read_text("src/link.py")
+
+
+def test_workspace_publishes_repaired_root_after_temp_cleanup_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "fix.py").write_text("repaired", encoding="utf-8")
+    durable_root = tmp_path / "workspace-root"
+    durable_root.mkdir()
+    grant = _grant("fix.py")
+
+    with IsolatedWorkspace.prepare(seed, grant, parent=durable_root) as workspace:
+        published = workspace.publish(
+            parent=durable_root,
+            remediation_id="remediation-1",
+            subject_digest="sha256:" + "a" * 64,
+        )
+        assert published.is_relative_to(durable_root)
+        assert published.is_dir()
+        assert (published / "fix.py").read_text(encoding="utf-8") == "repaired"
+        assert workspace.root == published
+
+    assert published.is_dir()
+    assert (published / "fix.py").read_text(encoding="utf-8") == "repaired"
+
+    with IsolatedWorkspace.prepare(seed, grant, parent=durable_root) as workspace:
+        with pytest.raises(WorkspaceViolation):
+            workspace.publish(
+                parent=durable_root,
+                remediation_id="remediation-1",
+                subject_digest="sha256:" + "a" * 64,
+            )
+
+
+def test_controller_publishes_before_reviewer_and_keeps_durable_root(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "fix.py").write_text("old", encoding="utf-8")
+    durable_root = tmp_path / "workspace-root"
+    durable_root.mkdir()
+    request = _request(_grant("fix.py"), _policy(max_attempts=1))
+    executor = _FakeExecutor([ValidationStatus.FAILED, ValidationStatus.PASSED])
+    reviewer_roots: list[Path] = []
+
+    async def agent(*, workspace: PublicWorkspaceView, **_: object) -> None:
+        workspace.write_text("fix.py", "repaired")
+
+    async def reviewer(**kwargs: object) -> None:
+        reviewer_roots.append(kwargs["workspace"].root)  # type: ignore[union-attr]
+        return None
+
+    controller = RemediationController(
+        request=request,
+        selected_finding=_finding(),
+        seed_root=seed,
+        validation_executor=lambda _workspace: executor,
+        subject_builder=lambda patch_digest: _subject(
+            diff=patch_digest.removeprefix("sha256:"), head="new-head"
+        ),
+        reviewer_rerunner=reviewer,
+        workspace_parent=durable_root,
+    )
+
+    result = _run(controller, agent)
+
+    assert result.status is RemediationStatus.BLOCKED
+    assert result.reason_code == "reviewer_subject_mismatch"
+    assert len(reviewer_roots) == 1
+    published = reviewer_roots[0]
+    assert published.is_relative_to(durable_root)
+    assert published.is_dir()
+    assert (published / "fix.py").read_text(encoding="utf-8") == "repaired"
+    assert not tuple(durable_root.glob("codemesh-remediation-*"))
 
 
 def test_baseline_pass_is_noop_and_does_not_build_subject(tmp_path: Path) -> None:

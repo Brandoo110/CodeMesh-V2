@@ -35,7 +35,11 @@ from assurance.remediation_validation import (
     ValidationStatus,
     make_validation_tool_registry,
 )
-from assurance.remediation_workspace import IsolatedWorkspace, WorkspaceGrant
+from assurance.remediation_workspace import (
+    IsolatedWorkspace,
+    WorkspaceGrant,
+    WorkspaceViolation,
+)
 from assurance.run_service import AssuranceRunBundle, ReviewerRunRecord
 
 
@@ -861,6 +865,25 @@ class RemediationController:
                     patch_digests=patch_digests,
                     last_validation=last_validation,
                 )
+
+            if self.workspace_parent is not None:
+                try:
+                    workspace.publish(
+                        parent=self.workspace_parent,
+                        remediation_id=self.request.remediation_id,
+                        subject_digest=new_digest,
+                    )
+                except (OSError, RuntimeError, WorkspaceViolation):
+                    return self._result(
+                        request=self.request,
+                        status=RemediationStatus.BLOCKED,
+                        reason_code="durable_workspace_publish_failed",
+                        attempts=len(attempt_receipts),
+                        validation_calls=validation_calls,
+                        attempt_receipts=attempt_receipts,
+                        patch_digests=patch_digests,
+                        last_validation=last_validation,
+                    )
 
             role = self.selected_finding.reviewer_role
             reviewer_output = await self._run_reviewer(

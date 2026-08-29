@@ -1609,6 +1609,100 @@ class AssuranceWebRepository:
                 return item
         raise AssuranceWebNotFoundError(f"evidence {evidence_id!r} not found for case {case_id!r}")
 
+    def get_authoritative_evidence(
+        self, case_id: str, evidence_id: str
+    ) -> Evidence:
+        """Read one Evidence row through the canonical or remediation seam.
+
+        Existing collected Cases remain authorized by their canonical
+        ``evidence_refs`` plus the matching Web projection row.  A remediation
+        DRAFT Case has intentionally empty canonical refs, so it falls back to
+        one exact immutable run/pointer/binding/subject membership check.
+        """
+
+        if type(case_id) is not str or not case_id.strip():
+            raise ValueError("case_id must be nonblank")
+        if type(evidence_id) is not str or not evidence_id.strip():
+            raise ValueError("evidence_id must be nonblank")
+        try:
+            with self._store._transaction(write=False) as unit_of_work:
+                conn = unit_of_work.connection
+                _validate_run_schema(conn)
+                self._ensure_web_remediation_schema(conn)
+                self._store._ensure_lifecycle_initialized(conn)
+                state = unit_of_work.load_case(case_id)
+                web = self._load_web_case_in_transaction(conn, case_id)
+                projected = (
+                    self._decode_models(web["evidence_json"], Evidence)
+                    if web is not None
+                    else ()
+                )
+                if evidence_id in state.case.evidence_refs:
+                    matches = tuple(
+                        item
+                        for item in projected
+                        if item.evidence_id == evidence_id
+                    )
+                    if (
+                        len(matches) != 1
+                        or matches[0].subject_digest != state.case.subject_digest
+                    ):
+                        raise AssuranceWebNotFoundError("artifact is unavailable")
+                    return matches[0]
+
+                if state.case.state != "DRAFT":
+                    raise AssuranceWebNotFoundError("artifact is unavailable")
+
+                canonical_binding = unit_of_work.get_binding(case_id)
+                rows = conn.execute(
+                    "SELECT * FROM assurance_web_runs WHERE case_id = ?"
+                    " ORDER BY committed_at ASC, run_id ASC",
+                    (case_id,),
+                ).fetchall()
+                if len(rows) != 1:
+                    raise AssuranceWebNotFoundError("artifact is unavailable")
+                row = rows[0]
+                bundle = _load_bundle_from_row(row)
+                _assert_row_columns(row, bundle)
+                _load_pointer(conn, row["idempotency_key"], bundle)
+                if (
+                    row["case_id"] != case_id
+                    or row["subject_digest"] != state.case.subject_digest
+                    or bundle.case.case_id != case_id
+                    or bundle.draft_case.case_id != case_id
+                    or bundle.case.subject_digest != state.case.subject_digest
+                    or bundle.draft_case.subject_digest != state.case.subject_digest
+                    or bundle.subject.subject_digest != state.case.subject_digest
+                    or bundle.binding != canonical_binding
+                    or state.case != bundle.draft_case
+                ):
+                    raise AssuranceWebNotFoundError("artifact is unavailable")
+                matches = tuple(
+                    item
+                    for item in bundle.evidence
+                    if item.evidence_id == evidence_id
+                )
+                if len(matches) != 1 or matches[0].subject_digest != state.case.subject_digest:
+                    raise AssuranceWebNotFoundError("artifact is unavailable")
+                return matches[0]
+        except AssuranceWebNotFoundError:
+            raise
+        except CaseNotFoundError as exc:
+            raise AssuranceWebNotFoundError("artifact is unavailable") from exc
+        except (
+            AssuranceWebError,
+            ProjectionIntegrityError,
+            StorePersistenceError,
+            AssuranceRunPersistenceError,
+            AssuranceRunMigrationError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+            KeyError,
+            IndexError,
+        ) as exc:
+            raise AssuranceWebNotFoundError("artifact is unavailable") from exc
+
     def get_receipt(self, case_id: str) -> dict:
         self._require_case(case_id)
         receipt = self._projection(case_id)["receipt"]

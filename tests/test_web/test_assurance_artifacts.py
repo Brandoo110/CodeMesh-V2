@@ -340,3 +340,101 @@ def test_return_values_do_not_expose_store_root_and_keep_script_as_plain_text(
         not (item.path or "").startswith(("/", "~"))
         for item in index.artifacts
     )
+
+
+def test_reader_preserves_canonical_case_evidence_refs(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    repository = _new_repository(tmp_path)
+    digest = store.put_bytes(b"canonical\n")
+    evidence = _evidence(
+        case_id="canonical", kind="git_snapshot", artifact_digest=digest
+    )
+    _add_evidence(repository, case_id="canonical", evidence=evidence)
+
+    state = repository._store.load_case("canonical")
+    assert state.case.evidence_refs == (evidence.evidence_id,)
+    reader = AssuranceArtifactReader(repository, store)
+    assert reader.read_artifact("canonical", evidence.evidence_id, digest).data == (
+        b"canonical\n"
+    )
+
+
+def test_reader_authorizes_remediation_draft_run_evidence_without_refs(
+    tmp_path, monkeypatch
+):
+    from tests.test_web.test_assurance_remediations import _seed_remediation
+
+    repository, _, _, request, handoff = _seed_remediation(tmp_path, monkeypatch)
+    receipt = repository.commit_prepared_remediation(
+        request, handoff, idempotency_key="remediate:artifact-fallback"
+    )
+    bundle = handoff.bundle
+    assert bundle is not None
+    state = repository._store.load_case(receipt.new_case_id)
+    assert state.case.state == "DRAFT"
+    assert state.case.evidence_refs == ()
+
+    reader = AssuranceArtifactReader(
+        repository, ArtifactStore(tmp_path / "artifacts")
+    )
+    for evidence in bundle.evidence:
+        index = reader.list_artifacts(receipt.new_case_id, evidence.evidence_id)
+        assert index.evidence_id == evidence.evidence_id
+        assert index.artifacts[0].digest == evidence.artifact_digest
+        artifact = reader.read_artifact(
+            receipt.new_case_id, evidence.evidence_id, evidence.artifact_digest
+        )
+        assert artifact.digest == evidence.artifact_digest
+
+    with pytest.raises(AssuranceWebNotFoundError):
+        reader.list_artifacts(receipt.old_case_id, bundle.evidence[0].evidence_id)
+    unreferenced = reader._artifact_store.put_bytes(b"unreferenced-remediation\n")
+    with pytest.raises(AssuranceWebNotFoundError):
+        reader.read_artifact(
+            receipt.new_case_id, bundle.evidence[0].evidence_id, unreferenced
+        )
+
+
+def test_reader_rejects_projection_only_case_without_canonical_or_run(tmp_path):
+    import sqlite3
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    repository = _new_repository(tmp_path)
+    case_id = "projection-only"
+    case = AcceptanceCase(
+        case_id=case_id,
+        subject_digest=SUBJECT,
+        state="DRAFT",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository.create_change(
+        case,
+        AcceptanceBinding(
+            subject_digest=SUBJECT,
+            policy_version="policy-v1",
+            rubric_version="rubric-v1",
+        ),
+        {"author": "test", "risk": "medium"},
+        "create:projection-only",
+        {"case_id": case_id},
+    )
+    digest = store.put_bytes(b"projection-only\n")
+    evidence = _evidence(
+        case_id=case_id, kind="git_snapshot", artifact_digest=digest
+    )
+    conn = sqlite3.connect(repository._db_path)
+    try:
+        conn.execute(
+            "UPDATE assurance_web_cases SET evidence_json = ? WHERE case_id = ?",
+            (json.dumps([evidence.model_dump(mode="json")]), case_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reader = AssuranceArtifactReader(repository, store)
+    with pytest.raises(AssuranceWebNotFoundError):
+        reader.list_artifacts(case_id, evidence.evidence_id)
+    with pytest.raises(AssuranceWebNotFoundError):
+        reader.read_artifact(case_id, evidence.evidence_id, digest)

@@ -137,34 +137,10 @@ class AssuranceArtifactReader:
 
     def _evidence_for_case(self, case_id: str, evidence_id: str) -> Evidence:
         try:
-            projection = self._repository.get_change(case_id)
+            return self._repository.get_authoritative_evidence(case_id, evidence_id)
         except AssuranceWebNotFoundError:
             raise
         except Exception:
-            raise self._not_found() from None
-        try:
-            case = projection["case"]
-            if evidence_id not in case["evidence_refs"]:
-                raise self._not_found()
-            item = next(
-                evidence
-                for evidence in projection["evidence"]
-                if evidence.get("evidence_id") == evidence_id
-            )
-            evidence = Evidence.model_validate(item)
-            if evidence.subject_digest != case["subject_digest"]:
-                raise self._not_found()
-            return evidence
-        except AssuranceWebNotFoundError:
-            raise
-        except (
-            AttributeError,
-            KeyError,
-            StopIteration,
-            TypeError,
-            ValueError,
-            ValidationError,
-        ):
             raise self._not_found() from None
 
     @staticmethod
