@@ -25,3 +25,5 @@
 本轮专项记录（2026-08-29）：无新增延后专项。当前仍处于“本地产品收口 / 可用 MVP 集成”；本轮文档改动仅修复 Real local Change Acceptance quickstart 的 intake contract，补充有效 task spec 示例并让 README 的 `task_path` 指向该示例。后续可由真实 dogfood 验证其端到端可用性；本轮未进行、也不提前宣称 provider 调用或 dogfood 成功。
 
 本轮专项记录（2026-08-29，DeepSeek V4 model migration）：真实 run `run_b0a090...` 已证明 4 evidence success、FRESH、Passport 可读，但 reviewer 因 legacy model provider failure BLOCKED；keyed GET `/v1/models` 返回 200 只证明 key/network/鉴权，不证明 reviewer success。本轮迁移 reviewer 示例至 `deepseek-v4-flash`，迁移后仍待一次新 run，未完成 dogfood。无新增 hardening；V1 planner/adapter/pricing 作为单独后续范围处理。
+
+本轮专项记录（2026-08-29，DeepSeek V4 bounded non-thinking）：真实 run `run_9afdd...` 已实际使用 `deepseek-v4-flash`，FRESH 且 4 evidence success；但默认 high thinking 在 4096 output budget 达到 `finish_reason=length`，结果为 BLOCKED。本修复后待新 run，dogfood 尚未完成；无新增 hardening。

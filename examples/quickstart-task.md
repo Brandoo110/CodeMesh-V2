@@ -1,14 +1,17 @@
 ---
-title: Migrate reviewer to supported DeepSeek V4 model
+title: Bound DeepSeek V4 reviewer output
 owner: CodeMesh maintainers
 ---
 
 # Scope
 
-This task spec documents the CodeMesh V2 reviewer-model migration for the real
-local Change Acceptance quickstart. It is documentation-only evidence; reviewer
-provider execution and real dogfood remain pending.
+This task spec documents the CodeMesh V2 fixed-reviewer transport change for the
+real local Change Acceptance quickstart. The DeepSeek route must explicitly
+disable provider thinking while retaining the existing one-shot bounded JSON
+contract; other providers keep their exact payload. Reviewer provider execution
+after this fix and real dogfood remain pending.
 
-- [ ] Confirm the reviewer example uses the supported `deepseek-v4-flash` model.
-- [ ] Confirm the README explains legacy DeepSeek model retirement and the current `deepseek-v4-flash` and explicit `deepseek-v4-pro` options.
-- [ ] Confirm the reviewer example JSON is valid and contains no secrets.
+- [ ] Confirm `route.provider == "deepseek"` adds only `extra_body: {"thinking": {"type": "disabled"}}`, keeps `max_tokens: 4096`, and sends exactly one request.
+- [ ] Confirm every non-DeepSeek provider retains its exact prior request payload, with no thinking field, tools, fallback, or response-format additions.
+- [ ] Confirm the fixed quickstart README wording describes bounded non-thinking transport for both `deepseek-v4-flash` and explicitly selected `deepseek-v4-pro`, without claiming a dynamic thinking mode.
+- [ ] Confirm the focused DeepSeek transport test and the adjacent fixed-reviewer test file pass, with no real provider or dogfood claim.

@@ -261,6 +261,11 @@ class FixedOpenAICompatibleReviewerInvoker:
         route = self._endpoint.route
         started = _now()
         try:
+            provider_options = {}
+            if route.provider == "deepseek":
+                provider_options["extra_body"] = {
+                    "thinking": {"type": "disabled"}
+                }
             response = await asyncio.wait_for(
                 self._client.chat.completions.create(
                     model=route.model_ref,
@@ -271,6 +276,7 @@ class FixedOpenAICompatibleReviewerInvoker:
                     n=1,
                     stream=False,
                     max_tokens=route.token_budget,
+                    **provider_options,
                 ),
                 timeout=route.timeout_seconds,
             )

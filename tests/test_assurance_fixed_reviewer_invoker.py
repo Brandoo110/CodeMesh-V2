@@ -182,6 +182,27 @@ def test_happy_path_uses_real_sdk_once_with_exact_safe_payload(caplog):
     asyncio.run(invoker.aclose())
 
 
+def test_deepseek_route_explicitly_disables_thinking():
+    route = _route(
+        provider="deepseek",
+        model_ref="deepseek-v4-flash",
+        token_budget=4096,
+    )
+    invoker, seen = _invoker(
+        route,
+        _json_handler(_completion(model="deepseek-v4-flash")),
+    )
+
+    result = asyncio.run(invoker.invoke(_prompt(), run_id="run-1", route=route))
+
+    assert result.status == "success"
+    assert len(seen) == 1
+    payload = json.loads(seen[0].content)
+    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["max_tokens"] == 4096
+    asyncio.run(invoker.aclose())
+
+
 def test_forged_prompt_and_mismatched_route_are_rejected_before_transport():
     route = _route()
     invoker, seen = _invoker(route, _json_handler(_completion()))

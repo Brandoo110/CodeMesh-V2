@@ -180,6 +180,10 @@ applies to any remediation provider call.
    `deepseek-v4-flash`, the current supported V2 quickstart option. For more
    complex review, you may explicitly select `deepseek-v4-pro`. Legacy
    DeepSeek model names are retired; see the [DeepSeek updates](https://api-docs.deepseek.com/updates/).
+   The fixed quickstart transport explicitly disables provider thinking to
+   preserve bounded deterministic JSON; even when `deepseek-v4-pro` is chosen
+   for complex review, this quickstart remains bounded non-thinking and does
+   not claim a dynamic thinking mode.
    The remediation role is
    explicitly `qwen` and has its own model and policy. Replace its
    `workspace_grant.allowed_paths` with one or more real, existing
