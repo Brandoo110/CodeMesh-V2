@@ -159,6 +159,18 @@ applies to any remediation provider call.
    must already exist. The requested `base_ref` must resolve in that
    repository.
 
+   `task_path` must point to a task spec, not an arbitrary Markdown file such
+   as `README.md`. The minimum task-spec contract is a frontmatter block that
+   starts on the first line with `---`, ends with a closing `---`, and contains
+   non-empty single-line scalar `title:` and `owner:` fields, followed by at
+   least one unique Markdown checkbox acceptance criterion. The
+   [examples/quickstart-task.md](examples/quickstart-task.md) file is a template
+   to copy into the target repository; after copying it, set `task_path` to the
+   copied repository-relative path. For CodeMesh self-dogfood, you can use
+   `examples/quickstart-task.md` and `.codex/agents/DEFERRED_HARDENING.md`
+   directly. The template documents this quickstart change only and does not
+   claim reviewer or dogfood success.
+
    The command spec's `cwd` and remediation `allowed_paths` are intentionally
    repository-relative fields required by their schemas; keep the example's
    `cwd: "."`, replace the absolute runtime path placeholders, and replace

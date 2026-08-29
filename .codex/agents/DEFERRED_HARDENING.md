@@ -21,3 +21,5 @@
 主线阻塞/未完成边界：真实 provider dogfood 与远端 push 仍未完成，属于主线交付边界，不归类为可延后 hardening。
 
 本轮新增后续项：无新增。现有全面安全扫描、压力/性能/长稳、大规模并发及生产多租户/RBAC/灾备/运营级发布加固继续按阶段成熟度延后。
+
+本轮专项记录（2026-08-29）：无新增延后专项。当前仍处于“本地产品收口 / 可用 MVP 集成”；本轮文档改动仅修复 Real local Change Acceptance quickstart 的 intake contract，补充有效 task spec 示例并让 README 的 `task_path` 指向该示例。后续可由真实 dogfood 验证其端到端可用性；本轮未进行、也不提前宣称 provider 调用或 dogfood 成功。
