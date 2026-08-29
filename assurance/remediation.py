@@ -567,7 +567,11 @@ class RemediationController:
         *,
         workspace: IsolatedWorkspace,
     ) -> Any:
-        function = self.reviewer_rerunner
+        function = getattr(self.reviewer_rerunner, "rerun", None)
+        if not callable(function):
+            function = self.reviewer_rerunner
+        if not callable(function):
+            raise TypeError("reviewer_rerunner must be callable or expose rerun")
         values = {
             "reviewer_role": role,
             "role": role,

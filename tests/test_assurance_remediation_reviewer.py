@@ -214,6 +214,47 @@ class _RecordingPrepareService:
         return self.bundle
 
 
+def test_controller_prefers_explicit_rerun_on_real_reviewer_contract(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (
+        _,
+        intent,
+        baseline,
+        workspace,
+        changed_bundle,
+        subject_input,
+        selected_finding,
+    ) = _baseline_and_changed_subject(tmp_path, monkeypatch)
+    request, _ = _request_for_baseline(baseline)
+    recording = _RecordingPrepareService(changed_bundle)
+    reviewer = AssuranceRemediationReviewer(
+        baseline_bundle=baseline,
+        service_factory=lambda _root: recording,
+    )
+    controller = RemediationController(
+        request=request,
+        selected_finding=selected_finding,
+        seed_root=intent.repository_path,
+        validation_executor=lambda _workspace: None,
+        subject_builder=lambda _patch_digest: subject_input,
+        reviewer_rerunner=reviewer,
+    )
+
+    prepared = asyncio.run(
+        controller._run_reviewer(
+            "architecture",
+            subject_input,
+            compute_subject_digest(subject_input),
+            workspace=workspace,
+        )
+    )
+
+    assert type(prepared) is PreparedReviewerRerun
+    assert prepared.bundle == changed_bundle
+    assert len(recording.calls) == 1
+
+
 def _rerun_with_bundle(
     tmp_path: Path, monkeypatch, mutate
 ):

@@ -283,6 +283,58 @@ def test_real_agent_mutation_returns_to_controller_validation_then_reviewer(
     )
 
 
+def test_reviewer_capability_prefers_explicit_rerun_over_broad_callable() -> None:
+    request = _request(_grant("fix.py"), _policy())
+    subject = _subject(head="new-head")
+    subject_digest = compute_subject_digest(subject)
+    received: list[dict[str, object]] = []
+
+    class ReviewerCapability:
+        async def rerun(self, *, reviewer_role: str, subject_digest: str) -> dict[str, str]:
+            received.append(
+                {
+                    "reviewer_role": reviewer_role,
+                    "subject_digest": subject_digest,
+                }
+            )
+            return {
+                "reviewer_role": reviewer_role,
+                "subject_digest": subject_digest,
+            }
+
+        async def __call__(self, **kwargs: object) -> dict[str, str]:
+            return await self.rerun(**kwargs)
+
+    controller = RemediationController(
+        request=request,
+        selected_finding=_finding(),
+        seed_root=Path("/tmp/seed"),
+        validation_executor=lambda _workspace: None,
+        subject_builder=lambda _patch_digest: subject,
+        reviewer_rerunner=ReviewerCapability(),
+    )
+
+    result = asyncio.run(
+        controller._run_reviewer(
+            "architecture",
+            subject,
+            subject_digest,
+            workspace=object(),
+        )
+    )
+
+    assert result == {
+        "reviewer_role": "architecture",
+        "subject_digest": subject_digest,
+    }
+    assert received == [
+        {
+            "reviewer_role": "architecture",
+            "subject_digest": subject_digest,
+        }
+    ]
+
+
 def test_attempt_budget_is_fixed_and_does_not_prepare_transition(tmp_path: Path) -> None:
     seed = tmp_path / "seed"
     seed.mkdir()
