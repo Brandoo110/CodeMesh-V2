@@ -678,9 +678,12 @@ class RemediationAgent:
             if isinstance(action, (ReadAction, ReplaceAction, WriteAction)):
                 _canonical_action_path(action.path)
             digest = hashlib.sha256(_action_json(action)).hexdigest()
-            if digest in seen_actions:
-                raise RemediationAgentRepeatedActionError("repeated action rejected")
-            seen_actions.add(digest)
+            if not isinstance(action, (ListAction, ReadAction)):
+                if digest in seen_actions:
+                    raise RemediationAgentRepeatedActionError(
+                        "repeated action rejected"
+                    )
+                seen_actions.add(digest)
 
             if isinstance(action, FinalizeAction):
                 return AgentAttemptResult(

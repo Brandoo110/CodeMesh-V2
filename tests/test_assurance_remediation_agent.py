@@ -245,7 +245,10 @@ def test_invalid_response_is_rejected_before_any_tool(
             "RemediationAgentActionPolicyError",
         ),
         (
-            ['{"action":"list"}', '{"action":"list"}'],
+            [
+                '{"action":"write","path":"fix.py","content":"new"}',
+                '{"action":"write","path":"fix.py","content":"new"}',
+            ],
             None,
             "RemediationAgentRepeatedActionError",
         ),
@@ -483,13 +486,17 @@ def test_oversized_initial_context_fails_before_model_call() -> None:
 
 def test_repeated_action_and_max_iterations_do_not_loop_forever() -> None:
     repeated_adapter = _Adapter(
-        ['{"action":"list"}', '{"action":"list"}', '{"action":"list"}']
+        [
+            '{"action":"write","path":"fix.py","content":"new"}',
+            '{"action":"write","path":"fix.py","content":"new"}',
+            '{"action":"write","path":"fix.py","content":"new"}',
+        ]
     )
     repeated_tools = _Tools()
     with pytest.raises(RemediationAgentProtocolError, match="repeated"):
         _repair(repeated_adapter, repeated_tools, max_iterations=3)
     assert len(repeated_adapter.calls) == 2
-    assert [name for name, _ in repeated_tools.calls] == ["list"]
+    assert [name for name, _ in repeated_tools.calls] == ["write"]
 
     limited_adapter = _Adapter(
         [
@@ -503,6 +510,28 @@ def test_repeated_action_and_max_iterations_do_not_loop_forever() -> None:
         _repair(limited_adapter, limited_tools, max_iterations=2)
     assert len(limited_adapter.calls) == 2
     assert [name for name, _ in limited_tools.calls] == ["list", "read"]
+
+
+@pytest.mark.parametrize(
+    ("action", "tool_name"),
+    (
+        ('{"action":"list"}', "list"),
+        ('{"action":"read","path":"fix.py"}', "read"),
+    ),
+)
+def test_repeated_observation_actions_can_finalize_within_iteration_cap(
+    action: str,
+    tool_name: str,
+) -> None:
+    adapter = _Adapter(
+        [action, action, '{"action":"finalize","summary":"done"}']
+    )
+    tools = _Tools()
+
+    result = _repair(adapter, tools, max_iterations=3)
+
+    assert result.iterations == 3
+    assert [name for name, _ in tools.calls] == [tool_name, tool_name]
 
 
 def test_finalize_without_mutation_returns_safe_truncated_result() -> None:
