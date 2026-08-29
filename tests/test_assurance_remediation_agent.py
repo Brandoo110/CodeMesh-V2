@@ -464,17 +464,36 @@ def test_oversized_response_and_content_are_rejected_without_tool() -> None:
     huge_response = "{" + (" " * 100) + "}"
     response_adapter = _Adapter([huge_response])
     response_tools = _Tools()
-    with pytest.raises(RemediationAgentBudgetError):
+    with pytest.raises(RemediationAgentBudgetError) as response_raised:
         _repair(response_adapter, response_tools, max_iterations=1, budgets=budgets)
+    assert type(response_raised.value).__name__ == "RemediationAgentResponseBudgetError"
     assert response_tools.calls == []
 
     content_adapter = _Adapter(
         ['{"action":"write","path":"fix.py","content":"123456789"}']
     )
     content_tools = _Tools()
-    with pytest.raises(RemediationAgentBudgetError):
+    with pytest.raises(RemediationAgentBudgetError) as content_raised:
         _repair(content_adapter, content_tools, max_iterations=1, budgets=budgets)
+    assert type(content_raised.value).__name__ == "RemediationAgentContentBudgetError"
     assert content_tools.calls == []
+
+    action_budgets = RemediationAgentBudgets(
+        max_response_bytes=4096,
+        max_observation_bytes=128,
+        max_context_bytes=4096,
+        max_action_bytes=32,
+        max_content_bytes=128,
+        max_summary_bytes=16,
+    )
+    action_adapter = _Adapter(
+        ['{"action":"write","path":"fix.py","content":"new"}']
+    )
+    action_tools = _Tools()
+    with pytest.raises(RemediationAgentBudgetError) as action_raised:
+        _repair(action_adapter, action_tools, max_iterations=1, budgets=action_budgets)
+    assert type(action_raised.value).__name__ == "RemediationAgentActionBudgetError"
+    assert action_tools.calls == []
 
 
 def test_observation_and_next_prompt_are_clipped_and_redacted() -> None:
@@ -523,7 +542,7 @@ def test_oversized_initial_context_fails_before_model_call() -> None:
     tools = _Tools()
     paths = tuple(f"file-{index}-" + "x" * 100 for index in range(8))
 
-    with pytest.raises(RemediationAgentBudgetError, match="context"):
+    with pytest.raises(RemediationAgentBudgetError, match="context") as raised:
         _repair(
             adapter,
             tools,
@@ -531,7 +550,28 @@ def test_oversized_initial_context_fails_before_model_call() -> None:
             max_iterations=1,
             budgets=budgets,
         )
+    assert type(raised.value).__name__ == "RemediationAgentContextBudgetError"
     assert adapter.calls == []
+
+
+def test_oversized_loop_context_uses_context_budget_error() -> None:
+    budgets = RemediationAgentBudgets(
+        max_response_bytes=1024,
+        max_observation_bytes=64,
+        max_context_bytes=1400,
+        max_action_bytes=512,
+        max_content_bytes=128,
+        max_summary_bytes=32,
+    )
+    adapter = _Adapter(['{"action":"list"}', '{"action":"finalize","summary":"done"}'])
+    tools = _Tools()
+
+    with pytest.raises(RemediationAgentBudgetError, match="context") as raised:
+        _repair(adapter, tools, max_iterations=2, budgets=budgets)
+
+    assert type(raised.value).__name__ == "RemediationAgentContextBudgetError"
+    assert len(adapter.calls) == 1
+    assert [name for name, _ in tools.calls] == ["list"]
 
 
 def test_repeated_action_and_max_iterations_do_not_loop_forever() -> None:
@@ -556,8 +596,9 @@ def test_repeated_action_and_max_iterations_do_not_loop_forever() -> None:
         ]
     )
     limited_tools = _Tools()
-    with pytest.raises(RemediationAgentBudgetError, match="iteration"):
+    with pytest.raises(RemediationAgentBudgetError, match="iteration") as raised:
         _repair(limited_adapter, limited_tools, max_iterations=2)
+    assert type(raised.value).__name__ == "RemediationAgentIterationBudgetError"
     assert len(limited_adapter.calls) == 2
     assert [name for name, _ in limited_tools.calls] == ["list", "read"]
 
@@ -665,8 +706,9 @@ def test_iteration_limits_are_strict_and_reject_model_copy_tampering(
     request = _request(max_iterations=3)
     request.policy.max_agent_iterations = policy_limit
 
-    with pytest.raises(RemediationAgentBudgetError):
+    with pytest.raises(RemediationAgentBudgetError) as raised:
         _repair(adapter, tools, request=request, max_iterations=3)
+    assert type(raised.value).__name__ == "RemediationAgentConfigurationBudgetError"
     assert adapter.calls == []
     assert tools.calls == []
 

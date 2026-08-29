@@ -267,6 +267,30 @@ def test_non_success_remediation_post_is_not_applied_without_commit(
             "AGENT_BUDGET_ERROR",
         ),
         (
+            "agent_error:RemediationAgentResponseBudgetError",
+            "AGENT_RESPONSE_BUDGET_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentConfigurationBudgetError",
+            "AGENT_CONFIGURATION_BUDGET_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentActionBudgetError",
+            "AGENT_ACTION_BUDGET_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentContentBudgetError",
+            "AGENT_CONTENT_BUDGET_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentContextBudgetError",
+            "AGENT_CONTEXT_BUDGET_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentIterationBudgetError",
+            "AGENT_ITERATION_BUDGET_ERROR",
+        ),
+        (
             "agent_error:RemediationAgentProtocolError",
             "AGENT_PROTOCOL_ERROR",
         ),

@@ -62,6 +62,30 @@ class RemediationAgentBudgetError(RemediationAgentError):
     """A server-owned response, content, context, or iteration budget ended."""
 
 
+class RemediationAgentResponseBudgetError(RemediationAgentBudgetError):
+    """The model response exceeded the server-owned response budget."""
+
+
+class RemediationAgentConfigurationBudgetError(RemediationAgentBudgetError):
+    """A server or controller supplied an invalid budget input."""
+
+
+class RemediationAgentActionBudgetError(RemediationAgentBudgetError):
+    """The serialized model action exceeded its server-owned budget."""
+
+
+class RemediationAgentContentBudgetError(RemediationAgentBudgetError):
+    """Model-provided action content exceeded its server-owned budget."""
+
+
+class RemediationAgentContextBudgetError(RemediationAgentBudgetError):
+    """The accumulated remediation prompt context exceeded its budget."""
+
+
+class RemediationAgentIterationBudgetError(RemediationAgentBudgetError):
+    """The bounded remediation loop reached its iteration budget."""
+
+
 @dataclass(frozen=True, slots=True)
 class RemediationAgentBudgets:
     """Immutable server-owned bounds for one repair attempt.
@@ -283,7 +307,7 @@ def _parse_action(response: object, budgets: RemediationAgentBudgets) -> Remedia
     if type(response) is not str:
         raise RemediationAgentResponseError("model response must be text")
     if len(response.encode("utf-8", errors="replace")) > budgets.max_response_bytes:
-        raise RemediationAgentBudgetError("model response budget exhausted")
+        raise RemediationAgentResponseBudgetError("model response budget exhausted")
     if "```" in response:
         raise RemediationAgentResponseError("Markdown fences are not allowed")
     try:
@@ -576,7 +600,9 @@ def _authoritative_check_id(request: object) -> str:
 
 def _strict_positive_int(value: object, label: str) -> int:
     if type(value) is not int or value <= 0:
-        raise RemediationAgentBudgetError(f"{label} must be a positive integer")
+        raise RemediationAgentConfigurationBudgetError(
+            f"{label} must be a positive integer"
+        )
     return value
 
 
@@ -585,13 +611,13 @@ def _validate_action_budget(
     budgets: RemediationAgentBudgets,
 ) -> None:
     if len(_action_json(action)) > budgets.max_action_bytes:
-        raise RemediationAgentBudgetError("action budget exhausted")
+        raise RemediationAgentActionBudgetError("action budget exhausted")
     if isinstance(action, ReplaceAction) and action.old_text == "":
         raise RemediationAgentActionPolicyError("replace old_text must not be empty")
     for field_name in ("old_text", "new_text", "content"):
         value = getattr(action, field_name, None)
         if value is not None and len(value.encode("utf-8")) > budgets.max_content_bytes:
-            raise RemediationAgentBudgetError("action content budget exhausted")
+            raise RemediationAgentContentBudgetError("action content budget exhausted")
 
 
 async def _execute_action(
@@ -683,13 +709,13 @@ class RemediationAgent:
             }
         ]
         if self._context_bytes(messages) > self._budgets.max_context_bytes:
-            raise RemediationAgentBudgetError("context budget exhausted")
+            raise RemediationAgentContextBudgetError("context budget exhausted")
 
         seen_actions: set[str] = set()
         iterations = 0
         while iterations < max_iterations:
             if self._context_bytes(messages) > self._budgets.max_context_bytes:
-                raise RemediationAgentBudgetError("context budget exhausted")
+                raise RemediationAgentContextBudgetError("context budget exhausted")
 
             # Deliberately do not inspect adapter attributes or catch its
             # exception.  The controller owns the outer error/status boundary.
@@ -729,7 +755,7 @@ class RemediationAgent:
                 }
             )
 
-        raise RemediationAgentBudgetError("iteration budget exhausted")
+        raise RemediationAgentIterationBudgetError("iteration budget exhausted")
 
     def _context_bytes(self, messages: list[dict[str, str]]) -> int:
         return len(SYSTEM_PROMPT.encode("utf-8")) + sum(
@@ -758,13 +784,19 @@ __all__ = [
     "RemediationAgent",
     "RemediationAgentActionPolicyError",
     "RemediationAgentActionSchemaError",
+    "RemediationAgentActionBudgetError",
     "RemediationAgentBudgetError",
     "RemediationAgentBudgets",
+    "RemediationAgentConfigurationBudgetError",
+    "RemediationAgentContentBudgetError",
     "RemediationAgentError",
+    "RemediationAgentContextBudgetError",
     "RemediationAgentInternalProtocolError",
+    "RemediationAgentIterationBudgetError",
     "RemediationAgentPathError",
     "RemediationAgentProtocolError",
     "RemediationAgentRepeatedActionError",
+    "RemediationAgentResponseBudgetError",
     "RemediationAgentResponseError",
     "ReplaceAction",
     "RunValidationAction",
