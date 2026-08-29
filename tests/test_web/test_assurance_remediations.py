@@ -19,6 +19,7 @@ from assurance.remediation import (
 )
 from web.assurance_remediation import (
     AssuranceRemediationRequest,
+    AssuranceRemediationNotAppliedError,
     AssuranceRemediationService,
 )
 from web.assurance_run_composition import AssuranceRunWebDependencies
@@ -28,6 +29,7 @@ from web.assurance_store import (
     AssuranceWebNotFoundError,
 )
 from web.routes.assurance_runs import get_assurance_run_client
+from web.routes.assurance_lifecycle import _map_remediation_exception
 from web.server import create_app
 from tests.test_web.test_assurance_run_store import (
     _db_rows,
@@ -255,6 +257,48 @@ def test_non_success_remediation_post_is_not_applied_without_commit(
     assert prepare_calls == [request.remediation_id]
     assert commit_calls == []
     assert snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "public_reason_code"),
+    (
+        (
+            "agent_error:RemediationAgentBudgetError",
+            "AGENT_BUDGET_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentProtocolError",
+            "AGENT_PROTOCOL_ERROR",
+        ),
+        ("agent_error:WorkspaceViolation", "WORKSPACE_ERROR"),
+        ("agent_error:ValueError", "AGENT_VALUE_ERROR"),
+        ("agent_error:TypeError", "AGENT_TYPE_ERROR"),
+        ("agent_error:ValidationError", "AGENT_VALIDATION_ERROR"),
+        ("agent_error:secret:/tmp/internal", "AGENT_ERROR"),
+    ),
+)
+def test_remediation_agent_error_reason_codes_are_fixed_and_non_sensitive(
+    reason_code, public_reason_code
+):
+    response = _map_remediation_exception(
+        AssuranceRemediationNotAppliedError(
+            status=RemediationStatus.FAILED,
+            reason_code=reason_code,
+        )
+    )
+
+    assert response.status_code == 409
+    payload = json.loads(response.body.decode("utf-8"))
+    assert payload == {
+        "code": "ASSURANCE_REMEDIATION_NOT_APPLIED",
+        "message": "assurance remediation was not applied",
+        "reason_codes": [
+            "REMEDIATION_NOT_APPLIED",
+            RemediationStatus.FAILED.value,
+            public_reason_code,
+        ],
+    }
+    assert reason_code not in response.body.decode("utf-8")
 
 
 def test_direct_remediation_post_rejects_policy_pass_before_prepare(

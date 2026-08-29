@@ -63,12 +63,18 @@ _REMEDIATION_NOT_APPLIED_REASON_CODES = {
     "subject_builder_invalid": "SUBJECT_BUILDER_INVALID",
     "subject_digest_unchanged": "SUBJECT_DIGEST_UNCHANGED",
     "reviewer_subject_mismatch": "REVIEWER_SUBJECT_MISMATCH",
+    "agent_error:RemediationAgentBudgetError": "AGENT_BUDGET_ERROR",
+    "agent_error:RemediationAgentProtocolError": "AGENT_PROTOCOL_ERROR",
+    "agent_error:WorkspaceViolation": "WORKSPACE_ERROR",
+    "agent_error:ValueError": "AGENT_VALUE_ERROR",
+    "agent_error:TypeError": "AGENT_TYPE_ERROR",
+    "agent_error:ValidationError": "AGENT_VALIDATION_ERROR",
 }
 
 
 def _public_remediation_not_applied_reason(reason_code: object) -> str:
     if isinstance(reason_code, str) and reason_code.startswith("agent_error:"):
-        return "AGENT_ERROR"
+        return _REMEDIATION_NOT_APPLIED_REASON_CODES.get(reason_code, "AGENT_ERROR")
     if isinstance(reason_code, str):
         return _REMEDIATION_NOT_APPLIED_REASON_CODES.get(
             reason_code, "PREPARATION_NOT_APPLIED"
