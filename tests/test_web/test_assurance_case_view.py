@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from assurance.contracts import AcceptanceCase, HumanDecision, PolicyDecision
+from assurance.contracts import AcceptanceCase, Finding, HumanDecision, PolicyDecision
 from assurance.lifecycle_store import StoredReleaseObservation
 from assurance.release_observation import (
     AlertRecord,
@@ -46,6 +46,29 @@ def _policy_gate(
 
 def _codes(actions: list[dict[str, object]]) -> tuple[str, ...]:
     return tuple(action["code"] for action in actions)
+
+
+def _finding(
+    *,
+    finding_id: str = "finding-eligible",
+    subject_digest: str = SUBJECT,
+    severity: str = "high",
+    basis: str = "deterministic",
+    status: str = "open",
+) -> Finding:
+    return Finding(
+        finding_id=finding_id,
+        subject_digest=subject_digest,
+        reviewer_role="architecture",
+        claim="the selected change needs repair",
+        evidence_refs=("evidence-1",),
+        basis=basis,
+        severity=severity,
+        confidence=1.0,
+        rubric_hash=RULES,
+        model_ref="reviewer-model",
+        status=status,
+    )
 
 
 def _policy(
@@ -408,6 +431,76 @@ def test_case_view_uses_latest_policy_and_release_declarations():
         "download_passport",
         "reject",
     )
+
+
+@pytest.mark.parametrize(
+    ("acceptance_state", "policy_status", "digest_freshness", "finding", "expected"),
+    (
+        ("EVIDENCE_COLLECTED", "BLOCKED", True, _finding(), True),
+        ("NEEDS_EVIDENCE", "STALE", True, _finding(basis="inferred", severity="critical"), True),
+        ("CONFLICTED", "NEEDS_HUMAN", True, _finding(), True),
+        ("CONDITIONAL_ACCEPTED", "BLOCKED", True, _finding(), True),
+        ("REJECTED", "STALE", True, _finding(), True),
+        ("DRAFT", "BLOCKED", True, _finding(), False),
+        ("ACCEPTED", "BLOCKED", True, _finding(), False),
+        ("INVALIDATED", "BLOCKED", True, _finding(), False),
+        ("EVIDENCE_COLLECTED", "PASS", True, _finding(), False),
+        ("EVIDENCE_COLLECTED", "NOT_EVALUATED", True, _finding(), False),
+        ("EVIDENCE_COLLECTED", "BLOCKED", False, _finding(), False),
+        ("EVIDENCE_COLLECTED", "BLOCKED", True, _finding(severity="medium"), False),
+        ("EVIDENCE_COLLECTED", "BLOCKED", True, _finding(status="acknowledged"), False),
+        ("EVIDENCE_COLLECTED", "BLOCKED", True, _finding(subject_digest="sha256:" + "f" * 64), False),
+        ("EVIDENCE_COLLECTED", "BLOCKED", True, None, False),
+    ),
+)
+def test_case_view_remediation_action_obeys_authoritative_eligibility_matrix(
+    acceptance_state,
+    policy_status,
+    digest_freshness,
+    finding,
+    expected,
+):
+    view = build_case_view(
+        case_id="case-view",
+        subject_digest=SUBJECT,
+        revision=1,
+        acceptance_state=acceptance_state,
+        decisions=(),
+        release_observations=(),
+        digest_freshness=digest_freshness,
+        risk="high",
+        findings=(finding,) if finding is not None else (),
+    )
+    policy_gate = view["policy_gate"]
+    policy_gate["status"] = policy_status
+    view["allowed_actions"] = derive_allowed_actions(
+        acceptance_state=acceptance_state,
+        policy_gate=policy_gate,
+        digest_freshness=digest_freshness,
+        risk="high",
+        subject_digest=SUBJECT,
+        findings=(finding,) if finding is not None else (),
+    )
+
+    assert (resolve_action(view["allowed_actions"], "remediate") is not None) is expected
+
+
+def test_remediate_action_is_high_risk_but_not_a_decision_action():
+    actions = derive_allowed_actions(
+        acceptance_state="EVIDENCE_COLLECTED",
+        policy_gate=_policy_gate("BLOCKED"),
+        digest_freshness=True,
+        risk="medium",
+        subject_digest=SUBJECT,
+        findings=(_finding(),),
+    )
+
+    assert resolve_action(actions, "remediate") == {
+        "code": "remediate",
+        "required_human_role": None,
+        "self_approval_forbidden": False,
+        "high_risk_confirmation_required": True,
+    }
 
 
 def test_web_projection_adds_case_view_and_ignores_metadata_release_status(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from assurance.contracts import PolicyDecision
+from assurance.contracts import Finding, PolicyDecision
 from assurance.live_freshness import FreshnessStatus, LiveFreshness
 from assurance.release_observation import ReleaseObservation
 from assurance.state_machine import allowed_event_kinds
@@ -16,7 +16,47 @@ _DECISION_STATES = {
     "CONFLICTED",
     "CONDITIONAL_ACCEPTED",
 }
+_REMEDIATION_ACCEPTANCE_STATES = {
+    "EVIDENCE_COLLECTED",
+    "NEEDS_EVIDENCE",
+    "CONFLICTED",
+    "CONDITIONAL_ACCEPTED",
+    "REJECTED",
+}
+_REMEDIATION_POLICY_STATES = {"STALE", "BLOCKED", "NEEDS_HUMAN"}
+_REMEDIATION_BASES = {"deterministic", "inferred"}
+_REMEDIATION_SEVERITIES = {"high", "critical"}
 _APPROVAL_CODES = {"approve", "approve_with_conditions", "waiver"}
+
+
+def is_remediation_finding_eligible(
+    *,
+    finding: object,
+    subject_digest: object,
+    acceptance_state: object,
+    policy_status: object,
+    digest_freshness: object,
+) -> bool:
+    """Return whether one Finding authorizes the remediation action."""
+
+    if isinstance(finding, Finding):
+        finding_data = finding
+        get = lambda name: getattr(finding_data, name, None)
+    elif isinstance(finding, Mapping):
+        get = finding.get
+    else:
+        return False
+    finding_subject = get("subject_digest")
+    return (
+        type(subject_digest) is str
+        and finding_subject == subject_digest
+        and acceptance_state in _REMEDIATION_ACCEPTANCE_STATES
+        and policy_status in _REMEDIATION_POLICY_STATES
+        and digest_freshness is True
+        and get("status") == "open"
+        and get("severity") in _REMEDIATION_SEVERITIES
+        and get("basis") in _REMEDIATION_BASES
+    )
 
 
 def _action(
@@ -30,7 +70,8 @@ def _action(
         "code": code,
         "required_human_role": required_human_role if approval else None,
         "self_approval_forbidden": approval,
-        "high_risk_confirmation_required": approval and high_risk,
+        "high_risk_confirmation_required": (approval or code == "remediate")
+        and (high_risk or code == "remediate"),
     }
 
 
@@ -40,11 +81,13 @@ def derive_allowed_actions(
     policy_gate: Mapping[str, object],
     digest_freshness: bool,
     risk: object,
+    subject_digest: str | None = None,
+    findings: Sequence[object] = (),
 ) -> list[dict[str, object]]:
     """Derive actions from acceptance, policy, digest, and risk facts."""
 
     actions = [_action("download_passport")]
-    if not digest_freshness or acceptance_state not in _DECISION_STATES:
+    if not digest_freshness:
         return actions
 
     event_kinds = set(allowed_event_kinds(acceptance_state))
@@ -52,6 +95,24 @@ def derive_allowed_actions(
         actions.append(_action("reject"))
 
     policy_status = policy_gate["status"]
+    if (
+        subject_digest is not None
+        and any(
+            is_remediation_finding_eligible(
+                finding=finding,
+                subject_digest=subject_digest,
+                acceptance_state=acceptance_state,
+                policy_status=policy_status,
+                digest_freshness=digest_freshness,
+            )
+            for finding in findings
+        )
+    ):
+        actions.append(_action("remediate", high_risk=True))
+
+    if acceptance_state not in _DECISION_STATES:
+        return actions
+
     if policy_status not in {"PASS", "NEEDS_HUMAN"}:
         return actions
 
@@ -185,6 +246,7 @@ def build_case_view(
     release_observations: Sequence[ReleaseObservation],
     digest_freshness: bool,
     risk: object,
+    findings: Sequence[object] = (),
 ) -> dict[str, object]:
     """Build the additive CaseView contract from already-loaded facts."""
 
@@ -203,6 +265,8 @@ def build_case_view(
             policy_gate=policy_gate,
             digest_freshness=digest_freshness,
             risk=risk,
+            subject_digest=subject_digest,
+            findings=findings,
         ),
     }
 
@@ -211,5 +275,6 @@ __all__ = [
     "apply_live_freshness",
     "build_case_view",
     "derive_allowed_actions",
+    "is_remediation_finding_eligible",
     "resolve_action",
 ]

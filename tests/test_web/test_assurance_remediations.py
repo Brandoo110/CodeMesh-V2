@@ -6,10 +6,12 @@ import asyncio
 import json
 import hashlib
 import sqlite3
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 
+from assurance.contracts import PolicyDecision
 from web.assurance_remediation import (
     AssuranceRemediationRequest,
     AssuranceRemediationService,
@@ -41,7 +43,37 @@ def _seed_remediation(tmp_path, monkeypatch):
         idempotency_key=baseline.idempotency_key,
         request_digest=baseline.request_digest,
     )
+    repository._store.append_policy_decision(
+        baseline.case.case_id,
+        PolicyDecision(
+            decision_id="policy-remediation-blocked",
+            subject_digest=baseline.subject.subject_digest,
+            policy_version=baseline.subject.policy_version,
+            rules_digest=baseline.policy.decision.rules_digest,
+            outcome="BLOCKED",
+            reason_codes=("REVIEW_REQUIRED",),
+            evaluated_at=baseline.completed_at + timedelta(seconds=1),
+        ),
+    )
     return repository, baseline, changed_bundle, request, handoff
+
+
+def _append_policy(repository, baseline, *, outcome, required_human_role=None):
+    repository._store.append_policy_decision(
+        baseline.case.case_id,
+        PolicyDecision(
+            decision_id=f"policy-current-{outcome.lower()}",
+            subject_digest=baseline.subject.subject_digest,
+            policy_version=baseline.subject.policy_version,
+            rules_digest=baseline.policy.decision.rules_digest,
+            outcome=outcome,
+            reason_codes=("REVIEW_REQUIRED",)
+            if outcome in {"STALE", "BLOCKED", "NEEDS_HUMAN"}
+            else (),
+            required_human_role=required_human_role,
+            evaluated_at=baseline.completed_at + timedelta(seconds=2),
+        ),
+    )
 
 
 def test_default_remediation_post_is_stably_not_configured():
@@ -122,6 +154,138 @@ def test_configured_remediation_post_commits_and_replays_without_reprepare(
     assert replay.json()["receipt"] == first.json()["receipt"]
     assert replay.json()["case_view"]["case"]["state"] == "DRAFT"
     assert prepare_calls == [request.remediation_id]
+
+
+def test_direct_remediation_post_rejects_policy_pass_before_prepare(
+    tmp_path, monkeypatch
+):
+    repository, baseline, _, request, handoff = _seed_remediation(tmp_path, monkeypatch)
+    _append_policy(repository, baseline, outcome="PASS")
+    request_calls = []
+    prepare_calls = []
+
+    def request_factory(context, intent, **_):
+        request_calls.append((context, intent))
+        return request
+
+    async def prepare_callback(request, context):
+        prepare_calls.append(request.remediation_id)
+        return handoff
+
+    service = AssuranceRemediationService(
+        repository,
+        request_factory=request_factory,
+        prepare_callback=prepare_callback,
+    )
+    app = create_app(
+        assurance_run_dependencies=AssuranceRunWebDependencies(
+            service=object(),
+            repository=repository,
+            remediation_service=service,
+        )
+    )
+    app.dependency_overrides[get_assurance_run_client] = lambda: "127.0.0.1"
+    payload = {
+        "remediation_id": request.remediation_id,
+        "human_selected_finding_id": request.human_selected_finding_id,
+        "requested_by": request.requested_by,
+        "requested_at": request.requested_at.isoformat(),
+    }
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/assurance/changes/{request.old_case_id}/remediations",
+                headers={"Idempotency-Key": "remediate:policy-pass"},
+                json=payload,
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "code": "ASSURANCE_REMEDIATION_CONFLICT",
+        "message": "assurance remediation conflicts with existing state",
+        "reason_codes": ["REMEDIATION_CONFLICT"],
+    }
+    assert request_calls == []
+    assert prepare_calls == []
+
+
+def test_eligible_inferred_finding_with_needs_human_enters_prepared_flow(
+    tmp_path, monkeypatch
+):
+    repository, baseline, _, request, handoff = _seed_remediation(tmp_path, monkeypatch)
+    _append_policy(
+        repository,
+        baseline,
+        outcome="NEEDS_HUMAN",
+        required_human_role="release_owner",
+    )
+    prepare_calls = []
+
+    def request_factory(context, intent, **_):
+        return request
+
+    async def prepare_callback(request, context):
+        prepare_calls.append(request.remediation_id)
+        return handoff
+
+    service = AssuranceRemediationService(
+        repository,
+        request_factory=request_factory,
+        prepare_callback=prepare_callback,
+    )
+    app = create_app(
+        assurance_run_dependencies=AssuranceRunWebDependencies(
+            service=object(),
+            repository=repository,
+            remediation_service=service,
+        )
+    )
+    app.dependency_overrides[get_assurance_run_client] = lambda: "127.0.0.1"
+    payload = {
+        "remediation_id": request.remediation_id,
+        "human_selected_finding_id": request.human_selected_finding_id,
+        "requested_by": request.requested_by,
+        "requested_at": request.requested_at.isoformat(),
+    }
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/assurance/changes/{request.old_case_id}/remediations",
+                headers={"Idempotency-Key": "remediate:needs-human"},
+                json=payload,
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    assert response.json()["cached"] is False
+    assert prepare_calls == [request.remediation_id]
+
+
+def test_commit_rechecks_current_policy_before_writing_after_context_load(
+    tmp_path, monkeypatch
+):
+    repository, baseline, _, request, handoff = _seed_remediation(tmp_path, monkeypatch)
+    repository.load_remediation_context(
+        request.old_case_id, request.human_selected_finding_id
+    )
+    _append_policy(repository, baseline, outcome="PASS")
+
+    with pytest.raises(AssuranceWebConflictError, match="eligible"):
+        repository.commit_prepared_remediation(
+            request,
+            handoff,
+            idempotency_key="remediate:policy-toctou",
+        )
+
+    assert _db_rows(
+        repository,
+        "SELECT COUNT(*) AS count FROM assurance_remediations",
+    )[0]["count"] == 0
 
 
 def test_replay_conflict_with_invalid_projection_reraises_conflict():

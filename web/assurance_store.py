@@ -43,7 +43,11 @@ from assurance.store import (
     StoreConflictError,
     StorePersistenceError,
 )
-from web.assurance_case_view import apply_live_freshness, build_case_view
+from web.assurance_case_view import (
+    apply_live_freshness,
+    build_case_view,
+    is_remediation_finding_eligible,
+)
 from web.assurance_run_committer import (
     AssuranceRunCommitter,
     AssuranceRunConflictError,
@@ -67,6 +71,10 @@ class AssuranceWebError(Exception):
 
 class AssuranceWebConflictError(AssuranceWebError):
     """Idempotency key reused with a different operation or payload."""
+
+
+class _RemediationEligibilityConflict(StoreConflictError, AssuranceWebError):
+    """Keep an ineligible pre-prepare request outside replay fallback."""
 
 
 class AssuranceWebPreconditionError(AssuranceWebConflictError):
@@ -198,16 +206,22 @@ class AssuranceWebRepository:
         ):
             raise ValueError("human_selected_finding_id must be nonblank")
         try:
+            if self._live_required:
+                self._projection(case_id)
             with self._store._transaction(write=False) as unit_of_work:
                 conn = unit_of_work.connection
                 _validate_run_schema(conn)
                 self._ensure_web_remediation_schema(conn)
                 self._store._ensure_lifecycle_initialized(conn)
+                self._require_live_freshness_in_transaction(
+                    conn, case_id, required=True
+                )
                 state = unit_of_work.load_case(case_id)
                 return self._load_authoritative_remediation_context_in_transaction(
                     unit_of_work,
                     old_case=state.case,
                     human_selected_finding_id=human_selected_finding_id,
+                    eligibility_error=_RemediationEligibilityConflict,
                 )
         except AssuranceWebError:
             raise
@@ -387,13 +401,13 @@ class AssuranceWebRepository:
                         " is already committed under another idempotency key"
                     )
 
+                self._require_live_freshness_in_transaction(
+                    conn, request.old_case_id, required=True
+                )
                 selected_finding, baseline_binding, baseline_bundle = (
                     self._load_authoritative_remediation_finding_in_transaction(
                         unit_of_work, request=request, handoff=handoff
                     )
-                )
-                self._require_live_freshness_in_transaction(
-                    conn, request.old_case_id, required=True
                 )
                 expected_case, expected_binding, expected_event = (
                     self._derive_remediation_transition_in_transaction(
@@ -526,6 +540,7 @@ class AssuranceWebRepository:
         old_case: AcceptanceCase,
         human_selected_finding_id: str,
         allow_invalidated: bool = False,
+        eligibility_error: type[Exception] = AssuranceWebConflictError,
     ) -> RemediationContext:
         """Read one open Finding and its baseline only from committed runs."""
 
@@ -599,6 +614,29 @@ class AssuranceWebRepository:
             raise AssuranceWebConflictError(
                 "remediation selected Finding is not the requested open Finding"
             )
+        if not allow_invalidated:
+            latest_policy = next(
+                (
+                    decision
+                    for decision in reversed(unit_of_work.list_decisions(old_case.case_id))
+                    if isinstance(decision, PolicyDecision)
+                ),
+                None,
+            )
+            if latest_policy is None or latest_policy.subject_digest != old_case.subject_digest:
+                raise eligibility_error(
+                    "remediation action is not currently eligible"
+                )
+            if not is_remediation_finding_eligible(
+                finding=finding,
+                subject_digest=old_case.subject_digest,
+                acceptance_state=old_case.state,
+                policy_status=latest_policy.outcome,
+                digest_freshness=True,
+            ):
+                raise eligibility_error(
+                    "remediation action is not currently eligible"
+                )
         return RemediationContext(
             old_case=old_case,
             baseline_binding=baseline_binding,
@@ -1907,6 +1945,7 @@ class AssuranceWebRepository:
             ),
             digest_freshness=digest_freshness,
             risk=(metadata or {}).get("risk"),
+            findings=findings,
         )
         if self._live_required:
             if not check_live:
