@@ -34,6 +34,30 @@ class RemediationAgentProtocolError(RemediationAgentError):
     """The model returned a response outside the fixed action contract."""
 
 
+class RemediationAgentResponseError(RemediationAgentProtocolError):
+    """The model response was not valid structured JSON text."""
+
+
+class RemediationAgentActionSchemaError(RemediationAgentProtocolError):
+    """The model response did not match a supported action schema."""
+
+
+class RemediationAgentPathError(RemediationAgentProtocolError):
+    """The model supplied a non-canonical or private workspace path."""
+
+
+class RemediationAgentActionPolicyError(RemediationAgentProtocolError):
+    """The model action violated a server-owned action policy."""
+
+
+class RemediationAgentRepeatedActionError(RemediationAgentProtocolError):
+    """The model repeated an action already attempted in this repair loop."""
+
+
+class RemediationAgentInternalProtocolError(RemediationAgentProtocolError):
+    """The remediation protocol reached an unsupported internal branch."""
+
+
 class RemediationAgentBudgetError(RemediationAgentError):
     """A server-owned response, content, context, or iteration budget ended."""
 
@@ -220,25 +244,25 @@ def _canonical_action_path(value: object) -> str:
     """Validate the exact canonical spelling required by the public workspace."""
 
     if type(value) is not str or not value:
-        raise RemediationAgentProtocolError("path must be a non-empty string")
+        raise RemediationAgentPathError("path must be a non-empty string")
     if "\x00" in value:
-        raise RemediationAgentProtocolError("path contains a forbidden character")
+        raise RemediationAgentPathError("path contains a forbidden character")
     if _PERCENT_ESCAPE_RE.search(value) is not None:
-        raise RemediationAgentProtocolError("percent-encoded paths are not allowed")
+        raise RemediationAgentPathError("percent-encoded paths are not allowed")
     if "//" in value or _SCHEME_RE.match(value) is not None:
-        raise RemediationAgentProtocolError("URI paths are not allowed")
+        raise RemediationAgentPathError("URI paths are not allowed")
     if value.startswith("/") or value.startswith("\\"):
-        raise RemediationAgentProtocolError("absolute paths are not allowed")
+        raise RemediationAgentPathError("absolute paths are not allowed")
     if re.match(r"^[A-Za-z]:", value) is not None:
-        raise RemediationAgentProtocolError("drive paths are not allowed")
+        raise RemediationAgentPathError("drive paths are not allowed")
     try:
         canonical = normalize_repo_path(value)
     except (TypeError, ValueError) as exc:
-        raise RemediationAgentProtocolError("path is not a valid repository path") from exc
+        raise RemediationAgentPathError("path is not a valid repository path") from exc
     if canonical != value:
-        raise RemediationAgentProtocolError("path must use canonical spelling")
+        raise RemediationAgentPathError("path must use canonical spelling")
     if _private_path(canonical):
-        raise RemediationAgentProtocolError("controller-private paths are not allowed")
+        raise RemediationAgentPathError("controller-private paths are not allowed")
     return canonical
 
 
@@ -257,11 +281,11 @@ def _reject_json_constant(value: str) -> object:
 
 def _parse_action(response: object, budgets: RemediationAgentBudgets) -> RemediationAction:
     if type(response) is not str:
-        raise RemediationAgentProtocolError("model response must be text")
+        raise RemediationAgentResponseError("model response must be text")
     if len(response.encode("utf-8", errors="replace")) > budgets.max_response_bytes:
         raise RemediationAgentBudgetError("model response budget exhausted")
     if "```" in response:
-        raise RemediationAgentProtocolError("Markdown fences are not allowed")
+        raise RemediationAgentResponseError("Markdown fences are not allowed")
     try:
         payload = json.loads(
             response,
@@ -269,13 +293,15 @@ def _parse_action(response: object, budgets: RemediationAgentBudgets) -> Remedia
             parse_constant=_reject_json_constant,
         )
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise RemediationAgentProtocolError("model response is not valid JSON") from exc
+        raise RemediationAgentResponseError("model response is not valid JSON") from exc
     if type(payload) is not dict:
-        raise RemediationAgentProtocolError("model response must be a JSON object")
+        raise RemediationAgentResponseError("model response must be a JSON object")
     try:
         action = _ACTION_ADAPTER.validate_python(payload)
     except ValidationError as exc:
-        raise RemediationAgentProtocolError("model response does not match action schema") from exc
+        raise RemediationAgentActionSchemaError(
+            "model response does not match action schema"
+        ) from exc
     return action
 
 
@@ -511,7 +537,7 @@ async def _call_tool(tools: object, name: str, *args: object) -> object:
     elif name == "run_validation":
         result = tools.run_validation(args[0])
     else:
-        raise RemediationAgentProtocolError("unsupported tool operation")
+        raise RemediationAgentInternalProtocolError("unsupported tool operation")
     if inspect.isawaitable(result):
         return await result
     return result
@@ -521,7 +547,9 @@ def _authoritative_check_id(request: object) -> str:
     policy = _get_value(request, "policy")
     check_id = _get_value(policy, "authoritative_check_id")
     if type(check_id) is not str or not check_id:
-        raise RemediationAgentProtocolError("request has no server-authorized check ID")
+        raise RemediationAgentInternalProtocolError(
+            "request has no server-authorized check ID"
+        )
     return check_id
 
 
@@ -538,7 +566,7 @@ def _validate_action_budget(
     if len(_action_json(action)) > budgets.max_action_bytes:
         raise RemediationAgentBudgetError("action budget exhausted")
     if isinstance(action, ReplaceAction) and action.old_text == "":
-        raise RemediationAgentProtocolError("replace old_text must not be empty")
+        raise RemediationAgentActionPolicyError("replace old_text must not be empty")
     for field_name in ("old_text", "new_text", "content"):
         value = getattr(action, field_name, None)
         if value is not None and len(value.encode("utf-8")) > budgets.max_content_bytes:
@@ -566,11 +594,13 @@ async def _execute_action(
         return await _call_tool(tools, "write_file", path, action.content)
     if isinstance(action, RunValidationAction):
         if action.check_id != _authoritative_check_id(request):
-            raise RemediationAgentProtocolError("validation check is not authorized")
+            raise RemediationAgentActionPolicyError(
+                "validation check is not authorized"
+            )
         return await _call_tool(tools, "run_validation", action.check_id)
     if isinstance(action, FinalizeAction):
         return None
-    raise RemediationAgentProtocolError("unsupported remediation action")
+    raise RemediationAgentInternalProtocolError("unsupported remediation action")
 
 
 class RemediationAgent:
@@ -649,7 +679,7 @@ class RemediationAgent:
                 _canonical_action_path(action.path)
             digest = hashlib.sha256(_action_json(action)).hexdigest()
             if digest in seen_actions:
-                raise RemediationAgentProtocolError("repeated action rejected")
+                raise RemediationAgentRepeatedActionError("repeated action rejected")
             seen_actions.add(digest)
 
             if isinstance(action, FinalizeAction):
@@ -700,10 +730,16 @@ __all__ = [
     "ReadAction",
     "RemediationAction",
     "RemediationAgent",
+    "RemediationAgentActionPolicyError",
+    "RemediationAgentActionSchemaError",
     "RemediationAgentBudgetError",
     "RemediationAgentBudgets",
     "RemediationAgentError",
+    "RemediationAgentInternalProtocolError",
+    "RemediationAgentPathError",
     "RemediationAgentProtocolError",
+    "RemediationAgentRepeatedActionError",
+    "RemediationAgentResponseError",
     "ReplaceAction",
     "RunValidationAction",
     "StructuredRemediationAgent",

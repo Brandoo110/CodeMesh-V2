@@ -270,6 +270,30 @@ def test_non_success_remediation_post_is_not_applied_without_commit(
             "agent_error:RemediationAgentProtocolError",
             "AGENT_PROTOCOL_ERROR",
         ),
+        (
+            "agent_error:RemediationAgentResponseError",
+            "AGENT_RESPONSE_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentActionSchemaError",
+            "ACTION_SCHEMA_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentPathError",
+            "PATH_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentActionPolicyError",
+            "ACTION_POLICY_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentRepeatedActionError",
+            "REPEATED_ACTION_ERROR",
+        ),
+        (
+            "agent_error:RemediationAgentInternalProtocolError",
+            "INTERNAL_PROTOCOL_ERROR",
+        ),
         ("agent_error:WorkspaceViolation", "WORKSPACE_ERROR"),
         ("agent_error:ValueError", "AGENT_VALUE_ERROR"),
         ("agent_error:TypeError", "AGENT_TYPE_ERROR"),

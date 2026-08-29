@@ -225,6 +225,56 @@ def test_invalid_response_is_rejected_before_any_tool(
     assert tools.calls == []
 
 
+@pytest.mark.parametrize(
+    ("responses", "request_value", "expected_type"),
+    (
+        (["not json"], None, "RemediationAgentResponseError"),
+        (
+            ['{"action":"delete","path":"fix.py"}'],
+            None,
+            "RemediationAgentActionSchemaError",
+        ),
+        (
+            [json.dumps({"action": "read", "path": "../fix.py"})],
+            None,
+            "RemediationAgentPathError",
+        ),
+        (
+            ['{"action":"replace","path":"fix.py","old_text":"","new_text":"new"}'],
+            None,
+            "RemediationAgentActionPolicyError",
+        ),
+        (
+            ['{"action":"list"}', '{"action":"list"}'],
+            None,
+            "RemediationAgentRepeatedActionError",
+        ),
+        (
+            ['{"action":"run_validation","check_id":"authoritative"}'],
+            _request(check_id=None),
+            "RemediationAgentInternalProtocolError",
+        ),
+    ),
+)
+def test_protocol_failures_use_specific_safe_subclasses(
+    responses: list[object],
+    request_value: object | None,
+    expected_type: str,
+) -> None:
+    adapter = _Adapter(responses)
+    tools = _Tools()
+
+    with pytest.raises(RemediationAgentProtocolError) as raised:
+        _repair(
+            adapter,
+            tools,
+            request=request_value,
+            max_iterations=len(responses),
+        )
+
+    assert type(raised.value).__name__ == expected_type
+
+
 def test_model_adapter_surface_is_complete_only() -> None:
     class CompleteOnlyAdapter:
         def __init__(self) -> None:
