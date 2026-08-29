@@ -202,6 +202,16 @@ def test_selected_finding_claim_is_redacted_in_initial_prompt() -> None:
     assert "/Users/junjieli/private/finding.txt" not in prompt
 
 
+def test_system_prompt_prioritizes_bounded_single_file_repair() -> None:
+    adapter = _Adapter(['{"action":"finalize","summary":"done"}'])
+
+    _repair(adapter, _Tools(), max_iterations=1)
+
+    system_prompt = " ".join(adapter.calls[0][1].split()).casefold()
+    assert "known single-file path: skip list" in system_prompt
+    assert "read, edit once, validate, finalize after pass" in system_prompt
+
+
 def test_structured_loop_executes_one_action_per_model_call() -> None:
     class Adapter:
         def __init__(self) -> None:

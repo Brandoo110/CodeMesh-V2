@@ -192,6 +192,7 @@ fields.  The only actions are: {"action":"list"};
 Paths must be canonical relative paths.  Validation accepts only the
 server-authorized check ID supplied in the request context.  Use one action at
 a time and wait for the next untrusted observation before choosing another.
+Known single-file path: skip list; read, edit once, validate, finalize after pass.
 """
 
 
