@@ -53,7 +53,7 @@ jobs:
           pnpm test
           pnpm exec tsc --noEmit --allowImportingTsExtensions
           pnpm exec eslint . --rule 'react-hooks/set-state-in-effect: off' --rule 'react-hooks/exhaustive-deps: off'
-          pnpm build
+          NEXT_PUBLIC_API_BASE=http://127.0.0.1:8010 pnpm build
 
       - name: Start isolated API and frontend
         env:
