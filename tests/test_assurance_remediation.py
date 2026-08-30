@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 
 from assurance.contracts import Finding
 from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.artifacts import ArtifactStore
 from assurance.remediation import (
     RemediationAttempt,
     RemediationController,
@@ -33,6 +35,7 @@ from assurance.remediation_workspace import (
     WorkspaceGrant,
     WorkspaceViolation,
 )
+from assurance.snapshot import GitSnapshotCollector
 
 
 OLD_DIGEST = "sha256:" + "1" * 64
@@ -200,6 +203,51 @@ def test_workspace_rejects_escape_duplicate_and_symlink(tmp_path: Path) -> None:
             workspace.read_text("src/other.py")
         with pytest.raises(WorkspaceViolation):
             workspace.read_text("src/link.py")
+
+
+def test_workspace_detaches_copied_worktree_git_admin_for_snapshot_collection(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*args: str) -> bytes:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8", errors="replace"
+        )
+        return result.stdout
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (repository / "fix.json").write_text('{"valid": false}\n', encoding="utf-8")
+    git("add", "fix.json")
+    git("commit", "-qm", "baseline")
+    base_revision = git("rev-parse", "HEAD").decode().strip()
+
+    seed = tmp_path / "seed-worktree"
+    git("worktree", "add", "--detach", str(seed), base_revision)
+    (seed / "fix.json").write_text('{"valid": true}\n', encoding="utf-8")
+
+    with IsolatedWorkspace.prepare(seed, _grant("fix.json")) as workspace:
+        result = GitSnapshotCollector(command_timeout_seconds=1.0).collect(
+            workspace.root,
+            repository_identity="codemesh/fixture",
+            base_ref=base_revision,
+            task_digest=TASK_DIGEST,
+            policy_version="policy-v1",
+            rubric_version="rubric-v1",
+            artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        )
+
+    assert [change.path for change in result.snapshot.changes] == ["fix.json"]
+    assert result.snapshot.complete is True
 
 
 def test_workspace_publishes_repaired_root_after_temp_cleanup_without_overwrite(

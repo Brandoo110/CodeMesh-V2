@@ -125,6 +125,66 @@ class IsolatedWorkspace:
             shutil.copytree(seed, root, symlinks=True)
             root = root.resolve()
             (root / CONTROLLER_PRIVATE_DIR).mkdir(parents=True, exist_ok=True)
+            git_marker = root / ".git"
+            if git_marker.is_symlink():
+                raise WorkspaceViolation(
+                    "workspace Git metadata must not be a symlink"
+                )
+            if git_marker.is_file():
+                marker_lines = git_marker.read_text(encoding="utf-8").splitlines()
+                if len(marker_lines) != 1 or not marker_lines[0].startswith(
+                    "gitdir: "
+                ):
+                    raise WorkspaceViolation(
+                        "workspace Git worktree metadata is invalid"
+                    )
+                source_admin = Path(marker_lines[0][len("gitdir: ") :].strip())
+                if not source_admin.is_absolute():
+                    source_admin = git_marker.parent / source_admin
+                source_admin = source_admin.resolve(strict=True)
+                if not source_admin.is_dir():
+                    raise WorkspaceViolation(
+                        "workspace Git worktree admin directory is unavailable"
+                    )
+                git_marker.unlink()
+                isolated_admin = root / ".git"
+                isolated_admin.mkdir(parents=True, exist_ok=True)
+                for entry in source_admin.iterdir():
+                    if entry.name in {"commondir", "gitdir"}:
+                        continue
+                    destination = isolated_admin / entry.name
+                    if entry.is_dir() and not entry.is_symlink():
+                        shutil.copytree(entry, destination, symlinks=True)
+                    elif entry.is_file() and not entry.is_symlink():
+                        shutil.copy2(entry, destination)
+                commondir = source_admin / "commondir"
+                if commondir.is_file():
+                    common_root = Path(
+                        commondir.read_text(encoding="utf-8").strip()
+                    )
+                    if not common_root.is_absolute():
+                        common_root = source_admin / common_root
+                    common_root = common_root.resolve(strict=True)
+                    objects_dir = common_root / "objects"
+                    if not objects_dir.is_dir():
+                        raise WorkspaceViolation(
+                            "workspace Git object directory is unavailable"
+                        )
+                    alternates = isolated_admin / "objects" / "info"
+                    alternates.mkdir(parents=True, exist_ok=True)
+                    (alternates / "alternates").write_text(
+                        f"{objects_dir}\n", encoding="utf-8"
+                    )
+                (isolated_admin / "config").write_text(
+                    "[core]\n"
+                    "\trepositoryformatversion = 0\n"
+                    "\tfilemode = true\n"
+                    "\tbare = false\n"
+                    "\tlogallrefupdates = false\n"
+                    "\tcheckStat = minimal\n"
+                    "\ttrustctime = false\n",
+                    encoding="utf-8",
+                )
         except Exception:
             temporary.cleanup()
             raise
