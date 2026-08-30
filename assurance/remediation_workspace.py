@@ -11,6 +11,7 @@ import hashlib
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,6 +132,27 @@ class IsolatedWorkspace:
                     "workspace Git metadata must not be a symlink"
                 )
             if git_marker.is_file():
+                try:
+                    resolved_head = subprocess.run(
+                        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                        cwd=seed,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=5,
+                    )
+                    source_head = resolved_head.stdout.decode("ascii").strip()
+                except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
+                    raise WorkspaceViolation(
+                        "workspace Git HEAD cannot be resolved"
+                    ) from exc
+                if (
+                    resolved_head.returncode != 0
+                    or re.fullmatch(r"[0-9a-f]{40}", source_head) is None
+                ):
+                    raise WorkspaceViolation(
+                        "workspace Git HEAD cannot be resolved"
+                    )
                 marker_lines = git_marker.read_text(encoding="utf-8").splitlines()
                 if len(marker_lines) != 1 or not marker_lines[0].startswith(
                     "gitdir: "
@@ -150,13 +172,16 @@ class IsolatedWorkspace:
                 isolated_admin = root / ".git"
                 isolated_admin.mkdir(parents=True, exist_ok=True)
                 for entry in source_admin.iterdir():
-                    if entry.name in {"commondir", "gitdir"}:
+                    if entry.name in {"HEAD", "commondir", "gitdir"}:
                         continue
                     destination = isolated_admin / entry.name
                     if entry.is_dir() and not entry.is_symlink():
                         shutil.copytree(entry, destination, symlinks=True)
                     elif entry.is_file() and not entry.is_symlink():
                         shutil.copy2(entry, destination)
+                (isolated_admin / "HEAD").write_text(
+                    f"{source_head}\n", encoding="ascii"
+                )
                 commondir = source_admin / "commondir"
                 if commondir.is_file():
                     common_root = Path(
