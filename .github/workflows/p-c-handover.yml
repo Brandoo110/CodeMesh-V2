@@ -51,7 +51,7 @@ jobs:
         working-directory: frontend
         run: |
           pnpm test
-          pnpm exec tsc --noEmit
+          pnpm exec tsc --noEmit --allowImportingTsExtensions
           pnpm lint
           pnpm build
 
