@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 from assurance.integrations.github_client import (
     GitHubCheckPublisher,
@@ -325,9 +326,16 @@ def test_import_event_head_mismatch_happens_before_github_mutation(tmp_path, mon
 
 def test_workflow_queries_only_current_evidence_v2_transport_ref():
     workflow = Path(".github/workflows/codemesh-assurance.yml").read_text(encoding="utf-8")
+    document = yaml.safe_load(workflow)
 
     assert "refs/heads/codex/evidence-v2/*/" in workflow
     assert "refs/heads/codex/evidence/*/" not in workflow
+    assert document["permissions"] == {
+        "contents": "read",
+        "pull-requests": "read",
+        "checks": "write",
+        "actions": "read",
+    }
 
 
 def test_import_checkout_mismatch_happens_before_github_mutation(tmp_path, monkeypatch):
