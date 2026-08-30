@@ -30,6 +30,9 @@ _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY_RE = re.compile(r"^[^/\s?#]+/[^/\s?#]+$")
 _ARTIFACT_FILE_RE = re.compile(r"^sha256_([0-9a-f]{64})$")
 _INDEX_FILE_RE = re.compile(r"^ev_[A-Za-z0-9_-]+-index\.json$")
+_TRANSPORT_REF_RE = re.compile(
+    r"^refs/heads/codex/evidence/([0-9a-f]{40})/([0-9a-f]{40})$"
+)
 _MAX_OBJECT_BYTES = 256 * 1024
 _MAX_BUNDLE_BYTES = 900 * 1024
 _MAX_OBJECTS = 256
@@ -252,6 +255,25 @@ def _require_sha1(value: object, *, field: str) -> str:
     if _SHA1_RE.fullmatch(text) is None:
         raise BundleError(f"{field} must be a lowercase 40-character SHA")
     return text
+
+
+def transport_ref_for(*, producer_head: str, transport_head: str) -> str:
+    """Return the immutable evidence ref for both producer and transport heads."""
+
+    producer = _require_sha1(producer_head, field="producer_head")
+    transport = _require_sha1(transport_head, field="transport_head")
+    return f"refs/heads/codex/evidence/{producer}/{transport}"
+
+
+def parse_transport_ref(ref: object) -> tuple[str, str] | None:
+    """Parse a dual-version evidence ref; legacy or malformed refs are not valid."""
+
+    if type(ref) is not str:
+        return None
+    match = _TRANSPORT_REF_RE.fullmatch(ref)
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
 
 
 def _require_repository(value: object) -> str:
@@ -508,7 +530,10 @@ def _build_document(
         subject_digest=subject_digest,
         producer_head=producer_head,
     )
-    transport_ref = f"refs/heads/codex/evidence/{producer_head}"
+    transport_ref = transport_ref_for(
+        producer_head=producer_head,
+        transport_head=transport_head,
+    )
 
     objects_by_digest: dict[str, dict[str, object]] = {}
     references: set[str] = set()
@@ -806,8 +831,11 @@ def _verify_document(document: dict[str, Any], *, max_object_bytes: int) -> Veri
     producer_head = _require_sha1(document["producer_head"], field="producer_head")
     transport_head = _require_sha1(document["transport_head"], field="transport_head")
     transport_ref = _require_text(document["transport_ref"], field="transport_ref")
-    if transport_ref != f"refs/heads/codex/evidence/{producer_head}":
-        raise BundleError("transport_ref is not bound to producer_head")
+    if transport_ref != transport_ref_for(
+        producer_head=producer_head,
+        transport_head=transport_head,
+    ):
+        raise BundleError("transport_ref is not bound to producer and transport heads")
     transport_id = _require_text(document["transport_id"], field="transport_id")
     if transport_id != _transport_id(
         repository=repository,
@@ -1000,7 +1028,10 @@ def _verify_document(document: dict[str, Any], *, max_object_bytes: int) -> Veri
 
     if expected_references != set(closure):
         raise BundleError("bundle contains an unreferenced or missing object")
-    expected_transport_ref = f"refs/heads/codex/evidence/{producer_head}"
+    expected_transport_ref = transport_ref_for(
+        producer_head=producer_head,
+        transport_head=transport_head,
+    )
     lineage = document["lineage"]
     workbench = document["workbench"]
     if not isinstance(lineage, Mapping) or not isinstance(workbench, Mapping):

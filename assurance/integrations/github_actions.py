@@ -33,9 +33,12 @@ from ..case_publication import (
     RemotePublication,
 )
 from ..evidence_bundle import (
+    BundleError,
     BuiltEvidenceBundle,
     VerifiedEvidenceBundle,
     canonical_json_bytes,
+    parse_transport_ref,
+    transport_ref_for,
     verify_evidence_bundle,
 )
 from .github_client import GitHubCheckPublisher
@@ -44,7 +47,6 @@ from .github_client import GitHubCheckPublisher
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY_RE = re.compile(r"^[^/\s?#]+/[^/\s?#]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-_BUNDLE_REF_RE = re.compile(r"^refs/heads/codex/evidence/([0-9a-f]{40})$")
 _IMPORTED_CHECK_NAME = "CodeMesh Imported Authoritative Case"
 _WORKFLOW_FILE = "codemesh-assurance.yml"
 _BUNDLE_FILE = "bundle.json"
@@ -411,10 +413,35 @@ class _GitHubApi:
 
 
 def _ref_endpoint(ref: str) -> str:
-    match = _BUNDLE_REF_RE.fullmatch(ref)
-    if match is None:
+    parts = parse_transport_ref(ref)
+    if parts is None:
         raise GitHubActionsError("temporary ref is invalid")
-    return "/git/ref/heads/codex/evidence/" + match.group(1)
+    producer_head, transport_head = parts
+    return f"/git/ref/heads/codex/evidence/{producer_head}/{transport_head}"
+
+
+def _select_transport_ref(
+    refs: Sequence[tuple[str, str]],
+    *,
+    transport_head: str,
+) -> tuple[str, str]:
+    """Select the one dual-version ref for the current transport head."""
+
+    expected_transport_head = _sha1(transport_head, "transport_head")
+    matches: list[tuple[str, str]] = []
+    for item in refs:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise GitHubActionsError("temporary ref listing is invalid")
+        commit, ref = item
+        parts = parse_transport_ref(ref)
+        if parts is None:
+            continue
+        commit_sha = _sha1(commit, "temporary ref commit")
+        if parts[1] == expected_transport_head:
+            matches.append((commit_sha, ref))
+    if len(matches) != 1:
+        raise GitHubActionsError("expected exactly one current transport Bundle ref")
+    return matches[0]
 
 
 def _decode_base64(value: object, *, label: str) -> bytes:
@@ -1005,6 +1032,18 @@ class GitHubActionsTransport:
 
     def _ensure_ref(self, bundle: BuiltEvidenceBundle) -> _RemoteRef:
         ref = bundle.transport_ref
+        try:
+            expected_ref = transport_ref_for(
+                producer_head=bundle.producer_head,
+                transport_head=bundle.transport_head,
+            )
+        except BundleError as exc:
+            raise GitHubActionsError("Bundle transport heads are invalid") from exc
+        if ref != expected_ref or parse_transport_ref(ref) != (
+            bundle.producer_head,
+            bundle.transport_head,
+        ):
+            raise GitHubActionsError("Bundle transport ref did not match producer and transport heads")
         existing = _ref_matches(self._api, ref=ref, bundle=bundle)
         if existing is not None:
             commit_sha, _ = existing

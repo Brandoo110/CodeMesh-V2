@@ -45,25 +45,37 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          import re
           import subprocess
           from pathlib import Path
 
-          sha_re = re.compile(r"^[0-9a-f]{40}$")
-          ref_re = re.compile(r"^refs/heads/codex/evidence/[0-9a-f]{40}$")
+          from assurance.integrations.github_actions import _select_transport_ref
 
           listed = subprocess.run(
-              ["git", "ls-remote", "--heads", "origin", "refs/heads/codex/evidence/*"],
+              [
+                  "git",
+                  "ls-remote",
+                  "--heads",
+                  "origin",
+                  f"refs/heads/codex/evidence/*/{os.environ['CODEMESH_TRANSPORT_HEAD']}",
+              ],
               check=True,
               capture_output=True,
               text=True,
           ).stdout.splitlines()
           listed = [line for line in listed if line.strip()]
-          if len(listed) != 1:
-              raise SystemExit("expected exactly one temporary Bundle ref")
-          evidence_commit, evidence_ref = listed[0].split("\t", 1)
-          if not sha_re.fullmatch(evidence_commit) or not ref_re.fullmatch(evidence_ref):
-              raise SystemExit("temporary Bundle ref identity is invalid")
+          pairs = []
+          for line in listed:
+              parts = line.split("\t", 1)
+              if len(parts) != 2:
+                  raise SystemExit("temporary Bundle ref listing is invalid")
+              pairs.append((parts[0], parts[1]))
+          try:
+              evidence_commit, evidence_ref = _select_transport_ref(
+                  pairs,
+                  transport_head=os.environ["CODEMESH_TRANSPORT_HEAD"],
+              )
+          except Exception as exc:
+              raise SystemExit(str(exc)) from exc
 
           subprocess.run(["git", "fetch", "--no-tags", "origin", evidence_ref], check=True)
           tree = subprocess.run(

@@ -11,7 +11,7 @@ from assurance.case_publication import (
     PublicationRemoteError,
     RemotePublication,
 )
-from assurance.evidence_bundle import build_evidence_bundle
+from assurance.evidence_bundle import build_evidence_bundle, transport_ref_for
 
 from .test_assurance_evidence_bundle import (
     CASE_ID,
@@ -41,7 +41,10 @@ class FakeRemote:
 
 def _remote(**overrides: object) -> RemotePublication:
     values: dict[str, object] = {
-        "transport_ref": "refs/heads/codex/evidence/" + PRODUCER_HEAD,
+        "transport_ref": transport_ref_for(
+            producer_head=PRODUCER_HEAD,
+            transport_head=TRANSPORT_HEAD,
+        ),
         "transport_ref_commit": "c" * 40,
         "transport_head": TRANSPORT_HEAD,
         "ci_run_id": "9001",
@@ -117,7 +120,10 @@ def test_publication_reads_back_exact_remote_lineage_before_cleanup(tmp_path: Pa
     assert receipt.origin == "local_authoritative_bundle"
     assert [name for name, _ in remote.calls] == ["publish", "cleanup"]
     assert remote.calls[-1][1] == (
-        "refs/heads/codex/evidence/" + PRODUCER_HEAD,
+        transport_ref_for(
+            producer_head=PRODUCER_HEAD,
+            transport_head=TRANSPORT_HEAD,
+        ),
         "c" * 40,
     )
 

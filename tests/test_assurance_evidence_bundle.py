@@ -12,6 +12,8 @@ from assurance.evidence_bundle import (
     BundleError,
     _read_stable,
     build_evidence_bundle,
+    parse_transport_ref,
+    transport_ref_for,
     verify_evidence_bundle,
 )
 
@@ -151,6 +153,11 @@ def test_bundle_is_canonical_content_addressed_and_closes_objects(tmp_path: Path
     verified = verify_evidence_bundle(built.bundle_bytes)
     document = verified.document
 
+    assert built.transport_ref == transport_ref_for(
+        producer_head=PRODUCER_HEAD,
+        transport_head=TRANSPORT_HEAD,
+    )
+    assert parse_transport_ref(built.transport_ref) == (PRODUCER_HEAD, TRANSPORT_HEAD)
     assert built.bundle_digest == document["bundle_digest"]
     assert built.bundle_bytes == (
         json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -163,6 +170,32 @@ def test_bundle_is_canonical_content_addressed_and_closes_objects(tmp_path: Path
         raw = base64.b64decode(item["data_base64"], validate=True)
         assert len(raw) == item["size"]
         assert _digest(raw) == item["digest"]
+
+
+def test_bundle_rejects_legacy_single_segment_transport_ref(tmp_path: Path) -> None:
+    built = _build(tmp_path)
+    document = json.loads(built.bundle_bytes)
+    document["transport_ref"] = "refs/heads/codex/evidence/" + PRODUCER_HEAD
+    without_digest = dict(document)
+    del without_digest["bundle_digest"]
+    document["bundle_digest"] = _digest(
+        (
+            json.dumps(
+                without_digest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+    tampered = (
+        json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+    with pytest.raises(BundleError, match="transport_ref"):
+        verify_evidence_bundle(tampered)
 
 
 def test_bundle_rejects_tampered_object_bytes(tmp_path: Path) -> None:

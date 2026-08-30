@@ -1,5 +1,6 @@
 """Focused tests for the live GitHub Check publisher and readback."""
 
+import base64
 import io
 import json
 import zipfile
@@ -181,6 +182,181 @@ def test_publish_rejects_mismatched_github_readback_without_echoing_token():
             _passport(), owner="acme", repo="widget", head_sha=head_sha
         )
     assert "ghs-secret-token" not in str(caught.value)
+
+
+def test_dual_transport_ref_endpoint_rejects_legacy_single_segment_ref():
+    ref = (
+        "refs/heads/codex/evidence/"
+        + PRODUCER_HEAD
+        + "/"
+        + TRANSPORT_HEAD
+    )
+    assert github_actions._ref_endpoint(ref) == (
+        "/git/ref/heads/codex/evidence/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    )
+    with pytest.raises(github_actions.GitHubActionsError, match="temporary ref"):
+        github_actions._ref_endpoint("refs/heads/codex/evidence/" + PRODUCER_HEAD)
+
+
+def test_transport_ref_selection_ignores_legacy_and_other_transport_heads():
+    current_ref = (
+        "refs/heads/codex/evidence/"
+        + PRODUCER_HEAD
+        + "/"
+        + TRANSPORT_HEAD
+    )
+    other_ref = "refs/heads/codex/evidence/" + PRODUCER_HEAD + "/" + "c" * 40
+    refs = [
+        ("d" * 40, "refs/heads/codex/evidence/" + PRODUCER_HEAD),
+        ("e" * 40, other_ref),
+        ("f" * 40, current_ref),
+    ]
+
+    assert github_actions._select_transport_ref(
+        refs,
+        transport_head=TRANSPORT_HEAD,
+    ) == ("f" * 40, current_ref)
+
+
+def test_transport_ref_selection_rejects_multiple_current_refs():
+    refs = [
+        ("d" * 40, "refs/heads/codex/evidence/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD),
+        ("e" * 40, "refs/heads/codex/evidence/" + "c" * 40 + "/" + TRANSPORT_HEAD),
+    ]
+
+    with pytest.raises(github_actions.GitHubActionsError, match="exactly one"):
+        github_actions._select_transport_ref(refs, transport_head=TRANSPORT_HEAD)
+
+
+def test_same_dual_transport_ref_with_different_bytes_is_idempotency_conflict(tmp_path):
+    _, bundle = _build_fixture_bundle(tmp_path)
+    expected_ref_path = (
+        "/git/ref/heads/codex/evidence/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/acme/codemesh" + expected_ref_path:
+            return httpx.Response(200, json={"object": {"sha": "c" * 40}})
+        if request.url.path == "/repos/acme/codemesh/git/commits/" + "c" * 40:
+            return httpx.Response(200, json={"tree": {"sha": "d" * 40}})
+        if request.url.path == "/repos/acme/codemesh/git/trees/" + "d" * 40:
+            return httpx.Response(
+                200,
+                json={"tree": [{"path": "bundle.json", "type": "blob", "sha": "e" * 40}]},
+            )
+        if request.url.path == "/repos/acme/codemesh/git/blobs/" + "e" * 40:
+            return httpx.Response(
+                200,
+                json={"content": base64.b64encode(b"different").decode("ascii")},
+            )
+        raise AssertionError(f"unexpected API request: {request.method} {request.url}")
+
+    api = github_actions._GitHubApi(
+        token="ghs-test-token",
+        owner="acme",
+        repo="codemesh",
+        api_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(github_actions.IdempotencyConflict, match="different bundle"):
+            github_actions._ref_matches(api, ref=bundle.transport_ref, bundle=bundle)
+    finally:
+        api.close()
+
+
+def test_cleanup_cannot_target_preserved_legacy_ref_when_new_ref_is_active():
+    transport = github_actions.GitHubActionsTransport(
+        token="ghs-test-token",
+        repository="acme/codemesh",
+        api_url="https://api.github.test",
+        api_transport=httpx.MockTransport(
+            lambda request: (_ for _ in ()).throw(
+                AssertionError(f"unexpected cleanup API request: {request}")
+            )
+        ),
+    )
+    new_ref = "refs/heads/codex/evidence/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    legacy_ref = "refs/heads/codex/evidence/" + PRODUCER_HEAD
+    transport._active_ref = (new_ref, "c" * 40)
+    try:
+        with pytest.raises(github_actions.GitHubActionsError, match="cleanup target"):
+            transport.cleanup(ref=legacy_ref, commit_sha="c" * 40)
+    finally:
+        transport.close()
+
+
+def test_import_event_head_mismatch_happens_before_github_mutation(tmp_path, monkeypatch):
+    _, bundle = _build_fixture_bundle(tmp_path)
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps(
+            {
+                "repository": {"full_name": "acme/codemesh"},
+                "pull_request": {"head": {"sha": "c" * 40}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError(f"unexpected API mutation: {request.method} {request.url}")
+
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    with pytest.raises(github_actions.GitHubActionsError, match="transport head"):
+        github_actions.import_authoritative_bundle(
+            bundle.bundle_bytes,
+            output_dir=tmp_path / "output",
+            repository_root=tmp_path / "repository",
+            token="ghs-test-token",
+            repository="acme/codemesh",
+            transport_head=TRANSPORT_HEAD,
+            transport_ref_commit="c" * 40,
+            ci_run_id="9001",
+            ci_job_id="assurance",
+            run_attempt=1,
+            api_url="https://api.github.test",
+            api_transport=httpx.MockTransport(handler),
+        )
+    assert requests == []
+
+
+def test_import_checkout_mismatch_happens_before_github_mutation(tmp_path, monkeypatch):
+    _, bundle = _build_fixture_bundle(tmp_path)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError(f"unexpected API mutation: {request.method} {request.url}")
+
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+    monkeypatch.setattr(
+        github_actions,
+        "_is_ancestor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            github_actions.GitHubActionsError("producer head is not an ancestor")
+        ),
+    )
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    with pytest.raises(github_actions.GitHubActionsError, match="not an ancestor"):
+        github_actions.import_authoritative_bundle(
+            bundle.bundle_bytes,
+            output_dir=tmp_path / "output",
+            repository_root=repository_root,
+            token="ghs-test-token",
+            repository="acme/codemesh",
+            transport_head=TRANSPORT_HEAD,
+            transport_ref_commit="c" * 40,
+            ci_run_id="9001",
+            ci_job_id="assurance",
+            run_attempt=1,
+            api_url="https://api.github.test",
+            api_transport=httpx.MockTransport(handler),
+        )
+    assert requests == []
 
 
 def _build_fixture_bundle(tmp_path: Path):
