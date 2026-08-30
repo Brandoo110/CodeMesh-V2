@@ -1,6 +1,7 @@
 """GP-02 focused tests for the in-memory AssuranceRunService orchestration."""
 
 import asyncio
+import hashlib
 import json
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from pydantic import SecretStr
 
 from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandSpec
+from assurance.contracts import Evidence
 from assurance.fixed_reviewer_invoker import (
     FixedOpenAICompatibleReviewerInvoker,
     FixedReviewerEndpoint,
@@ -24,6 +26,7 @@ from assurance.run_service import (
     AssuranceRunConfig,
     AssuranceRunError,
     AssuranceRunIntent,
+    AssuranceRunOfficialEvidenceError,
     AssuranceRunRedactionError,
     AssuranceRunResult,
     AssuranceRunService,
@@ -38,6 +41,15 @@ from assurance.run_service import (
     ReviewerRoute,
     ReviewerRunRecord,
 )
+from assurance.official_evidence import (
+    OfficialEvidenceError,
+    OfficialEvidenceImport,
+    OfficialEvidenceReceipt,
+    OfficialEvidenceReport,
+    OfficialEvidenceSource,
+)
+
+NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -240,6 +252,230 @@ def test_intent_rejects_duplicate_or_empty_command_ids_before_io(tmp_path):
             task_path="TASK.md",
             command_ids=("check", "check"),
         )
+
+
+def _fake_official_import(
+    artifact_store: ArtifactStore,
+    *,
+    kind: str,
+    subject_digest: str,
+    head_revision: str,
+    collected_at: datetime,
+) -> OfficialEvidenceImport:
+    result_path = (
+        "dependency-audit-result.json"
+        if kind == "dependency_audit"
+        else "ci-iac-result.json"
+    )
+    result_bytes = b'{"status":"success"}'
+    result_digest = "sha256:" + hashlib.sha256(result_bytes).hexdigest()
+    source_path = (
+        "TASK.md"
+        if kind == "dependency_audit"
+        else ".github/workflows/p-c-handover.yml"
+    )
+    source = OfficialEvidenceSource(
+        path=source_path,
+        digest="sha256:" + "2" * 64,
+        byte_size=1,
+    )
+    checks = ()
+    audit_command = "pnpm audit --prod --audit-level=high --json"
+    if kind == "ci_iac_validation":
+        checks = tuple(
+            {
+                "name": name,
+                "status": "success",
+                "conclusion": "success",
+            }
+            for name in (
+                "checkout",
+                "install",
+                "focused_checks",
+                "build",
+                "browser_walkthrough",
+            )
+        )
+        audit_command = None
+    report = OfficialEvidenceReport(
+        kind=kind,
+        repository_identity="example/service",
+        head_revision=head_revision,
+        subject_digest=subject_digest,
+        producer="collector." + kind,
+        source_paths=(source,),
+        workflow_name="P-C Handover Experience",
+        workflow_path=".github/workflows/p-c-handover.yml",
+        event="workflow_dispatch",
+        pull_request_number=7,
+        workflow_run_id="123",
+        workflow_run_attempt=1,
+        job_id="handover",
+        job_name="handover",
+        status="success",
+        conclusion="success",
+        result_path=result_path,
+        result_digest=result_digest,
+        result_byte_size=len(result_bytes),
+        checks=checks,
+        audit_command=audit_command,
+    )
+    report_bytes = json.dumps(
+        report.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    remote_zip = b"official-zip"
+    remote_zip_digest = "sha256:" + hashlib.sha256(remote_zip).hexdigest()
+    receipt = OfficialEvidenceReceipt(
+        kind=kind,
+        subject_digest=subject_digest,
+        repository_identity="example/service",
+        head_revision=head_revision,
+        producer=report.producer,
+        source_paths=(source,),
+        workflow_name=report.workflow_name,
+        workflow_path=report.workflow_path,
+        event=report.event,
+        pull_request_number=report.pull_request_number,
+        workflow_run_id=report.workflow_run_id,
+        workflow_run_attempt=report.workflow_run_attempt,
+        job_id="456",
+        job_name="handover",
+        artifact_id="789",
+        artifact_name="p-c-official-validation-123",
+        artifact_digest=remote_zip_digest,
+        artifact_byte_size=len(remote_zip),
+        report_digest="sha256:" + hashlib.sha256(report_bytes).hexdigest(),
+        report_byte_size=len(report_bytes),
+        result_path=result_path,
+        result_digest=result_digest,
+        result_byte_size=len(result_bytes),
+        report=report,
+        result={"status": "success"},
+    )
+    receipt_bytes = json.dumps(
+        receipt.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    receipt_digest = artifact_store.put_bytes(receipt_bytes)
+    artifact_store.put_bytes(remote_zip)
+    evidence = Evidence(
+        evidence_id="ev_official_" + kind,
+        subject_digest=subject_digest,
+        kind=kind,
+        producer=report.producer,
+        artifact_digest=receipt_digest,
+        source_ref="github:official:" + kind + ":run:123:artifact:789:success",
+        trace_id="github:123:1:456",
+        status="success",
+        trust_level="observed",
+        collected_at=collected_at,
+    )
+    return OfficialEvidenceImport(
+        receipt=receipt,
+        evidence=evidence,
+        receipt_bytes=receipt_bytes,
+        receipt_digest=receipt_digest,
+        receipt_byte_size=len(receipt_bytes),
+        remote_zip_bytes=remote_zip,
+        remote_zip_digest=remote_zip_digest,
+        remote_zip_byte_size=len(remote_zip),
+        source_bindings=(source,),
+    )
+
+
+class _FakeOfficialImporter:
+    calls = 0
+    verified = 0
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def import_run(self, run_id: str):
+        type(self).calls += 1
+        assert run_id == "123"
+        return tuple(
+            _fake_official_import(
+                self.kwargs["artifact_store"],
+                kind=kind,
+                subject_digest=self.kwargs["subject_digest"],
+                head_revision=self.kwargs["head_revision"],
+                collected_at=self.kwargs["collected_at"],
+            )
+            for kind in ("dependency_audit", "ci_iac_validation")
+        )
+
+    def verify_import(self, _imported):
+        type(self).verified += 1
+
+
+def test_official_dependency_evidence_flows_through_manifest_risk_policy_and_bundle(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter)
+    service, intent = _service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    result = asyncio.run(service.run(intent, idempotency_key="official-dependency"))
+
+    assert [item.kind for item in result.bundle.evidence] == [
+        "git_snapshot",
+        "intake_documents",
+        "command_batch",
+        "evidence_manifest",
+        "dependency_audit",
+        "ci_iac_validation",
+    ]
+    assert any(
+        item.kind == "dependency_audit"
+        for item in result.bundle.manifest.manifest.entries
+    )
+    assert "dependency_audit" in result.bundle.risk.classification.required_collectors
+    assert result.bundle.policy.input.risk_result == result.bundle.risk
+    assert result.bundle.case.state == "EVIDENCE_COLLECTED"
+    assert _FakeOfficialImporter.calls == 1
+    assert _FakeOfficialImporter.verified == 2
+
+
+def test_missing_official_dependency_evidence_keeps_policy_blocked(tmp_path):
+    service, intent = _service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+
+    result = asyncio.run(service.run(intent, idempotency_key="missing-official"))
+
+    assert "dependency_audit" in result.bundle.risk.classification.required_collectors
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert result.bundle.policy.decision.reason_codes == (
+        "REQUIRED_COLLECTOR_MISSING",
+        "REQUIRED_REVIEWER_MISSING",
+    )
+    assert result.bundle.reviewer.status == "blocked_evidence"
+    assert result.bundle.reviewer.error_code == "OFFICIAL_EVIDENCE_MISSING"
+    assert service._reviewer_invoker.calls == 0
+    assert all(
+        item.kind not in {"dependency_audit", "ci_iac_validation"}
+        for item in result.bundle.evidence
+    )
+
+
+def test_malformed_official_run_fails_before_reviewer_and_commit(tmp_path, monkeypatch):
+    class _MalformedImporter(_FakeOfficialImporter):
+        def import_run(self, _run_id):
+            raise OfficialEvidenceError()
+
+    monkeypatch.setattr(run_service_module, "OfficialEvidenceImporter", _MalformedImporter)
+    service, intent = _service(tmp_path)
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    with pytest.raises(AssuranceRunOfficialEvidenceError):
+        asyncio.run(service.run(intent, idempotency_key="malformed-official"))
+
+    assert not any(call[0] == "commit" for call in service._committer.calls)
 
 
 @pytest.mark.parametrize(

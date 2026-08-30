@@ -13,6 +13,11 @@ from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandObservation
 from assurance.contracts import Evidence
 from assurance.intake import IntakeDocument
+from assurance.official_evidence import (
+    OfficialEvidenceReceipt,
+    OfficialEvidenceReport,
+    OfficialEvidenceSource,
+)
 from assurance.reviewer_context import (
     ReviewerContextError,
     SafeReviewerContextBuilder,
@@ -384,7 +389,19 @@ def test_truncated_evidence_is_not_assessed_without_reading_missing_artifact(tmp
             RedactionDisposition.DECLARED_REDACTED,
         ),
         (
+            b"diff --git a/a.py b/a.py\n+/Library/Application Support/CodeMesh/cache.json\n",
+            RedactionDisposition.DECLARED_REDACTED,
+        ),
+        (
             b"diff --git a/a.py b/a.py\n+path=\\\\server\\share\\SENTINEL_UNC\\a.py\n",
+            RedactionDisposition.DECLARED_REDACTED,
+        ),
+        (
+            b"diff --git a/a.py b/a.py\n+C:\\Users\\alice\\SENTINEL_WINDOWS\\a.py\n",
+            RedactionDisposition.DECLARED_REDACTED,
+        ),
+        (
+            b"diff --git a/a.py b/a.py\n+file:///Users/alice/SENTINEL_FILE_URL/a.py\n",
             RedactionDisposition.DECLARED_REDACTED,
         ),
         (
@@ -445,6 +462,106 @@ def test_source_property_named_key_is_not_misclassified_as_sensitive_path(tmp_pa
     ]
     assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
     assert "object.key" in entry.content
+
+
+def test_https_url_and_json_escaped_source_are_not_paths(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    git = (
+        b"diff --git a/a.py b/a.py\n"
+        b"+url = https://example.com/api\n"
+        b"+pattern = /^\\d+$/\n"
+    )
+    entry = _by_kind(_prepare(store, _base_evidences(store, git=git)))[
+        "git_snapshot"
+    ]
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+
+
+def test_regex_backslash_and_escaped_newline_are_safe_after_json_encoding(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    git = (
+        b"diff --git a/frontend/components/AssuranceView.tsx "
+        b"b/frontend/components/AssuranceView.tsx\n"
+        b"+const caseId = /^\\d+$/;\n"
+        b'+const message = "line 1\\nline 2";\n'
+    )
+    entry = _by_kind(_prepare(store, _base_evidences(store, git=git)))[
+        "git_snapshot"
+    ]
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    payload = json.loads(entry.content)
+    assert payload["payload"]["unified_diff"] == git.decode()
+
+
+def test_official_report_context_is_redacted_as_semantic_json(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source = OfficialEvidenceSource(
+        path="package.json", digest="sha256:" + "2" * 64, byte_size=1
+    )
+    result = b'{"advisories":[]}\n'
+    report = OfficialEvidenceReport(
+        kind="dependency_audit",
+        repository_identity="example/repository",
+        head_revision="a" * 40,
+        subject_digest=SUBJECT,
+        producer="collector.dependency_audit",
+        source_paths=(source,),
+        workflow_name="P-C Handover Experience",
+        workflow_path=".github/workflows/p-c-handover.yml",
+        event="workflow_dispatch",
+        pull_request_number=1,
+        workflow_run_id="123",
+        workflow_run_attempt=1,
+        job_id="handover",
+        job_name="handover",
+        status="success",
+        conclusion="success",
+        result_path="dependency-audit-result.json",
+        result_digest=_digest(result),
+        result_byte_size=len(result),
+        audit_command="pnpm audit --prod --audit-level=high --json",
+    )
+    receipt = OfficialEvidenceReceipt(
+        kind="dependency_audit",
+        subject_digest=SUBJECT,
+        repository_identity="example/repository",
+        head_revision="a" * 40,
+        producer="collector.dependency_audit",
+        source_paths=(source,),
+        workflow_name=report.workflow_name,
+        workflow_path=report.workflow_path,
+        event="workflow_dispatch",
+        pull_request_number=1,
+        workflow_run_id="123",
+        workflow_run_attempt=1,
+        job_id="456",
+        job_name="handover",
+        artifact_id="789",
+        artifact_name="p-c-official-validation-123",
+        artifact_digest="sha256:" + "3" * 64,
+        artifact_byte_size=1,
+        report_digest=_digest(_json(report.model_dump(mode="json"))),
+        report_byte_size=len(_json(report.model_dump(mode="json"))),
+        result_path=report.result_path,
+        result_digest=report.result_digest,
+        result_byte_size=report.result_byte_size,
+        report=report,
+        result={"advisories": []},
+    )
+    receipt_bytes = _json(receipt.model_dump(mode="json"))
+    evidence = _evidence(
+        "dependency_audit",
+        "collector.dependency_audit",
+        store.put_bytes(receipt_bytes),
+        evidence_id="ev-dependency-audit",
+    ).model_copy(update={"trust_level": "observed"})
+
+    plan = _prepare(store, _base_evidences(store) + (evidence,))
+    entry = _by_kind(plan)["dependency_audit"]
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert json.loads(entry.content)["payload"]["official_receipt"]["kind"] == (
+        "dependency_audit"
+    )
 
 
 def test_artifact_integrity_failure_is_fixed_and_path_free(tmp_path):

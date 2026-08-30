@@ -55,6 +55,12 @@ from .manifest import (
     EvidenceManifestInput,
     EvidenceManifestResult,
 )
+from .official_evidence import (
+    OFFICIAL_EVIDENCE_KINDS,
+    OfficialEvidenceImport,
+    OfficialEvidenceError,
+    OfficialEvidenceImporter,
+)
 from .policy import PolicyEvaluationInput, PolicyGate, PolicyGateResult
 from .risk import (
     RiskClassificationInput,
@@ -99,6 +105,7 @@ _REVIEWER_FAILURE_CODES = {
 _REVIEWER_ERROR_CODES = frozenset(
     {
         "REDACTION_UNSAFE",
+        "OFFICIAL_EVIDENCE_MISSING",
         "REVIEWER_PROVIDER_FAILURE",
         "REVIEWER_TIMEOUT",
         "REVIEWER_CANCELLED",
@@ -113,6 +120,7 @@ _REVIEWER_STATUS_ERROR_CODES = {
     "cancelled": frozenset({"REVIEWER_CANCELLED"}),
     "budget_exceeded": frozenset({"REVIEWER_BUDGET_EXCEEDED"}),
     "blocked_redaction": frozenset({"REDACTION_UNSAFE"}),
+    "blocked_evidence": frozenset({"OFFICIAL_EVIDENCE_MISSING"}),
     "invalid_json": frozenset({"REVIEWER_INVALID_JSON"}),
 }
 _DEFAULT_GIT_COLLECTOR_PROFILE = {
@@ -201,6 +209,10 @@ class AssuranceRunValidationError(AssuranceRunError, ValueError):
 
 class AssuranceRunPreconditionError(AssuranceRunError):
     """A required external-side-effect precondition was not satisfied."""
+
+
+class AssuranceRunOfficialEvidenceError(AssuranceRunPreconditionError):
+    """A supplied official GitHub run was missing, invalid, or drifted."""
 
 
 class AssuranceRunStaleError(AssuranceRunError):
@@ -506,6 +518,7 @@ class AssuranceRunIntent(BaseModel):
     adr_paths: tuple[str, ...] = ()
     runbook_paths: tuple[str, ...] = ()
     command_ids: tuple[str, ...] = Field(min_length=1, max_length=_MAX_COMMANDS)
+    official_evidence_run_id: str | None = None
     changed_lines_total: StrictInt | None = Field(default=None, ge=0)
     external_side_effects: Literal["none_declared", "present_declared", "unknown"] = (
         "unknown"
@@ -592,6 +605,17 @@ class AssuranceRunIntent(BaseModel):
             result.append(item)
         return tuple(result)
 
+    @field_validator("official_evidence_run_id", mode="before")
+    @classmethod
+    def _official_evidence_run_id(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if type(value) is not str or not value.isascii() or not value.isdecimal():
+            raise ValueError("official_evidence_run_id must be a positive numeric string")
+        if value == "0" or value.startswith("0") or len(value) > 19:
+            raise ValueError("official_evidence_run_id must be a positive numeric string")
+        return value
+
 
 class ReviewerContextPlanEntry(BaseModel):
     """One redaction decision and optional safe context for one Evidence."""
@@ -615,7 +639,7 @@ class ReviewerContextPlanEntry(BaseModel):
 
 
 class ReviewerContextPlan(BaseModel):
-    """A one-to-one redaction assessment for the three base Evidence items."""
+    """A one-to-one redaction assessment for every collected Evidence item."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -705,6 +729,7 @@ class ReviewerRunRecord(BaseModel):
         "cancelled",
         "budget_exceeded",
         "blocked_redaction",
+        "blocked_evidence",
         "invalid_json",
     ]
     planned_route: ReviewerRoute
@@ -728,6 +753,7 @@ class ReviewerRunRecord(BaseModel):
     cost_usd: float | None = Field(default=None, ge=0)
     error_code: Literal[
         "REDACTION_UNSAFE",
+        "OFFICIAL_EVIDENCE_MISSING",
         "REVIEWER_PROVIDER_FAILURE",
         "REVIEWER_TIMEOUT",
         "REVIEWER_CANCELLED",
@@ -796,7 +822,7 @@ class ReviewerRunRecord(BaseModel):
             ):
                 raise ValueError("invalid_json reviewer must not carry canonical or result facts")
         else:
-            if self.status == "blocked_redaction":
+            if self.status in {"blocked_redaction", "blocked_evidence"}:
                 expected_facts = (
                     self.prompt_id,
                     self.prompt_digest,
@@ -836,9 +862,9 @@ class ReviewerRunRecord(BaseModel):
                 raise ValueError("failed reviewer must not carry success result facts")
             if self.schema_status != "not_produced":
                 raise ValueError("failed reviewer must not claim a produced schema")
-            if self.status == "blocked_redaction":
+            if self.status in {"blocked_redaction", "blocked_evidence"}:
                 if self.schema_status != "not_produced":
-                    raise ValueError("redaction-blocked reviewer must not claim a schema")
+                    raise ValueError("blocked reviewer must not claim a schema")
         if self.usage_status == "measured" and (
             self.input_tokens is None
             or self.output_tokens is None
@@ -865,6 +891,7 @@ def _validate_reviewer_receipt_binding(
         "cancelled": ("cancelled", "cancelled"),
         "budget_exceeded": ("failure", "failure"),
         "blocked_redaction": ("blocked", "blocked"),
+        "blocked_evidence": ("blocked", "blocked"),
         "invalid_json": ("failure", "failure"),
     }
     expected_step_result, expected_overall = expected_results[reviewer.status]
@@ -885,7 +912,7 @@ def _validate_reviewer_receipt_binding(
             raise ValueError("reviewer status does not match receipt step result")
         if step.schema_status != reviewer.schema_status:
             raise ValueError("reviewer schema status does not match receipt")
-        if reviewer.status == "blocked_redaction":
+        if reviewer.status in {"blocked_redaction", "blocked_evidence"}:
             if (
                 step.actual_role is not None
                 or step.model_ref is not None
@@ -933,7 +960,7 @@ class AssuranceRunBundle(BaseModel):
     commands: CommandBatchResult
     manifest: EvidenceManifestResult
     risk: RiskClassificationResult
-    evidence: tuple[Evidence, ...] = Field(min_length=4)
+    evidence: tuple[Evidence, ...] = Field(min_length=4, max_length=6)
     findings: tuple[Finding, ...] = ()
     questions: tuple[ReviewQuestion, ...] = ()
     reviewer: ReviewerRunRecord
@@ -999,8 +1026,31 @@ class AssuranceRunBundle(BaseModel):
             self.commands.evidence,
             self.manifest.evidence,
         )
-        if self.evidence != expected:
+        if self.evidence[:4] != expected:
             raise ValueError("bundle evidence must use the fixed collector order")
+        official_evidence = self.evidence[4:]
+        if len(official_evidence) > len(OFFICIAL_EVIDENCE_KINDS):
+            raise ValueError("bundle contains too many official Evidence items")
+        if any(
+            item.kind not in OFFICIAL_EVIDENCE_KINDS
+            or item.producer != f"collector.{item.kind}"
+            or item.status != "success"
+            or item.trust_level != "observed"
+            or item.subject_digest != subject_digest
+            for item in official_evidence
+        ):
+            raise ValueError("bundle official Evidence is invalid")
+        if len({item.kind for item in official_evidence}) != len(official_evidence):
+            raise ValueError("bundle official Evidence kinds must be unique")
+        expected_manifest_evidence_ids = {
+            item.evidence_id
+            for item in self.evidence
+            if item != self.manifest.evidence
+        }
+        if {
+            item.evidence_id for item in self.manifest.manifest.entries
+        } != expected_manifest_evidence_ids:
+            raise ValueError("manifest must cover every bundle Evidence")
         if self.execution_receipt.subject_digest != subject_digest:
             raise ValueError("receipt must bind to subject")
         if self.policy.decision.subject_digest != subject_digest:
@@ -1046,7 +1096,7 @@ class AssuranceRunBundle(BaseModel):
                 raise ValueError("successful reviewer must bind SingleReviewerResult")
         elif self.reviewer.result_id is not None or self.reviewer.result_digest is not None:
             raise ValueError("failed reviewer must not bind a success result")
-        if self.reviewer.status == "blocked_redaction":
+        if self.reviewer.status in {"blocked_redaction", "blocked_evidence"}:
             if (
                 self.reviewer.prompt_id is not None
                 or self.reviewer.prompt_digest is not None
@@ -1284,12 +1334,22 @@ class AssuranceRunService:
             intake_result.evidence,
             command_result.evidence,
         )
+        official_imports = await asyncio.to_thread(
+            self._import_official_evidence,
+            intent,
+            repository_identity=git_result.snapshot.repository,
+            head_revision=git_result.snapshot.head_revision,
+            subject_digest=subject_digest,
+            collected_at=started_at,
+        )
+        official_evidences = tuple(item.evidence for item in official_imports)
+        all_evidences = evidences + official_evidences
         context_plan = await asyncio.to_thread(
-            self._prepare_context, evidences, subject_digest
+            self._prepare_context, all_evidences, subject_digest
         )
         manifest_result = await asyncio.to_thread(
             self._build_manifest,
-            evidences,
+            all_evidences,
             context_plan,
             subject_digest,
             started_at,
@@ -1331,13 +1391,30 @@ class AssuranceRunService:
             updated_at=started_at,
         )
 
-        reviewer_record, findings, questions, receipt = await self._review(
-            subject=subject,
-            risk_result=risk_result,
-            context_plan=context_plan,
-            run_id=self._run_id(request_digest, idempotency_key),
-            evaluated_at=self._now(),
+        run_id = self._run_id(request_digest, idempotency_key)
+        collected_official_kinds = {item.kind for item in official_evidences}
+        missing_official = tuple(
+            kind
+            for kind in risk_result.classification.required_collectors
+            if kind in OFFICIAL_EVIDENCE_KINDS
+            and kind not in collected_official_kinds
         )
+        if missing_official:
+            reviewer_record, findings, questions, receipt = (
+                self._blocked_evidence_review(
+                    subject_digest=subject.subject_digest,
+                    run_id=run_id,
+                    evaluated_at=self._now(),
+                )
+            )
+        else:
+            reviewer_record, findings, questions, receipt = await self._review(
+                subject=subject,
+                risk_result=risk_result,
+                context_plan=context_plan,
+                run_id=run_id,
+                evaluated_at=self._now(),
+            )
         policy_input = PolicyEvaluationInput(
             schema_version="v1",
             subject=subject,
@@ -1359,6 +1436,7 @@ class AssuranceRunService:
             intake_result,
             manifest_result,
             fence_collection_at,
+            official_imports,
         )
         freshness_source_binding = await asyncio.to_thread(
             self._build_freshness_source_binding,
@@ -1370,7 +1448,7 @@ class AssuranceRunService:
         case, events = self._build_case_and_events(
             draft_case=draft_case,
             subject_digest=subject_digest,
-            evidence=evidences + (manifest_result.evidence,),
+            evidence=evidences + (manifest_result.evidence,) + official_evidences,
             findings=findings,
             questions=questions,
             receipt=receipt,
@@ -1391,7 +1469,7 @@ class AssuranceRunService:
             commands=command_result,
             manifest=manifest_result,
             risk=risk_result,
-            evidence=evidences + (manifest_result.evidence,),
+            evidence=evidences + (manifest_result.evidence,) + official_evidences,
             findings=findings,
             questions=questions,
             reviewer=reviewer_record,
@@ -1406,6 +1484,47 @@ class AssuranceRunService:
             completed_at=fence_at,
         )
 
+    def _import_official_evidence(
+        self,
+        intent: AssuranceRunIntent,
+        *,
+        repository_identity: str,
+        head_revision: str,
+        subject_digest: str,
+        collected_at: datetime,
+    ) -> tuple[OfficialEvidenceImport, ...]:
+        if intent.official_evidence_run_id is None:
+            return ()
+        try:
+            importer = OfficialEvidenceImporter(
+                workspace_root=self._config.workspace_root,
+                repository_path=intent.repository_path,
+                repository_identity=repository_identity,
+                head_revision=head_revision,
+                subject_digest=subject_digest,
+                artifact_store=self._artifact_store,
+                collected_at=collected_at,
+                github_token=os.getenv("GITHUB_TOKEN") or None,
+            )
+            imports = importer.import_run(intent.official_evidence_run_id)
+        except (OfficialEvidenceError, TypeError, ValueError) as exc:
+            raise AssuranceRunOfficialEvidenceError(
+                "official GitHub evidence import precondition was not satisfied"
+            ) from exc
+        if type(imports) is not tuple or any(
+            type(item) is not OfficialEvidenceImport for item in imports
+        ):
+            raise AssuranceRunOfficialEvidenceError(
+                "official run did not contain the complete typed evidence set"
+            )
+        kinds = tuple(item.receipt.kind for item in imports)
+        if set(kinds) != set(OFFICIAL_EVIDENCE_KINDS) or len(kinds) != len(set(kinds)):
+            raise AssuranceRunOfficialEvidenceError(
+                "official run did not contain the complete typed evidence set"
+            )
+        order = {kind: index for index, kind in enumerate(OFFICIAL_EVIDENCE_KINDS)}
+        return tuple(sorted(imports, key=lambda item: order[item.receipt.kind]))
+
     def _validate_intent(self, intent: AssuranceRunIntent, idempotency_key: str) -> None:
         if type(intent) is not AssuranceRunIntent:
             raise AssuranceRunValidationError("intent must be an exact AssuranceRunIntent")
@@ -1417,6 +1536,18 @@ class AssuranceRunService:
             raise AssuranceRunValidationError("idempotency_key must be nonblank")
         if len(idempotency_key.encode("utf-8")) > 256:
             raise AssuranceRunValidationError("idempotency_key is too long")
+        run_id = intent.official_evidence_run_id
+        if run_id is not None and (
+            type(run_id) is not str
+            or not run_id.isascii()
+            or not run_id.isdecimal()
+            or run_id == "0"
+            or run_id.startswith("0")
+            or len(run_id) > 19
+        ):
+            raise AssuranceRunValidationError(
+                "official_evidence_run_id must be a positive numeric string"
+            )
         if not intent.repository_path.is_absolute():
             raise AssuranceRunValidationError("repository_path must be absolute")
         try:
@@ -1509,7 +1640,7 @@ class AssuranceRunService:
         expected = {item.evidence_id: item for item in evidences}
         actual = {item.evidence_id: item for item in value.entries}
         if set(expected) != set(actual):
-            raise AssuranceRunRedactionError("redaction plan must cover every base Evidence")
+            raise AssuranceRunRedactionError("redaction plan must cover every Evidence")
         for evidence_id, evidence in expected.items():
             entry = actual[evidence_id]
             if entry.kind != evidence.kind or entry.artifact_digest != evidence.artifact_digest:
@@ -1621,6 +1752,41 @@ class AssuranceRunService:
             author=intent.author,
             author_provenance=intent.author_provenance,
         )
+
+    def _blocked_evidence_review(
+        self,
+        *,
+        subject_digest: str,
+        run_id: str,
+        evaluated_at: datetime,
+    ) -> tuple[
+        ReviewerRunRecord,
+        tuple[Finding, ...],
+        tuple[ReviewQuestion, ...],
+        ExecutionReceipt,
+    ]:
+        """Record missing official collectors without calling the provider."""
+
+        route = self._config.reviewer_route
+        receipt = self._failure_receipt(
+            run_id=run_id,
+            subject_digest=subject_digest,
+            status="blocked_evidence",
+            route=route,
+            started_at=evaluated_at,
+            completed_at=evaluated_at,
+            actual_provider=None,
+            actual_model_ref=None,
+        )
+        reviewer = ReviewerRunRecord(
+            status="blocked_evidence",
+            planned_route=route,
+            rubric_version=self._config.rubric_version,
+            schema_status="not_produced",
+            usage_status="unavailable",
+            error_code="OFFICIAL_EVIDENCE_MISSING",
+        )
+        return reviewer, (), (), receipt
 
     async def _review(
         self,
@@ -1950,7 +2116,12 @@ class AssuranceRunService:
         output_tokens: int = 0,
         cost_usd: float = 0.0,
     ) -> ExecutionReceipt:
-        if status == "blocked_redaction":
+        if status in {"blocked_redaction", "blocked_evidence"}:
+            fallback_reason = (
+                "redaction_unsafe"
+                if status == "blocked_redaction"
+                else "official_evidence_missing"
+            )
             steps = tuple(
                 ExecutionStep(
                     sequence=index,
@@ -1960,7 +2131,7 @@ class AssuranceRunService:
                     provider=None,
                     tool_grants=(),
                     routing_rule=route.routing_rule,
-                    fallback_reason="redaction_unsafe",
+                    fallback_reason=fallback_reason,
                     token_budget=route.token_budget,
                     timeout_seconds=route.timeout_seconds,
                     result="blocked",
@@ -2025,6 +2196,7 @@ class AssuranceRunService:
         initial_intake: IntakeResult,
         manifest: EvidenceManifestResult,
         collected_at: datetime,
+        official_imports: tuple[OfficialEvidenceImport, ...] = (),
     ) -> datetime:
         try:
             final_git = self._git_collector.collect(
@@ -2056,6 +2228,23 @@ class AssuranceRunService:
             raise AssuranceRunStaleError("Git changed during reviewer execution")
         if _strip_datetimes(_jsonable(final_intake)) != _strip_datetimes(_jsonable(initial_intake)):
             raise AssuranceRunStaleError("intake documents changed during reviewer execution")
+        if official_imports:
+            try:
+                importer = OfficialEvidenceImporter(
+                    workspace_root=self._config.workspace_root,
+                    repository_path=intent.repository_path,
+                    repository_identity=initial_git.snapshot.repository,
+                    head_revision=initial_git.snapshot.head_revision,
+                    subject_digest=subject_digest,
+                    artifact_store=self._artifact_store,
+                    collected_at=collected_at,
+                )
+                for imported in official_imports:
+                    importer.verify_import(imported)
+            except (OfficialEvidenceError, TypeError, ValueError) as exc:
+                raise AssuranceRunStaleError(
+                    "official evidence changed during reviewer execution"
+                ) from exc
         for entry in manifest.manifest.entries:
             try:
                 if self._artifact_store.verify(entry.artifact_digest) is not True:
@@ -2166,6 +2355,7 @@ __all__ = [
     "AssuranceRunBundle",
     "AssuranceRunConfig",
     "AssuranceRunIntent",
+    "AssuranceRunOfficialEvidenceError",
     "AssuranceRunPreconditionError",
     "AssuranceRunResult",
     "AssuranceRunService",

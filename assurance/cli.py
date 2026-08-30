@@ -343,6 +343,7 @@ def _perform_live_run(
     adr_paths: Sequence[str],
     runbook_paths: Sequence[str],
     command_ids: Sequence[str],
+    official_evidence_run_id: str | None = None,
     changed_lines_total: int | None,
     external_side_effects: str,
     provider_boundary: str,
@@ -354,6 +355,16 @@ def _perform_live_run(
     policy_relative = tuple(_relative_document(root, item) for item in policy_paths)
     adr_relative = tuple(_relative_document(root, item) for item in adr_paths)
     runbook_relative = tuple(_relative_document(root, item) for item in runbook_paths)
+    if official_evidence_run_id is not None:
+        if (
+            type(official_evidence_run_id) is not str
+            or not official_evidence_run_id.isascii()
+            or not official_evidence_run_id.isdecimal()
+            or official_evidence_run_id == "0"
+            or official_evidence_run_id.startswith("0")
+            or len(official_evidence_run_id) > 19
+        ):
+            raise ValueError("official evidence run id must be positive numeric text")
     commands = tuple(command_ids)
     if not 1 <= len(commands) <= 16 or any(
         type(item) is not str or not item.strip() for item in commands
@@ -382,6 +393,7 @@ def _perform_live_run(
         "adr_paths": adr_relative,
         "runbook_paths": runbook_relative,
         "command_ids": commands,
+        "official_evidence_run_id": official_evidence_run_id,
         "changed_lines_total": changed_lines_total,
         "external_side_effects": external_side_effects,
         "provider_boundary": provider_boundary,
@@ -406,6 +418,11 @@ def run_entry(
     adr_path: list[str] | None = typer.Option(None, "--adr-path", help="仓库内 Markdown ADR，可重复"),
     runbook_path: list[str] | None = typer.Option(None, "--runbook-path", help="仓库内 Markdown runbook，可重复"),
     command_id: list[str] | None = typer.Option(None, "--command-id", help="runtime allowlist 中的 command id，可重复"),
+    official_evidence_run_id: str | None = typer.Option(
+        None,
+        "--official-evidence-run-id",
+        help="单一已完成且成功的 P-C GitHub Actions run id",
+    ),
     changed_lines_total: int | None = typer.Option(None, "--changed-lines-total", min=0),
     external_side_effects: str = typer.Option("unknown", "--external-side-effects"),
     provider_boundary: str = typer.Option("within_declared_boundary", "--provider-boundary"),
@@ -430,6 +447,7 @@ def run_entry(
             adr_paths=tuple(adr_path or ()),
             runbook_paths=tuple(runbook_path or ()),
             command_ids=tuple(command_id or (_DEFAULT_COMMAND_ID,)),
+            official_evidence_run_id=official_evidence_run_id,
             changed_lines_total=changed_lines_total,
             external_side_effects=external_side_effects,
             provider_boundary=provider_boundary,

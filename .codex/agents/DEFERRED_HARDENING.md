@@ -41,3 +41,14 @@
 本轮授权纠偏（2026-08-30，P-B）：当前冻结任务已明确授权本仓库、分支、PR 与 Workflow/Check 的真实 dogfood 外部写入；上述“未获 exact authorization”仅适用于此前运行窗口。新的候选仍须以 fresh PR、Workflow、Case/Passport、Check 与 artifact lineage 权威读回为准，未完成前不宣称 dogfood 或生产就绪；全面安全扫描、压力/性能/长稳及生产加固继续延后。
 
 本轮专项记录（2026-08-30，P-C 团队接管与产品体验）：新增 Queue → Change Passport → Findings/Evidence/Freshness/Lineage → owner decision 的 CI-only 隔离走查；验证素材为临时 SQLite、TestClient、Next production build 与 headless Chromium，未触碰真实 Case、生产数据库、Provider 或部署。当前仍未达到真实用户/流量、部署回滚或生产成熟度；全面安全扫描、压力/性能/长稳、大规模并发及生产多租户/RBAC/灾备/运营级发布加固无新增，继续按阶段延后。
+
+## 2026-08-31 P-D 专项记录
+
+本轮源码合同与独立 Reviewer 定向复核均为 P0=0、P1=0；trusted P-D official Evidence 的 redaction、provenance、fail-closed 与 subject-bound 读回门禁保持启用，未弱化当前门禁。真实 GitHub dogfood/publication 尚待完成，本轮不把本地候选或静态验证表述为线上或生产证据。
+
+本轮保留两项 P2 后续加固：
+
+1. 补充 scanner 对 generic arbitrary absolute path、大小写不敏感的 file URL，以及含空格 path 的覆盖。
+2. 为 idempotency cached replay 增加对 official artifact 重新远端验证的权威性边界。
+
+两项不改变当前 fail-closed 行为，后续以有界 focused coverage 与 replay authority fence 加固；本轮阶段不升级。

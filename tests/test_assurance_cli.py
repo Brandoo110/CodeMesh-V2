@@ -179,6 +179,49 @@ def test_live_run_command_prints_case_subject_gate_freshness_and_workbench(
     assert str(tmp_path) not in result.stdout
 
 
+def test_live_run_serializes_single_official_run_id_for_http(monkeypatch, tmp_path):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def run_and_readback(self, request, *, idempotency_key):
+            captured["request"] = request
+            captured["idempotency_key"] = idempotency_key
+            return {"ok": True}
+
+    monkeypatch.setattr(cli, "AssuranceHttpClient", FakeClient)
+    cli._perform_live_run(
+        repository=tmp_path,
+        repository_identity="acme/widget",
+        author="tester",
+        base_ref="main",
+        task_path=task,
+        policy_paths=(),
+        adr_paths=(),
+        runbook_paths=(),
+        command_ids=("diff-check",),
+        official_evidence_run_id="123",
+        changed_lines_total=None,
+        external_side_effects="none_declared",
+        provider_boundary="within_declared_boundary",
+        idempotency_key="run-official-cli",
+        api_url="http://127.0.0.1:8010",
+    )
+
+    assert captured["request"]["official_evidence_run_id"] == "123"
+    assert "official_evidence" not in captured["request"]
+
+
 def test_publish_case_command_uses_one_deep_module_and_returns_safe_receipt(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(root_cli, "_publish_require_clean", lambda _root: None)
