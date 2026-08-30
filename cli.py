@@ -65,7 +65,7 @@ _PUBLISH_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _PUBLISH_REPOSITORY_RE = re.compile(r"^[^/\s?#]+/[^/\s?#]+$")
 _PUBLISH_DEFAULT_BRANCH = "codex/authoritative-publication"
 _PUBLISH_DEFAULT_BASE = "codex/local-acceptance-vertical"
-_PUBLISH_DEFAULT_EVIDENCE_ROOT = "~/.codemesh/codemesh-v2-dogfood"
+_PUBLISH_DEFAULT_ASSURANCE_API_URL = "http://127.0.0.1:8010"
 
 
 def _publish_git_value(repository: Path, *arguments: str) -> str:
@@ -238,7 +238,8 @@ def publish_case(
     try:
         # Keep the existing top-level CLI import graph light: publishing is a
         # deliberate external operation and loads its adapter only on demand.
-        from assurance.case_publication import CasePublication
+        from assurance.case_publication import CasePublication, LocalAuthoritativeCaseSource
+        from assurance.entry import AssuranceHttpClient
         from assurance.integrations.github_actions import GitHubActionsTransport
 
         repository_root = Path.cwd().resolve(strict=True)
@@ -261,25 +262,27 @@ def publish_case(
             raise ValueError("producer HEAD is invalid")
         repository = _publish_repository(repository_root)
         token = _publish_token()
-        evidence_root = Path(
-            os.getenv("CODEMESH_EVIDENCE_ROOT", _PUBLISH_DEFAULT_EVIDENCE_ROOT)
-        ).expanduser()
-        with GitHubActionsTransport(
-            token=token,
-            repository=repository,
-            transport_branch=transport_branch,
-            base_branch=base_branch,
-        ) as transport:
-            receipt = CasePublication(
-                evidence_root=evidence_root,
+        assurance_url = os.getenv(
+            "CODEMESH_ASSURANCE_API_URL", _PUBLISH_DEFAULT_ASSURANCE_API_URL
+        )
+        with AssuranceHttpClient(assurance_url) as client:
+            source = LocalAuthoritativeCaseSource(client)
+            with GitHubActionsTransport(
+                token=token,
                 repository=repository,
-                transport_head=transport_head,
-                remote=transport,
-            ).publish(
-                case_id=case_id,
-                target_pr=target_pr,
-                producer_head=producer_head,
-            )
+                transport_branch=transport_branch,
+                base_branch=base_branch,
+            ) as transport:
+                receipt = CasePublication(
+                    source=source,
+                    repository=repository,
+                    transport_head=transport_head,
+                    remote=transport,
+                ).publish(
+                    case_id=case_id,
+                    target_pr=target_pr,
+                    producer_head=producer_head,
+                )
         payload = _publish_payload(receipt)
     except Exception as exc:
         if as_json:

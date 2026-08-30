@@ -258,6 +258,11 @@ def test_publish_case_command_uses_one_deep_module_and_returns_safe_receipt(monk
     assert payload["check_id"] == 123
     assert payload["producer_head"] == "a" * 40
     assert "ghs-secret-token" not in result.stdout
+    assert isinstance(
+        captured["publication"]["source"],
+        case_publication.LocalAuthoritativeCaseSource,
+    )
+    assert "evidence_root" not in captured["publication"]
     assert captured["publish"] == {
         "case_id": "case-1",
         "target_pr": 2,
