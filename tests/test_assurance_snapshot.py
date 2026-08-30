@@ -1844,3 +1844,23 @@ def test_repeated_stable_collection_equal_with_ignored_and_binary(tmp_path):
     assert second == first
     assert first.snapshot.ignored_files_lower_bound == 1
     assert first.snapshot.ignored_scan_truncated is False
+
+
+def test_collector_can_rebuild_the_exact_subject_input_from_snapshot(tmp_path):
+    repo = _init_repo(tmp_path, {"a.txt": b"one\n"})
+    (repo / "a.txt").write_bytes(b"two\n")
+    store = ArtifactStore(tmp_path / "artifact-store")
+    collector = GitSnapshotCollector(max_diff_bytes=1024, max_files=8, max_file_bytes=1024)
+    result = _collect(repo, store, collector=collector)
+
+    subject_input = collector.build_subject_input(
+        result.snapshot,
+        task_digest=TASK,
+        policy_version=POLICY,
+        rubric_version=RUBRIC,
+    )
+
+    assert subject_input.normalized_diff_digest == _expected_manifest_digest(
+        result.snapshot, collector
+    )
+    assert compute_subject_digest(subject_input) == result.snapshot.subject_digest

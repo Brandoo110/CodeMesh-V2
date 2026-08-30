@@ -11,9 +11,11 @@ from fastapi.testclient import TestClient
 import web.assurance_runtime as runtime_module
 import orchestration.adapters.deepseek as deepseek_module
 from assurance.artifacts import ArtifactStore
+from assurance.digests import SubjectDigestInput, compute_subject_digest
 from assurance.fixed_reviewer_invoker import FixedOpenAICompatibleReviewerInvoker
 from assurance.reviewer_context import SafeReviewerContextBuilder
 from assurance.run_service import AssuranceRunService
+from assurance.snapshot import GitSnapshotCollector
 from web.assurance_store import AssuranceWebRepository
 from web.assurance_runtime import (
     AssuranceRuntime,
@@ -456,6 +458,46 @@ def test_remediation_source_root_accepts_posix_path_and_rejects_prefix_and_symli
         runtime_module._revalidate_remediation_root(sibling_root, configured_root)
     with pytest.raises(ValueError):
         runtime_module._revalidate_remediation_root(symlink_root, configured_root)
+
+
+def test_remediation_git_collector_rejects_synthetic_subject_digest(tmp_path):
+    repository_path = _repository(tmp_path)
+    collector = GitSnapshotCollector()
+    task_digest = "sha256:" + "2" * 64
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    collected = collector.collect(
+        repository_path,
+        repository_identity="example/service",
+        base_ref="HEAD",
+        task_digest=task_digest,
+        policy_version="gate.v0",
+        rubric_version="single_general.v0",
+        artifact_store=artifact_store,
+    )
+    synthetic = SubjectDigestInput(
+        repository=collected.snapshot.repository,
+        base_revision=collected.snapshot.base_revision,
+        head_revision=collected.snapshot.head_revision,
+        normalized_diff_digest="sha256:" + "f" * 64,
+        task_digest=task_digest,
+        policy_version="gate.v0",
+        rubric_version="single_general.v0",
+    )
+    assert compute_subject_digest(synthetic) != collected.snapshot.subject_digest
+
+    scoped = runtime_module._RemediationGitCollector(
+        collector, lambda: synthetic
+    )
+    with pytest.raises(ValueError, match="subject digest"):
+        scoped.collect(
+            repository_path,
+            repository_identity="example/service",
+            base_ref="HEAD",
+            task_digest=task_digest,
+            policy_version="gate.v0",
+            rubric_version="single_general.v0",
+            artifact_store=ArtifactStore(tmp_path / "scoped-artifacts"),
+        )
 
 
 def test_valid_config_failure_raises_fixed_sanitized_startup_error(tmp_path, monkeypatch):

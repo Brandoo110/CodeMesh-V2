@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import inspect
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,7 +40,7 @@ from assurance.store import StoreConflictError
 from assurance.remediation_agent import StructuredRemediationAgent
 from assurance.remediation_reviewer import AssuranceRemediationReviewer
 from assurance.remediation_validation import ValidationCheck, ValidationExecutor
-from assurance.remediation_workspace import WorkspaceGrant
+from assurance.remediation_workspace import IsolatedWorkspace, WorkspaceGrant
 from assurance.reviewer_context import SafeReviewerContextBuilder
 from assurance.run_service import (
     AssuranceRunConfig,
@@ -584,16 +585,11 @@ class _RemediationGitCollector:
         ):
             raise ValueError("scoped Git facts do not match remediation subject")
         subject_digest = compute_subject_digest(subject_input)
-        return result.model_copy(
-            update={
-                "snapshot": snapshot.model_copy(
-                    update={"subject_digest": subject_digest}
-                ),
-                "evidence": result.evidence.model_copy(
-                    update={"subject_digest": subject_digest}
-                ),
-            }
-        )
+        if snapshot.subject_digest != subject_digest:
+            raise ValueError(
+                "scoped Git subject digest does not match remediation subject"
+            )
+        return result
 
 
 def _build_remediation_service(
@@ -663,20 +659,45 @@ def _build_remediation_service(
 
         requested_subject_input: SubjectDigestInput | None = None
 
-        def subject_builder(patch_digest: str) -> tuple[SubjectDigestInput, str]:
+        def subject_builder(
+            _patch_digest: str, *, workspace: IsolatedWorkspace
+        ) -> tuple[SubjectDigestInput, str]:
             nonlocal requested_subject_input
-            subject = baseline.subject
-            subject_input = SubjectDigestInput(
-                schema_version="v1",
-                repository=subject.repository,
-                base_revision=subject.base_revision,
-                head_revision=subject.head_revision,
-                normalized_diff_digest=patch_digest,
-                task_digest=subject.task_digest,
-                policy_version=subject.policy_version,
-                rubric_version=baseline.binding.rubric_version,
-                attachment_digests=(),
+            if type(workspace) is not IsolatedWorkspace:
+                raise ValueError("remediation subject builder requires its workspace")
+            scoped_root = _revalidate_remediation_root(
+                workspace.root, config.workspace_root
             )
+            collector = service._git_collector
+            build_subject_input = getattr(collector, "build_subject_input", None)
+            if not callable(build_subject_input):
+                raise ValueError("remediation Git collector cannot rebuild subject")
+            with tempfile.TemporaryDirectory(
+                prefix="codemesh-remediation-subject-"
+            ) as scratch_root:
+                scratch_store = ArtifactStore(Path(scratch_root))
+                task_digest = service._intake_collector.probe_task_digest(
+                    scoped_root, task_path=source_binding.task_path
+                )
+                git_result = collector.collect(
+                    scoped_root,
+                    repository_identity=source_binding.repository_identity,
+                    base_ref=source_binding.requested_base_ref,
+                    task_digest=task_digest,
+                    policy_version=source_binding.policy_version,
+                    rubric_version=source_binding.rubric_version,
+                    artifact_store=scratch_store,
+                    attachment_digests=source_binding.attachment_digests,
+                )
+                if type(git_result) is not GitSnapshotResult:
+                    raise TypeError("Git collector returned an invalid result")
+                subject_input = build_subject_input(
+                    git_result.snapshot,
+                    task_digest=task_digest,
+                    policy_version=source_binding.policy_version,
+                    rubric_version=source_binding.rubric_version,
+                    attachment_digests=source_binding.attachment_digests,
+                )
             requested_subject_input = subject_input
             return subject_input, compute_subject_digest(subject_input)
 

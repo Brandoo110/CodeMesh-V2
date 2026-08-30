@@ -738,42 +738,26 @@ class GitSnapshotCollector:
         )
         complete = not omissions
 
-        manifest = {
-            "schema_version": "v1",
-            "repository": repository,
-            "base_revision": base_revision,
-            "head_revision": head_revision,
-            "scope": "base_to_worktree",
-            "worktree_dirty": worktree_dirty,
-            "changes": [
-                change.model_dump(mode="json") for change in changes_tuple
-            ],
-            "changed_files_total": changed_files_total,
-            "diff_artifact_digest": diff_artifact_digest,
-            "diff_bytes": diff_bytes,
-            "diff_truncated": diff_truncated,
-            "files_truncated": files_truncated,
-            "ignored_files_lower_bound": ignored_files_lower_bound,
-            "ignored_scan_truncated": ignored_scan_truncated,
-            "large_file_paths": list(large_file_paths),
-            "submodule_paths": list(submodule_paths_out),
-            "omissions": list(omissions),
-            "complete": complete,
-            "limits": {
-                "max_diff_bytes": self.max_diff_bytes,
-                "max_files": self.max_files,
-                "max_file_bytes": self.max_file_bytes,
-            },
-        }
-        manifest_digest = _sha256_bytes(
-            json.dumps(
-                manifest,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")
+        manifest = self._manifest_payload(
+            repository=repository,
+            base_revision=base_revision,
+            head_revision=head_revision,
+            scope="base_to_worktree",
+            worktree_dirty=worktree_dirty,
+            changes=changes_tuple,
+            changed_files_total=changed_files_total,
+            diff_artifact_digest=diff_artifact_digest,
+            diff_bytes=diff_bytes,
+            diff_truncated=diff_truncated,
+            files_truncated=files_truncated,
+            ignored_files_lower_bound=ignored_files_lower_bound,
+            ignored_scan_truncated=ignored_scan_truncated,
+            large_file_paths=large_file_paths,
+            submodule_paths=submodule_paths_out,
+            omissions=omissions,
+            complete=complete,
         )
+        manifest_digest = self._manifest_digest_from_payload(manifest)
         subject_digest = compute_subject_digest(
             SubjectDigestInput(
                 repository=repository,
@@ -835,6 +819,126 @@ class GitSnapshotCollector:
             schema_version="v1",
             snapshot=snapshot,
             evidence=evidence,
+        )
+
+    def build_subject_input(
+        self,
+        snapshot: GitSnapshot,
+        *,
+        task_digest: str,
+        policy_version: str,
+        rubric_version: str,
+        attachment_digests: tuple[str, ...] = (),
+    ) -> SubjectDigestInput:
+        """Rebuild the exact subject input represented by one Git snapshot.
+
+        The manifest is canonicalized through the same collector-owned helper
+        used by ``collect``.  A snapshot whose persisted subject digest does
+        not match those facts is rejected instead of being rewritten.
+        """
+
+        if type(snapshot) is not GitSnapshot:
+            raise TypeError("snapshot must be an exact GitSnapshot")
+        manifest_digest = self._manifest_digest(snapshot)
+        subject_input = SubjectDigestInput(
+            repository=snapshot.repository,
+            base_revision=snapshot.base_revision,
+            head_revision=snapshot.head_revision,
+            normalized_diff_digest=manifest_digest,
+            task_digest=task_digest,
+            policy_version=policy_version,
+            rubric_version=rubric_version,
+            attachment_digests=attachment_digests,
+        )
+        if compute_subject_digest(subject_input) != snapshot.subject_digest:
+            raise GitSnapshotError(
+                "Git snapshot subject digest does not match its canonical facts"
+            )
+        return subject_input
+
+    def _manifest_digest(self, snapshot: GitSnapshot) -> str:
+        manifest = self._manifest_payload(
+            repository=snapshot.repository,
+            base_revision=snapshot.base_revision,
+            head_revision=snapshot.head_revision,
+            scope=snapshot.scope,
+            worktree_dirty=snapshot.worktree_dirty,
+            changes=snapshot.changes,
+            changed_files_total=snapshot.changed_files_total,
+            diff_artifact_digest=snapshot.diff_artifact_digest,
+            diff_bytes=snapshot.diff_bytes,
+            diff_truncated=snapshot.diff_truncated,
+            files_truncated=snapshot.files_truncated,
+            ignored_files_lower_bound=snapshot.ignored_files_lower_bound,
+            ignored_scan_truncated=snapshot.ignored_scan_truncated,
+            large_file_paths=snapshot.large_file_paths,
+            submodule_paths=snapshot.submodule_paths,
+            omissions=snapshot.omissions,
+            complete=snapshot.complete,
+        )
+        return self._manifest_digest_from_payload(manifest)
+
+    def _manifest_payload(
+        self,
+        *,
+        repository: str,
+        base_revision: str,
+        head_revision: str,
+        scope: str,
+        worktree_dirty: bool,
+        changes: tuple[GitChange, ...],
+        changed_files_total: int,
+        diff_artifact_digest: str,
+        diff_bytes: int,
+        diff_truncated: bool,
+        files_truncated: bool,
+        ignored_files_lower_bound: int,
+        ignored_scan_truncated: bool,
+        large_file_paths: tuple[str, ...],
+        submodule_paths: tuple[str, ...],
+        omissions: tuple[str, ...],
+        complete: bool,
+    ) -> dict[str, object]:
+        """Build the one canonical Git manifest used for subject hashing."""
+
+        return {
+            "schema_version": "v1",
+            "repository": repository,
+            "base_revision": base_revision,
+            "head_revision": head_revision,
+            "scope": scope,
+            "worktree_dirty": worktree_dirty,
+            "changes": [
+                change.model_dump(mode="json") for change in changes
+            ],
+            "changed_files_total": changed_files_total,
+            "diff_artifact_digest": diff_artifact_digest,
+            "diff_bytes": diff_bytes,
+            "diff_truncated": diff_truncated,
+            "files_truncated": files_truncated,
+            "ignored_files_lower_bound": ignored_files_lower_bound,
+            "ignored_scan_truncated": ignored_scan_truncated,
+            "large_file_paths": list(large_file_paths),
+            "submodule_paths": list(submodule_paths),
+            "omissions": list(omissions),
+            "complete": complete,
+            "limits": {
+                "max_diff_bytes": self.max_diff_bytes,
+                "max_files": self.max_files,
+                "max_file_bytes": self.max_file_bytes,
+            },
+        }
+
+    @staticmethod
+    def _manifest_digest_from_payload(manifest: dict[str, object]) -> str:
+        return _sha256_bytes(
+            json.dumps(
+                manifest,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
         )
 
     def _resolve_repository_root(self, repository_path: Path) -> Path:

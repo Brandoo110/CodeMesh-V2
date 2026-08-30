@@ -840,7 +840,23 @@ class RemediationController:
                         last_validation=last_validation,
                     )
 
-            built = self.subject_builder(_aggregate_patch_digest(tuple(patch_digests)))
+            patch_digest = _aggregate_patch_digest(tuple(patch_digests))
+            try:
+                parameters = inspect.signature(self.subject_builder).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            workspace_parameter = parameters.get("workspace")
+            accepts_workspace = any(
+                parameter.kind is parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ) or (
+                workspace_parameter is not None
+                and workspace_parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+            )
+            if accepts_workspace:
+                built = self.subject_builder(patch_digest, workspace=workspace)
+            else:
+                built = self.subject_builder(patch_digest)
             new_subject = self._new_subject(built)
             if new_subject is None:
                 return self._result(
