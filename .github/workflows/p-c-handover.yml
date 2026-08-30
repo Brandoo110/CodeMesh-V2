@@ -75,14 +75,20 @@ jobs:
           done
           curl --fail --silent http://127.0.0.1:3010/ >/dev/null
 
+      - name: Install Playwright runner
+        run: |
+          mkdir -p "$RUNNER_TEMP/p-c-playwright"
+          npm install --prefix "$RUNNER_TEMP/p-c-playwright" --no-save --no-package-lock playwright@1.55.0
+          cp scripts/p_c_browser_walkthrough.mjs "$RUNNER_TEMP/p-c-playwright/walkthrough.mjs"
+
       - name: Install headless Chromium
-        run: npm exec --yes --package=playwright@1.55.0 -- playwright install --with-deps chromium
+        run: "$RUNNER_TEMP/p-c-playwright/node_modules/.bin/playwright install --with-deps chromium"
 
       - name: Run target-user browser walkthrough
         env:
           FRONTEND_URL: http://127.0.0.1:3010
           WALKTHROUGH_OUTPUT_DIR: ${{ runner.temp }}/p-c-browser-walkthrough
-        run: npm exec --yes --package=playwright@1.55.0 -- node scripts/p_c_browser_walkthrough.mjs
+        run: node "$RUNNER_TEMP/p-c-playwright/walkthrough.mjs"
 
       - name: Upload walkthrough artifacts
         if: always()
