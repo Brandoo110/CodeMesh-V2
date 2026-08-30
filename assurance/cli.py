@@ -282,6 +282,7 @@ def _public_run_payload(result: AssuranceRunReadback | Mapping[str, object], wor
         if isinstance(raw_gate, Mapping)
         else raw_gate
     )
+    case_state = case_view.get("acceptance_state")
     freshness = case_view.get("freshness")
     actions = case_view.get("allowed_actions", [])
     if (
@@ -291,6 +292,7 @@ def _public_run_payload(result: AssuranceRunReadback | Mapping[str, object], wor
         or type(cached) is not bool
         or type(subject_digest) is not str
         or type(gate) is not str
+        or type(case_state) is not str
         or not isinstance(freshness, Mapping)
         or not isinstance(actions, list)
     ):
@@ -308,6 +310,7 @@ def _public_run_payload(result: AssuranceRunReadback | Mapping[str, object], wor
         "case_id": case_id,
         "subject_digest": subject_digest,
         "gate": gate,
+        "state": case_state,
         "freshness": dict(freshness),
         "allowed_actions": action_codes,
         "workbench_url": workbench_url,
@@ -444,6 +447,7 @@ def run_entry(
     typer.echo(f"run_id: {payload['run_id']}")
     typer.echo(f"case_id: {payload['case_id']}")
     typer.echo(f"subject: {payload['subject_digest']}")
+    typer.echo(f"state: {payload['state']}")
     typer.echo(f"gate: {payload['gate']}")
     freshness = payload["freshness"]
     typer.echo(f"freshness: {freshness.get('status', 'UNAVAILABLE')}")

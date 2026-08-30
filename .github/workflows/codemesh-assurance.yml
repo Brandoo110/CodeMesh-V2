@@ -88,22 +88,59 @@ jobs:
       - name: Start local Assurance API
         env:
           CODEMESH_ASSURANCE_CONFIG: ${{ runner.temp }}/codemesh-assurance-runtime/assurance-runtime.v1.json
+          CODEMESH_ASSURANCE_API_URL: http://127.0.0.1:8010
         run: |
-          python -m uvicorn web.server:app --host 127.0.0.1 --port 8010 --workers 1 \
-            >"$RUNNER_TEMP/codemesh-assurance-server.log" 2>&1 &
+          server_log="$RUNNER_TEMP/codemesh-assurance-server.log"
+          server_pid_file="$RUNNER_TEMP/codemesh-assurance-server.pid"
+
+          dump_server_log() {
+            python - "$server_log" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          try:
+              text = path.read_text(encoding="utf-8", errors="replace")
+          except OSError as exc:
+              print(f"unable to read Assurance API log: {type(exc).__name__}")
+          else:
+              for name in (
+                  "CODEMESH_ASSURANCE_REVIEWER_API_KEY",
+                  "CODEMESH_ASSURANCE_REMEDIATION_API_KEY",
+                  "GITHUB_TOKEN",
+              ):
+                  value = os.environ.get(name)
+                  if value:
+                      text = text.replace(value, "***")
+              print(text[-20000:])
+          PY
+          }
+
+          python -m uvicorn web.server:app --app-dir "$GITHUB_WORKSPACE" \
+            --host 127.0.0.1 --port 8010 --workers 1 --log-level info \
+            >"$server_log" 2>&1 &
           server_pid=$!
-          echo "$server_pid" >"$RUNNER_TEMP/codemesh-assurance-server.pid"
+          printf '%s\n' "$server_pid" >"$server_pid_file"
           for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:8010/api/health >/dev/null; then
+            if curl --fail --silent --show-error --max-time 2 "$CODEMESH_ASSURANCE_API_URL/api/health" >/dev/null; then
               exit 0
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "Assurance API exited before the health check became ready."
+              dump_server_log
+              exit 1
             fi
             sleep 1
           done
+          echo "Assurance API did not become healthy within 30 seconds."
+          dump_server_log
           exit 1
 
       - name: Run Assurance and read back the Case
         env:
           CODEMESH_ASSURANCE_CONFIG: ${{ runner.temp }}/codemesh-assurance-runtime/assurance-runtime.v1.json
+          CODEMESH_ASSURANCE_API_URL: http://127.0.0.1:8010
         run: |
           codemesh assurance run \
             --repository "$GITHUB_WORKSPACE" \
@@ -114,6 +151,7 @@ jobs:
             --policy-path .codex/agents/DEFERRED_HARDENING.md \
             --command-id diff-check \
             --provider-boundary within_declared_boundary \
+            --workbench-url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --json >"$RUNNER_TEMP/codemesh-assurance-run.json"
           python - <<'PY'
           import json
@@ -122,11 +160,65 @@ jobs:
 
           run_file = Path(os.environ["RUNNER_TEMP"]) / "codemesh-assurance-run.json"
           run = json.loads(run_file.read_text(encoding="utf-8"))
-          if not run.get("case_id") or not run.get("subject_digest"):
+          if not all(
+              isinstance(run.get(name), str) and run[name].strip()
+              for name in ("run_id", "case_id", "subject_digest", "state")
+          ):
               raise SystemExit("missing authoritative Case facts")
+          if not isinstance(run.get("freshness"), dict):
+              raise SystemExit("missing authoritative freshness")
           print("case_id=" + run["case_id"])
+          print("run_id=" + run["run_id"])
+          print("subject=" + run["subject_digest"])
+          print("state=" + run["state"])
           print("gate=" + run.get("gate", "UNKNOWN"))
           print("freshness=" + run.get("freshness", {}).get("status", "UNKNOWN"))
+          PY
+
+      - name: Read back authoritative Case and Passport artifacts
+        env:
+          CODEMESH_ASSURANCE_API_URL: http://127.0.0.1:8010
+        run: |
+          artifact_dir="$RUNNER_TEMP/codemesh-assurance-artifacts"
+          mkdir -p "$artifact_dir"
+          cp "$RUNNER_TEMP/codemesh-assurance-run.json" "$artifact_dir/run.json"
+          case_id=$(python -c 'import json,os; from pathlib import Path; print(json.loads((Path(os.environ["RUNNER_TEMP"])/"codemesh-assurance-run.json").read_text(encoding="utf-8"))["case_id"])')
+          encoded_case_id=$(python -c 'import sys; from urllib.parse import quote; print(quote(sys.argv[1], safe=""))' "$case_id")
+          curl --fail --silent --show-error --max-time 20 \
+            "$CODEMESH_ASSURANCE_API_URL/api/assurance/changes/$encoded_case_id" \
+            >"$artifact_dir/case.json"
+          curl --fail --silent --show-error --max-time 20 \
+            "$CODEMESH_ASSURANCE_API_URL/api/assurance/changes/$encoded_case_id/passport?format=json" \
+            >"$artifact_dir/passport.json"
+          curl --fail --silent --show-error --max-time 20 \
+            "$CODEMESH_ASSURANCE_API_URL/api/assurance/changes/$encoded_case_id/passport?format=markdown" \
+            >"$artifact_dir/passport.md"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "codemesh-assurance-artifacts"
+          run = json.loads((root / "run.json").read_text(encoding="utf-8"))
+          case = json.loads((root / "case.json").read_text(encoding="utf-8"))
+          passport = json.loads((root / "passport.json").read_text(encoding="utf-8"))
+          policy_gate = case.get("policy_gate")
+          if (
+              case.get("case_id") != run.get("case_id")
+              or case.get("subject_digest") != run.get("subject_digest")
+              or case.get("acceptance_state") != run.get("state")
+              or not isinstance(policy_gate, dict)
+              or policy_gate.get("status") != run.get("gate")
+              or passport.get("case_id") != run.get("case_id")
+              or passport.get("subject_digest") != run.get("subject_digest")
+              or passport.get("state") != case.get("acceptance_state")
+              or passport.get("gate") != run.get("gate")
+          ):
+              raise SystemExit("authoritative Case/Passport lineage did not match")
+          print("case_passport_lineage=verified")
+          print("evidence_count=" + str(len(passport.get("evidence", []))))
+          print("finding_count=" + str(len(passport.get("findings", []))))
+          print("decision_count=" + str(len(passport.get("policy_decisions", []))))
           PY
 
       - name: Publish and read back the GitHub Check
@@ -155,6 +247,113 @@ jobs:
           print("check_id=" + str(check["check_id"]))
           print("conclusion=" + check.get("conclusion", "UNKNOWN"))
           PY
+          cp "$RUNNER_TEMP/codemesh-assurance-check.json" "$RUNNER_TEMP/codemesh-assurance-artifacts/check.json"
+
+      - name: Assemble and validate CI Workbench lineage
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "codemesh-assurance-artifacts"
+
+          def read(name):
+              path = root / name
+              if not path.is_file():
+                  raise SystemExit("missing CI artifact: " + name)
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          run = read("run.json")
+          case = read("case.json")
+          passport = read("passport.json")
+          check = read("check.json")
+          policy_gate = case.get("policy_gate")
+          required_artifacts = (
+              "run.json",
+              "case.json",
+              "passport.json",
+              "passport.md",
+              "check.json",
+          )
+          if not all((root / name).is_file() for name in required_artifacts):
+              raise SystemExit("CI Workbench artifact set is incomplete")
+          if (
+              case.get("case_id") != run.get("case_id")
+              or case.get("subject_digest") != run.get("subject_digest")
+              or case.get("acceptance_state") != run.get("state")
+              or not isinstance(policy_gate, dict)
+              or policy_gate.get("status") != run.get("gate")
+              or passport.get("case_id") != run.get("case_id")
+              or passport.get("subject_digest") != run.get("subject_digest")
+              or passport.get("state") != case.get("acceptance_state")
+              or passport.get("gate") != run.get("gate")
+              or check.get("case_id") != run.get("case_id")
+              or check.get("subject_digest") != run.get("subject_digest")
+              or check.get("head_sha") != os.environ["GITHUB_SHA"]
+              or not isinstance(check.get("check_id"), int)
+              or check.get("status") != "completed"
+              or not isinstance(check.get("passport_digest"), str)
+              or not check["passport_digest"].strip()
+          ):
+              raise SystemExit("CI Workbench lineage did not match the authoritative run")
+
+          workflow = {
+              "name": os.environ["GITHUB_WORKFLOW"],
+              "job": os.environ["GITHUB_JOB"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "head_sha": os.environ["GITHUB_SHA"],
+          }
+          lineage = {
+              "schema_version": "v1",
+              "workflow": workflow,
+              "run_id": run["run_id"],
+              "case_id": run["case_id"],
+              "subject_digest": run["subject_digest"],
+              "case_state": run["state"],
+              "policy_gate": run["gate"],
+              "check_id": check["check_id"],
+              "check_conclusion": check["conclusion"],
+              "check_url": check.get("check_url"),
+              "passport_digest": check["passport_digest"],
+              "artifact_files": [*required_artifacts, "lineage.json", "workbench.json"],
+          }
+          (root / "lineage.json").write_text(
+              json.dumps(lineage, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          workbench = {
+              "schema_version": "v1",
+              "view": "ci_assurance_workbench",
+              "lineage": lineage,
+              "run": run,
+              "case": case,
+              "passport": passport,
+              "check": check,
+          }
+          (root / "workbench.json").write_text(
+              json.dumps(workbench, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print("workbench_lineage=verified")
+          print("run_id=" + run["run_id"])
+          print("case_id=" + run["case_id"])
+          print("subject=" + run["subject_digest"])
+          print("case_state=" + run["state"])
+          print("check_id=" + str(check["check_id"]))
+          print("check_conclusion=" + check["conclusion"])
+          PY
+
+      - name: Upload CI Workbench and Passport artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemesh-assurance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codemesh-assurance-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Stop local Assurance API
         if: always()

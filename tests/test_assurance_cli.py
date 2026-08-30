@@ -135,6 +135,7 @@ def test_live_run_command_prints_case_subject_gate_freshness_and_workbench(
         "case_view": {
             "subject_digest": "sha256:" + "1" * 64,
             "policy_gate": {"status": "PENDING"},
+            "acceptance_state": "EVIDENCE_COLLECTED",
             "freshness": {"status": "FRESH"},
             "allowed_actions": [],
         },
@@ -167,6 +168,7 @@ def test_live_run_command_prints_case_subject_gate_freshness_and_workbench(
     assert "case-001" in result.stdout
     assert "sha256:" + "1" * 64 in result.stdout
     assert "PENDING" in result.stdout
+    assert "EVIDENCE_COLLECTED" in result.stdout
     assert "FRESH" in result.stdout
     assert "http://127.0.0.1:3010/?view=assurance" in result.stdout
     assert str(tmp_path) not in result.stdout
