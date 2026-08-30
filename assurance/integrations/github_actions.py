@@ -412,12 +412,20 @@ class _GitHubApi:
         return f"/repos/{self.owner}/{self.repo}{suffix}"
 
 
-def _ref_endpoint(ref: str) -> str:
+def _ref_read_endpoint(ref: str) -> str:
     parts = parse_transport_ref(ref)
     if parts is None:
         raise GitHubActionsError("temporary ref is invalid")
     producer_head, transport_head = parts
     return f"/git/ref/heads/codex/evidence-v2/{producer_head}/{transport_head}"
+
+
+def _ref_delete_endpoint(ref: str) -> str:
+    parts = parse_transport_ref(ref)
+    if parts is None:
+        raise GitHubActionsError("temporary ref is invalid")
+    producer_head, transport_head = parts
+    return f"/git/refs/heads/codex/evidence-v2/{producer_head}/{transport_head}"
 
 
 def _select_transport_ref(
@@ -820,7 +828,7 @@ def import_authoritative_bundle(
     ) as api:
         ref_response = api.request(
             "GET",
-            api.repo_path(_ref_endpoint(str(document["transport_ref"]))),
+            api.repo_path(_ref_read_endpoint(str(document["transport_ref"]))),
             expected={200},
         )
         ref_payload = _json(ref_response, label="temporary ref readback")
@@ -933,7 +941,7 @@ def _ref_matches(
     ref: str,
     bundle: BuiltEvidenceBundle,
 ) -> tuple[str, bool] | None:
-    response = api.optional_get(api.repo_path(_ref_endpoint(ref)))
+    response = api.optional_get(api.repo_path(_ref_read_endpoint(ref)))
     if response is None:
         return None
     payload = _json(response, label="temporary ref")
@@ -1573,7 +1581,7 @@ class GitHubActionsTransport:
         try:
             response = self._api.request(
                 "DELETE",
-                self._api.repo_path(_ref_endpoint(ref)),
+                self._api.repo_path(_ref_delete_endpoint(ref)),
                 expected={204},
             )
         except GitHubActionsError as exc:
@@ -1582,13 +1590,13 @@ class GitHubActionsTransport:
             # A timeout/5xx after DELETE is not success and must not be
             # retried blindly.  A 404 readback proves the exact ref is gone;
             # anything else remains unconfirmed for an operator to inspect.
-            if self._api.optional_get(self._api.repo_path(_ref_endpoint(ref))) is None:
+            if self._api.optional_get(self._api.repo_path(_ref_read_endpoint(ref))) is None:
                 self._active_ref = None
                 return
             raise GitHubActionsError("temporary ref cleanup result is unknown", unknown=True) from exc
         if response.content:
             raise GitHubActionsError("temporary ref deletion returned unexpected content")
-        if self._api.optional_get(self._api.repo_path(_ref_endpoint(ref))) is not None:
+        if self._api.optional_get(self._api.repo_path(_ref_read_endpoint(ref))) is not None:
             raise GitHubActionsError("temporary ref still exists after cleanup")
         self._active_ref = None
 

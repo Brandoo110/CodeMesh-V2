@@ -185,18 +185,21 @@ def test_publish_rejects_mismatched_github_readback_without_echoing_token():
     assert "ghs-secret-token" not in str(caught.value)
 
 
-def test_dual_transport_ref_endpoint_rejects_legacy_single_segment_ref():
+def test_dual_transport_ref_endpoints_use_distinct_git_reference_routes():
     ref = (
         "refs/heads/codex/evidence-v2/"
         + PRODUCER_HEAD
         + "/"
         + TRANSPORT_HEAD
     )
-    assert github_actions._ref_endpoint(ref) == (
+    assert github_actions._ref_read_endpoint(ref) == (
         "/git/ref/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
     )
+    assert github_actions._ref_delete_endpoint(ref) == (
+        "/git/refs/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    )
     with pytest.raises(github_actions.GitHubActionsError, match="temporary ref"):
-        github_actions._ref_endpoint("refs/heads/codex/evidence/" + PRODUCER_HEAD)
+        github_actions._ref_read_endpoint("refs/heads/codex/evidence/" + PRODUCER_HEAD)
 
 
 def test_transport_ref_selection_ignores_legacy_and_other_transport_heads():
@@ -285,6 +288,39 @@ def test_cleanup_cannot_target_preserved_legacy_ref_when_new_ref_is_active():
             transport.cleanup(ref=legacy_ref, commit_sha="c" * 40)
     finally:
         transport.close()
+
+
+def test_cleanup_uses_plural_delete_and_singular_404_readback():
+    ref = "refs/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    read_endpoint = "/repos/acme/codemesh/git/ref/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    delete_endpoint = "/repos/acme/codemesh/git/refs/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    requests: list[tuple[str, str]] = []
+    state = {"deleted": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.method == "DELETE":
+            assert request.url.path == delete_endpoint
+            state["deleted"] = True
+            return httpx.Response(204)
+        assert request.method == "GET"
+        assert request.url.path == read_endpoint
+        assert state["deleted"] is True
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    transport = github_actions.GitHubActionsTransport(
+        token="ghs-test-token",
+        repository="acme/codemesh",
+        api_url="https://api.github.test",
+        api_transport=httpx.MockTransport(handler),
+    )
+    transport._active_ref = (ref, "c" * 40)
+    try:
+        transport.cleanup(ref=ref, commit_sha="c" * 40)
+    finally:
+        transport.close()
+
+    assert requests == [("DELETE", delete_endpoint), ("GET", read_endpoint)]
 
 
 def test_import_event_head_mismatch_happens_before_github_mutation(tmp_path, monkeypatch):
