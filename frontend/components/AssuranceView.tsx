@@ -392,7 +392,7 @@ export function AssuranceView() {
     effectiveDecision !== "approve_with_conditions" && effectiveDecision !== "waiver"
   ) || parsedDecisionConditions.length > 0;
   const waiverFieldsReady = effectiveDecision !== "waiver"
-    || Boolean(waiverId.trim() && expiresAt && new Date(expiresAt).getTime() > Date.now());
+    || Boolean(waiverId.trim() && expiresAt);
 
   function openEvidence(ref: string) {
     const evidence = evidenceById.get(ref) || null;

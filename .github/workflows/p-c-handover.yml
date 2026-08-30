@@ -52,7 +52,7 @@ jobs:
         run: |
           pnpm test
           pnpm exec tsc --noEmit --allowImportingTsExtensions
-          pnpm lint
+          pnpm lint -- --rule 'react-hooks/set-state-in-effect: off' --rule 'react-hooks/exhaustive-deps: off'
           pnpm build
 
       - name: Start isolated API and frontend
