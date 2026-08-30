@@ -23,6 +23,7 @@ import {
   submitAssuranceDecision,
 } from "@/lib/api";
 import {
+  authoritativeReadbackMatches,
   getDecisionOptions,
   getSelectedDecisionAction,
 } from "@/lib/assurance-case-view";
@@ -223,7 +224,7 @@ function EvidenceDrawer({ caseId, evidence, missingRef, onClose }: { caseId: str
   }
 
   return (
-    <aside className="flex h-full w-[370px] flex-shrink-0 flex-col border-l border-border bg-surface">
+    <aside className="absolute inset-y-0 right-0 z-20 flex h-full w-full flex-shrink-0 flex-col border-l border-border bg-surface shadow-2xl sm:w-[370px]">
       <div className="flex h-14 items-center justify-between border-b border-border px-5">
         <div>
           <div className="text-xs uppercase tracking-[0.14em] text-fg-subtle">Evidence</div>
@@ -386,6 +387,12 @@ export function AssuranceView() {
     && (runForm.changed_lines_total.trim() === "" || /^\d+$/.test(runForm.changed_lines_total.trim()))
   );
   const freshnessNotice = detail ? liveFreshnessNotice(detail) : null;
+  const parsedDecisionConditions = conditions.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
+  const decisionConditionsReady = (
+    effectiveDecision !== "approve_with_conditions" && effectiveDecision !== "waiver"
+  ) || parsedDecisionConditions.length > 0;
+  const waiverFieldsReady = effectiveDecision !== "waiver"
+    || Boolean(waiverId.trim() && expiresAt && new Date(expiresAt).getTime() > Date.now());
 
   function openEvidence(ref: string) {
     const evidence = evidenceById.get(ref) || null;
@@ -459,10 +466,12 @@ export function AssuranceView() {
       || !ownerRoleMatches
       || selfApprovalBlocked
       || (selectedAction.high_risk_confirmation_required && !highRiskConfirmed)
+      || !decisionConditionsReady
+      || !waiverFieldsReady
     ) return;
     const parsedConditions = (
       effectiveDecision === "approve_with_conditions" || effectiveDecision === "waiver"
-        ? conditions.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)
+        ? parsedDecisionConditions
         : []
     );
     setSubmitting(true);
@@ -477,13 +486,17 @@ export function AssuranceView() {
         expires_at: effectiveDecision === "waiver" && expiresAt ? new Date(expiresAt).toISOString() : null,
         decided_at: decidedAt, high_risk_confirmed: highRiskConfirmed,
       };
-      const updated = await submitAssuranceDecision(
+      const posted = await submitAssuranceDecision(
         detail.case_id,
         request,
         `web-${detail.case_id}-${crypto.randomUUID()}`,
       );
-      setDetail(updated);
-      setCases((rows) => rows.map((row) => row.case_id === updated.case_id ? updated : row));
+      const readback = await getAssuranceChange(detail.case_id);
+      if (!authoritativeReadbackMatches(posted, readback)) {
+        throw new Error("Decision 未确认：authoritative GET 与 POST 业务结果不一致，请刷新后再判断，系统不会自动重试。");
+      }
+      setDetail(readback);
+      setCases((rows) => rows.map((row) => row.case_id === readback.case_id ? readback : row));
       setReason(""); setConditions("");
       setError(null);
     } catch (cause) {
@@ -498,8 +511,8 @@ export function AssuranceView() {
   }
 
   return (
-    <div className="relative flex min-h-0 flex-1 overflow-hidden bg-canvas">
-      <aside className="flex w-[310px] flex-shrink-0 flex-col border-r border-border bg-surface">
+    <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-canvas md:flex-row">
+      <aside className="flex max-h-[38vh] w-full flex-shrink-0 flex-col border-b border-border bg-surface md:max-h-none md:w-[310px] md:border-b-0 md:border-r">
         <div className="flex h-14 items-center justify-between border-b border-border px-4">
           <div><div className="text-sm font-semibold text-fg">Change Queue</div><div className="text-xs text-fg-subtle">{cases.length} 个验收对象</div></div>
           <div className="flex items-center gap-1"><button onClick={() => selectCase(null)} className="p-2 text-fg-muted hover:bg-surface-hover hover:text-fg" title="新建本地 Run"><Plus size={16} /></button><button onClick={() => void load(true)} className="p-2 text-fg-muted hover:bg-surface-hover hover:text-fg" title="刷新"><RefreshCw size={16} className={refreshing ? "animate-spin" : ""} /></button></div>
@@ -554,7 +567,7 @@ export function AssuranceView() {
               <div className="flex items-start gap-3 border border-error/40 bg-error/10 p-4 text-error"><AlertTriangle className="mt-0.5 flex-shrink-0" size={18} /><div><div className="font-semibold">{freshnessNotice.title}</div><div className="mt-1 text-sm">{freshnessNotice.reason}</div></div></div>
             )}
             <header className="border-b border-border pb-5">
-              <div className="mb-3 flex items-center justify-between gap-3"><span className="text-xs font-semibold uppercase tracking-[0.12em] text-fg-subtle">CaseView v1</span><span className="text-xs text-fg-subtle">rev {detail.revision}</span></div>
+              <div className="mb-3 flex items-center justify-between gap-3"><span className="text-xs font-semibold uppercase tracking-[0.12em] text-fg-subtle">Change Passport · CaseView v1</span><span className="text-xs text-fg-subtle">rev {detail.revision}</span></div>
               <div className="flex items-start justify-between gap-6"><div><h2 className="text-2xl font-semibold tracking-tight text-fg">{detail.metadata?.title || detail.case_id}</h2><p className="mt-2 max-w-3xl text-sm leading-6 text-fg-muted">{detail.metadata?.summary || "未记录变更摘要"}</p></div><div className="flex flex-shrink-0 gap-2"><button onClick={() => void downloadAssurancePassport(detail.case_id, "json")} className="flex items-center gap-1.5 border border-border px-3 py-2 text-xs text-fg-muted hover:bg-surface"><Download size={14} />JSON</button><button onClick={() => void downloadAssurancePassport(detail.case_id, "markdown")} className="flex items-center gap-1.5 border border-border px-3 py-2 text-xs text-fg-muted hover:bg-surface"><Download size={14} />Markdown</button></div></div>
               <div className="mt-4 break-all font-mono text-xs text-fg-subtle">{detail.subject_digest}</div>
             </header>
@@ -564,6 +577,28 @@ export function AssuranceView() {
               <AxisBlock title="Acceptance" value={detail.acceptance_state} />
               <AxisBlock title="Release" value={detail.release_state.status} note={detail.release_state.trust_level ? `trust: ${detail.release_state.trust_level}` : undefined} />
               <AxisBlock title="Freshness" value={detail.freshness?.status || "UNAVAILABLE"} note={detail.freshness?.reason_code || "NO_FRESHNESS_CHECKER"} />
+            </section>
+
+            <section className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+              <div className="border border-border bg-surface p-5">
+                <div className="mb-3 flex items-center justify-between gap-3"><h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-fg-muted">Passport Summary</h3><Badge value={detail.gate} /></div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <InfoBlock title="Case identity" value={detail.case_id} />
+                  <InfoBlock title="Subject digest" value={detail.subject_digest} />
+                  <InfoBlock title="Owner" value={detail.metadata?.owner} />
+                  <InfoBlock title="Author" value={detail.metadata?.author} />
+                </div>
+                <p className="mt-4 text-xs leading-5 text-fg-subtle">Passport 是当前 Case 的服务端派生视图；Gate、Freshness 和 allowed actions 均不由浏览器计算。</p>
+              </div>
+              <div className="border border-border bg-surface p-5">
+                <div className="mb-3 flex items-center justify-between gap-3"><h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-fg-muted">Lineage</h3><span className="text-xs text-fg-subtle">authoritative refs</span></div>
+                <div className="space-y-2 font-mono text-xs leading-5 text-fg-muted">
+                  <div><span className="text-fg-subtle">Evidence </span>{detail.case.evidence_refs.length ? detail.case.evidence_refs.join(" · ") : "none"}</div>
+                  <div><span className="text-fg-subtle">Receipt </span>{detail.case.execution_receipt_refs.length ? detail.case.execution_receipt_refs.join(" · ") : "none"}</div>
+                  <div><span className="text-fg-subtle">Policy </span>{detail.case.policy_decision_refs.length ? detail.case.policy_decision_refs.join(" · ") : "none"}</div>
+                  <div><span className="text-fg-subtle">Human </span>{detail.case.human_decision_refs.length ? detail.case.human_decision_refs.join(" · ") : "none"}</div>
+                </div>
+              </div>
             </section>
 
             <section className="grid grid-cols-1 gap-5 lg:grid-cols-3"><InfoBlock title="Intent Coverage" value={detail.metadata?.intent_coverage} /><InfoBlock title="Architecture Impact" value={detail.metadata?.architecture_impact} /><InfoBlock title="Operational Readiness" value={detail.metadata?.operational_readiness} /><InfoBlock title="Knowledge" value={detail.metadata?.knowledge_notes} /><InfoBlock title="Ownership" value={detail.metadata?.ownership_notes} /><InfoBlock title="Policy / Rubric" value={`${detail.binding.policy_version} / ${detail.binding.rubric_version}`} /></section>
@@ -616,7 +651,7 @@ export function AssuranceView() {
                   {selectedAction?.high_risk_confirmation_required && <label className="mt-3 flex items-center gap-2 text-sm text-warning"><input type="checkbox" checked={highRiskConfirmed} onChange={(e) => setHighRiskConfirmed(e.target.checked)} />我已复核高风险变更并进行二次确认</label>}
                   <div className="mt-4 flex items-center justify-between gap-4">
                     <div className="text-xs text-fg-subtle">动作来自当前 CaseView allowed_actions；服务端会再次校验。</div>
-                    <button onClick={() => void submitDecision()} disabled={submitting || !selectedAction || !reason.trim() || !owner.trim() || !ownerRole.trim() || !ownerRoleMatches || selfApprovalBlocked || Boolean(selectedAction?.high_risk_confirmation_required && !highRiskConfirmed)} className="flex items-center gap-2 bg-accent px-4 py-2 text-sm font-semibold text-canvas disabled:cursor-not-allowed disabled:opacity-40">
+                    <button onClick={() => void submitDecision()} disabled={submitting || !selectedAction || !reason.trim() || !owner.trim() || !ownerRole.trim() || !ownerRoleMatches || selfApprovalBlocked || Boolean(selectedAction?.high_risk_confirmation_required && !highRiskConfirmed) || !decisionConditionsReady || !waiverFieldsReady} className="flex items-center gap-2 bg-accent px-4 py-2 text-sm font-semibold text-canvas disabled:cursor-not-allowed disabled:opacity-40">
                       {submitting ? <RefreshCw size={15} className="animate-spin" /> : effectiveDecision === "reject" ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}提交签收
                     </button>
                   </div>

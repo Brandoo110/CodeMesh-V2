@@ -39,3 +39,5 @@
 本轮专项记录（2026-08-30，P-B 真实入口与自动化）：新增 loopback CLI、GitHub Check transport/readback 与同一合同的 CI workflow；focused tests 使用 MockTransport 仅证明实现边界，不替代真实 provider/GitHub 写入证据。真实 GitHub 写入因本轮未获 exact authorization 未执行；全面安全扫描、压力/性能/长稳及生产加固仍按当前阶段延后。
 
 本轮授权纠偏（2026-08-30，P-B）：当前冻结任务已明确授权本仓库、分支、PR 与 Workflow/Check 的真实 dogfood 外部写入；上述“未获 exact authorization”仅适用于此前运行窗口。新的候选仍须以 fresh PR、Workflow、Case/Passport、Check 与 artifact lineage 权威读回为准，未完成前不宣称 dogfood 或生产就绪；全面安全扫描、压力/性能/长稳及生产加固继续延后。
+
+本轮专项记录（2026-08-30，P-C 团队接管与产品体验）：新增 Queue → Change Passport → Findings/Evidence/Freshness/Lineage → owner decision 的 CI-only 隔离走查；验证素材为临时 SQLite、TestClient、Next production build 与 headless Chromium，未触碰真实 Case、生产数据库、Provider 或部署。当前仍未达到真实用户/流量、部署回滚或生产成熟度；全面安全扫描、压力/性能/长稳、大规模并发及生产多租户/RBAC/灾备/运营级发布加固无新增，继续按阶段延后。
