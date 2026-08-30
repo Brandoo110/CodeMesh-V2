@@ -20,7 +20,7 @@ try {
   await page.getByText("UNAVAILABLE", { exact: true }).waitFor();
   await page.screenshot({ path: `${outputDir}/desktop-case-passport.png`, fullPage: true });
 
-  await page.getByPlaceholder("Owner").fill("release-owner");
+  await page.getByPlaceholder("Owner", { exact: true }).fill("release-owner");
   await page.getByPlaceholder(/Role/).fill("release_owner");
   await page.getByPlaceholder("签收理由（必填）").fill("CI walkthrough owner decision");
   await page.getByLabel("我已复核高风险变更并进行二次确认").check();
