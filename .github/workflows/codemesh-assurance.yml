@@ -34,8 +34,23 @@ jobs:
           python-version: "3.11"
 
       - name: Install CodeMesh web runtime
-        # The current orchestration adapter uses the pre-1.0 OpenAIModel API.
-        run: python -m pip install --disable-pip-version-check -e '.[web]' 'pydantic-ai==0.8.0'
+        run: python -m pip install --disable-pip-version-check -e '.[web]'
+
+      - name: Verify Assurance runtime dependency contract
+        run: |
+          python -m pip check
+          python - <<'PY'
+          from opentelemetry._events import Event
+          from pydantic_ai.models.openai import OpenAIModel
+          from pydantic_ai.providers.openai import OpenAIProvider
+          from web.server import app
+
+          assert Event is not None
+          assert OpenAIModel is not None
+          assert OpenAIProvider is not None
+          assert app is not None
+          print("assurance_runtime_imports=ok")
+          PY
 
       - name: Create ephemeral Assurance runtime config
         env:
