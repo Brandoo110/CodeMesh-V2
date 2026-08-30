@@ -114,7 +114,7 @@ jobs:
             --transport-head "$CODEMESH_TRANSPORT_HEAD" \
             --transport-ref-commit "$CODEMESH_EVIDENCE_REF_COMMIT" \
             --ci-run-id "$GITHUB_RUN_ID" \
-            --ci-job-id "$GITHUB_JOB" \
+            --ci-job-id "${{ job.check_run_id }}" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Verify CI-only import counters

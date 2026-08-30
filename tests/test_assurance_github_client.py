@@ -330,6 +330,8 @@ def test_workflow_queries_only_current_evidence_v2_transport_ref():
 
     assert "refs/heads/codex/evidence-v2/*/" in workflow
     assert "refs/heads/codex/evidence/*/" not in workflow
+    assert '--ci-job-id "${{ job.check_run_id }}"' in workflow
+    assert '--ci-job-id "$GITHUB_JOB"' not in workflow
     assert document["permissions"] == {
         "contents": "read",
         "pull-requests": "read",
