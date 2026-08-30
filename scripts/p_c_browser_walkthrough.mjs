@@ -51,7 +51,7 @@ try {
   await page.getByText("Change Passport · CaseView v1").waitFor();
   await page.getByText("Lineage").waitFor();
   await page.getByText("Findings").waitFor();
-  await page.getByText("Evidence").waitFor();
+  await page.getByText("Evidence", { exact: true }).waitFor();
   await page.getByText("FRESH", { exact: true }).waitFor();
   await page.getByText("FRESHNESS_MATCH", { exact: true }).waitFor();
   await page.getByText(`Required role: ${approve.required_human_role}`).waitFor();
