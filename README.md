@@ -233,7 +233,44 @@ rolling back the provider option. Any failure fails closed.
    .venv/bin/python -m uvicorn web.server:app --host 127.0.0.1 --port 8010 --workers 1
    ```
 
-4. From another terminal, submit one run. Replace all uppercase placeholders;
+4. From another terminal, use the user-facing CLI to submit one real run and
+   immediately read back its authoritative CaseView. The command sends only
+   the server-owned Run intent; it never prints the repository path, task
+   contents, provider prompt, or secret. Repeating the command with an
+   unchanged worktree deterministically reuses its idempotency key:
+
+   ```bash
+   codemesh assurance run \
+     --repository "$PWD" \
+     --repository-identity "example/service" \
+     --author "local-cli" \
+     --base-ref "BASE_REF_THAT_EXISTS" \
+     --task-path examples/quickstart-task.md \
+     --policy-path .codex/agents/DEFERRED_HARDENING.md \
+     --command-id diff-check \
+     --provider-boundary within_declared_boundary
+   ```
+
+   The output includes `run_id`, `case_id`, subject digest, server policy gate,
+   live freshness, allowed actions, and the local Workbench URL. Any transport,
+   schema, or readback mismatch exits non-zero and is not reported as a
+   successful run. The existing `python -m assurance.cli gate/passport`
+   commands remain read-only compatibility surfaces.
+
+5. For a real GitHub/CI entry, configure the repository secret
+   `CODEMESH_ASSURANCE_REVIEWER_API_KEY` in GitHub (never in the repository or
+   command line), then enable [`.github/workflows/codemesh-assurance.yml`](.github/workflows/codemesh-assurance.yml).
+   The workflow starts the loopback API, invokes the same `codemesh assurance run`
+   command, reads the Passport from the local API, publishes a bound
+   `CodeMesh Change Assurance` Check Run with `checks: write`, and GETs that
+   Check back to verify the exact Case/passport digest and commit SHA. Forked
+   pull requests are skipped because GitHub does not expose the reviewer
+   secret to them; use a trusted same-repository branch or an explicitly
+   authorized workflow dispatch. The workflow is the real external entry;
+   offline exporter payloads and fixture transports do not count as its
+   success evidence.
+
+6. For manual API contract inspection only, submit one run. Replace all uppercase placeholders;
    `task_path`, `policy_paths`, and the other repository file paths below are
    relative to `repository_path` by contract. The example's `diff-check`
    command is intentionally a lightweight staged/unstaged Git check, not a
@@ -264,7 +301,7 @@ rolling back the provider option. Any failure fails closed.
    with a different request conflicts rather than silently creating another
    run.
 
-5. Use the existing read surfaces, substituting the IDs returned by the POST:
+7. Use the existing read surfaces, substituting the IDs returned by the POST:
 
    ```bash
    # CaseView

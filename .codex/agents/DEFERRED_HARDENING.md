@@ -35,3 +35,5 @@
 本轮待回答的两个 operability questions 是：如何保证每次 run 不因 reviewer 重试而产生额外 provider 请求，以及服务停止/回滚时有哪些真实控制面。当前边界为 `max_retries=0`、每次 run 一次 provider request，Case `Idempotency-Key` 负责 replay/conflict，失败 fail-closed；没有独立 runtime kill-switch，安全停止/回滚依靠停止本地服务或回滚 provider option。无新增 hardening。
 
 后续 operability gap：建立 dedicated provider status taxonomy，并补充 usage/cost capture。两项均未完成，不阻塞当前已记录的真实 reviewer success 事实。
+
+本轮专项记录（2026-08-30，P-B 真实入口与自动化）：新增 loopback CLI、GitHub Check transport/readback 与同一合同的 CI workflow；focused tests 使用 MockTransport 仅证明实现边界，不替代真实 provider/GitHub 写入证据。真实 GitHub 写入因本轮未获 exact authorization 未执行；全面安全扫描、压力/性能/长稳及生产加固仍按当前阶段延后。

@@ -32,12 +32,14 @@ from rich.table import Table
 from harness import Harness
 from rag import build_index
 from feedback import read_calls, aggregate, LOG_PATH, render_stats_dashboard, write_artifact
+from assurance.cli import app as assurance_app
 
 
 app = typer.Typer(
     help="CodeMesh：国内多模型 Code Agent（Harness 四层架构实践）",
     no_args_is_help=True,
 )
+app.add_typer(assurance_app, name="assurance")
 console = Console()
 
 

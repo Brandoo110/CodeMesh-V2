@@ -1,0 +1,166 @@
+name: CodeMesh Assurance
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  assurance:
+    # A pull_request from a fork cannot receive the reviewer secret.  Do not
+    # silently downgrade to an unreviewed or offline result in that case.
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    env:
+      CODEMESH_ASSURANCE_REVIEWER_API_KEY: ${{ secrets.CODEMESH_ASSURANCE_REVIEWER_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CodeMesh web runtime
+        run: python -m pip install --disable-pip-version-check -e '.[web]'
+
+      - name: Create ephemeral Assurance runtime config
+        env:
+          CODEMESH_REPO_ROOT: ${{ github.workspace }}
+          CODEMESH_RUNTIME_ROOT: ${{ runner.temp }}/codemesh-assurance-runtime
+        run: |
+          mkdir -p "$CODEMESH_RUNTIME_ROOT/artifacts"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          repo_root = Path(os.environ["CODEMESH_REPO_ROOT"])
+          runtime_root = Path(os.environ["CODEMESH_RUNTIME_ROOT"])
+          config = {
+              "schema_version": "v1",
+              "workspace_root": str(repo_root),
+              "database_path": str(runtime_root / "assurance.sqlite"),
+              "artifact_store_root": str(runtime_root / "artifacts"),
+              "allowed_commands": [
+                  {
+                      "schema_version": "v1",
+                      "command_id": "diff-check",
+                      "kind": "lint",
+                      "argv": ["git", "diff", "--check", "HEAD", "--"],
+                      "cwd": ".",
+                      "timeout_seconds": 60.0,
+                      "max_output_bytes": 65536,
+                  }
+              ],
+              "orchestration_version": "golden.v1",
+              "redaction_policy_version": "redaction.v0",
+              "policy_version": "gate.v0",
+              "rubric_version": "single_general.v0",
+              "freshness_ttl_seconds": 300,
+              "reviewer": {
+                  "provider": "deepseek",
+                  "model_ref": "deepseek-v4-flash",
+                  "timeout_seconds": 60,
+                  "token_budget": 4096,
+                  "routing_rule": "single_general.v0:fixed",
+              },
+          }
+          (runtime_root / "assurance-runtime.v1.json").write_text(
+              json.dumps(config, ensure_ascii=False, sort_keys=True),
+              encoding="utf-8",
+          )
+          print(runtime_root / "assurance-runtime.v1.json")
+          PY
+
+      - name: Start local Assurance API
+        env:
+          CODEMESH_ASSURANCE_CONFIG: ${{ runner.temp }}/codemesh-assurance-runtime/assurance-runtime.v1.json
+        run: |
+          python -m uvicorn web.server:app --host 127.0.0.1 --port 8010 --workers 1 \
+            >"$RUNNER_TEMP/codemesh-assurance-server.log" 2>&1 &
+          server_pid=$!
+          echo "$server_pid" >"$RUNNER_TEMP/codemesh-assurance-server.pid"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8010/api/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Run Assurance and read back the Case
+        env:
+          CODEMESH_ASSURANCE_CONFIG: ${{ runner.temp }}/codemesh-assurance-runtime/assurance-runtime.v1.json
+        run: |
+          codemesh assurance run \
+            --repository "$GITHUB_WORKSPACE" \
+            --repository-identity "$GITHUB_REPOSITORY" \
+            --author "github-actions" \
+            --base-ref origin/main \
+            --task-path examples/quickstart-task.md \
+            --policy-path .codex/agents/DEFERRED_HARDENING.md \
+            --command-id diff-check \
+            --provider-boundary within_declared_boundary \
+            --json >"$RUNNER_TEMP/codemesh-assurance-run.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          run_file = Path(os.environ["RUNNER_TEMP"]) / "codemesh-assurance-run.json"
+          run = json.loads(run_file.read_text(encoding="utf-8"))
+          if not run.get("case_id") or not run.get("subject_digest"):
+              raise SystemExit("missing authoritative Case facts")
+          print("case_id=" + run["case_id"])
+          print("gate=" + run.get("gate", "UNKNOWN"))
+          print("freshness=" + run.get("freshness", {}).get("status", "UNKNOWN"))
+          PY
+
+      - name: Publish and read back the GitHub Check
+        env:
+          CODEMESH_ASSURANCE_CONFIG: ${{ runner.temp }}/codemesh-assurance-runtime/assurance-runtime.v1.json
+        run: |
+          case_id=$(python -c 'import json,os; from pathlib import Path; print(json.loads((Path(os.environ["RUNNER_TEMP"])/"codemesh-assurance-run.json").read_text())["case_id"])')
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY##*/}"
+          codemesh assurance github publish \
+            --case-id "$case_id" \
+            --owner "$owner" \
+            --repo "$repo" \
+            --head-sha "$GITHUB_SHA" \
+            --token-env GITHUB_TOKEN \
+            --json >"$RUNNER_TEMP/codemesh-assurance-check.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          check_file = Path(os.environ["RUNNER_TEMP"]) / "codemesh-assurance-check.json"
+          check = json.loads(check_file.read_text(encoding="utf-8"))
+          if not check.get("check_id") or check.get("head_sha") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("missing authoritative GitHub Check readback")
+          print("check_id=" + str(check["check_id"]))
+          print("conclusion=" + check.get("conclusion", "UNKNOWN"))
+          PY
+
+      - name: Stop local Assurance API
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/codemesh-assurance-server.pid" ]; then
+            server_pid=$(cat "$RUNNER_TEMP/codemesh-assurance-server.pid")
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          fi
