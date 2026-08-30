@@ -25,6 +25,7 @@ from .github import (
 
 
 _CHECK_NAME = "CodeMesh Change Assurance"
+_GITHUB_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -245,7 +246,7 @@ class GitHubCheckPublisher:
             raise GitHubPublishError("GitHub Check Run state binding did not match")
         check_url = payload.get("html_url")
         if check_url is not None:
-            if type(check_url) is not str:
+            if type(check_url) is not str or not check_url.strip():
                 raise GitHubPublishError("GitHub Check Run URL was invalid")
             try:
                 parsed_url = httpx.URL(check_url)
@@ -328,6 +329,10 @@ class GitHubCheckPublisher:
         """Create or safely reuse a Check Run, then GET it back from GitHub."""
 
         owner_text, repo_text, sha_text = self._validate_target(owner, repo, head_sha)
+        if not _GITHUB_NAME_RE.fullmatch(owner_text) or not _GITHUB_NAME_RE.fullmatch(repo_text):
+            raise ValueError("owner and repo must be simple GitHub names")
+        if not isinstance(passport, Mapping):
+            raise GitHubPublishError("passport must be a mapping")
         try:
             target = GitHubTarget(
                 owner=owner_text,
