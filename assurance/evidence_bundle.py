@@ -24,18 +24,19 @@ from typing import Any
 _SCHEMA_VERSION = "v1"
 _BUNDLE_TYPE = "AssuranceEvidenceBundle"
 _ORIGIN = "local_authoritative_bundle"
-_DEFAULT_PREFIX = "mvp-08f-remediation-post-fix-03-"
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY_RE = re.compile(r"^[^/\s?#]+/[^/\s?#]+$")
 _ARTIFACT_FILE_RE = re.compile(r"^sha256_([0-9a-f]{64})$")
 _INDEX_FILE_RE = re.compile(r"^ev_[A-Za-z0-9_-]+-index\.json$")
+_AUTHORITATIVE_CASE_RE = re.compile(r"^(.+)-authoritative-case\.json$")
 _TRANSPORT_REF_RE = re.compile(
     r"^refs/heads/codex/evidence-v2/([0-9a-f]{40})/([0-9a-f]{40})$"
 )
 _MAX_OBJECT_BYTES = 256 * 1024
 _MAX_BUNDLE_BYTES = 900 * 1024
 _MAX_OBJECTS = 256
+_MAX_DISCOVERY_CANDIDATES = 64
 _MAX_NESTING = 32
 
 _SECRET_PATTERNS = (
@@ -359,7 +360,14 @@ def _object_record(
     }
 
 
+def _validated_prefix(prefix: object) -> str:
+    if type(prefix) is not str or not prefix or "/" in prefix or ".." in prefix:
+        raise BundleError("evidence prefix is invalid")
+    return prefix
+
+
 def _selected_paths(root: Path, prefix: str) -> dict[str, Path]:
+    prefix = _validated_prefix(prefix)
     suffixes = {
         "case": "authoritative-case.json",
         "run": "response.json",
@@ -373,6 +381,61 @@ def _selected_paths(root: Path, prefix: str) -> dict[str, Path]:
             raise BundleError(f"missing authoritative {key} file")
         selected[key] = path
     return selected
+
+
+def _discover_prefix(root: Path, *, case_id: str, max_object_bytes: int) -> str:
+    matches: list[str] = []
+    candidate_count = 0
+    try:
+        entries = root.iterdir()
+        for path in entries:
+            match = _AUTHORITATIVE_CASE_RE.fullmatch(path.name)
+            if match is None:
+                continue
+            candidate_count += 1
+            if candidate_count > _MAX_DISCOVERY_CANDIDATES:
+                raise BundleError("too many authoritative Case candidates")
+            try:
+                info = path.lstat()
+            except OSError as exc:
+                raise BundleError("authoritative Case candidate is unavailable") from exc
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise BundleError(
+                    "authoritative Case candidate must be a regular non-symlink file"
+                )
+            prefix = _validated_prefix(match.group(1) + "-")
+            data = _read_stable(
+                path,
+                label="authoritative Case candidate",
+                max_bytes=max_object_bytes,
+            )
+            candidate = _parse_json(data, label="authoritative Case candidate")
+            candidate_id = _require_text(
+                candidate.get("case_id"), field="authoritative Case candidate case_id"
+            )
+            if candidate_id == case_id:
+                matches.append(prefix)
+    except BundleError:
+        raise
+    except OSError as exc:
+        raise BundleError("evidence root changed while scanning") from exc
+    if not matches:
+        raise BundleError("no authoritative Case matched requested case")
+    if len(matches) > 1:
+        raise BundleError("multiple authoritative Cases matched requested case")
+    return matches[0]
+
+
+def _resolve_prefix(
+    root: Path,
+    *,
+    case_id: str,
+    prefix: str | None,
+    max_object_bytes: int,
+) -> str:
+    if prefix is not None:
+        return _validated_prefix(prefix)
+    return _discover_prefix(root, case_id=case_id, max_object_bytes=max_object_bytes)
 
 
 def _validate_core_payloads(
@@ -495,7 +558,7 @@ def _build_document(
     target_pr: int,
     producer_head: str,
     transport_head: str,
-    prefix: str,
+    prefix: str | None,
     max_object_bytes: int,
 ) -> tuple[dict[str, Any], str, str, str, str, str, str]:
     root = _real_directory(Path(evidence_root), label="evidence root")
@@ -504,8 +567,12 @@ def _build_document(
     target_pr = _require_pr(target_pr)
     producer_head = _require_sha1(producer_head, field="producer_head")
     transport_head = _require_sha1(transport_head, field="transport_head")
-    if type(prefix) is not str or not prefix or "/" in prefix or ".." in prefix:
-        raise BundleError("evidence prefix is invalid")
+    prefix = _resolve_prefix(
+        root,
+        case_id=case_id,
+        prefix=prefix,
+        max_object_bytes=max_object_bytes,
+    )
     selected = _selected_paths(root, prefix)
     payload_bytes = {
         key: _read_stable(path, label=key, max_bytes=max_object_bytes)
@@ -752,7 +819,7 @@ def build_evidence_bundle(
     pr_number: int,
     producer_head: str,
     transport_head: str,
-    prefix: str = _DEFAULT_PREFIX,
+    prefix: str | None = None,
     max_object_bytes: int = _MAX_OBJECT_BYTES,
 ) -> BuiltEvidenceBundle:
     """Export one strict local evidence directory into canonical Bundle v1."""

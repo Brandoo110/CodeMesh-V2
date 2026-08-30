@@ -167,7 +167,7 @@ class CasePublication:
         repository: str,
         transport_head: str,
         remote: PublicationRemote,
-        prefix: str = "mvp-08f-remediation-post-fix-03-",
+        prefix: str | None = None,
     ) -> None:
         if not isinstance(evidence_root, Path):
             raise TypeError("evidence_root must be a Path")

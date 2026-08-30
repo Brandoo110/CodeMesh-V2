@@ -4,11 +4,13 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from assurance.case_publication import CasePublication
 from assurance.evidence_bundle import (
     BundleError,
     _read_stable,
@@ -20,10 +22,13 @@ from assurance.evidence_bundle import (
 
 
 CASE_ID = "case_fixture"
+NEW_CASE_ID = "case_new_fixture"
 RUN_ID = "run_fixture"
 SUBJECT = "sha256:" + "1" * 64
 PRODUCER_HEAD = "a" * 40
 TRANSPORT_HEAD = "b" * 40
+LEGACY_PREFIX = "mvp-08f-remediation-post-fix-03-"
+NEW_PREFIX = "branch-worktree-head-pin-20260830-new-"
 
 
 def _digest(data: bytes) -> str:
@@ -136,6 +141,34 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     return root, artifact_path, artifact_digest
 
 
+def _clone_evidence_set(root: Path, source_prefix: str, target_prefix: str, case_id: str) -> None:
+    def replace_case_ids(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: case_id if key == "case_id" else replace_case_ids(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [replace_case_ids(item) for item in value]
+        return value
+
+    for suffix in ("authoritative-case.json", "passport.json", "response.json"):
+        source = root / f"{source_prefix}{suffix}"
+        value = json.loads(source.read_text(encoding="utf-8"))
+        _write_json(root / f"{target_prefix}{suffix}", replace_case_ids(value))
+    shutil.copyfile(
+        root / f"{source_prefix}passport.md",
+        root / f"{target_prefix}passport.md",
+    )
+    shutil.copytree(
+        root / f"{source_prefix}artifacts",
+        root / f"{target_prefix}artifacts",
+    )
+    for path in (root / f"{target_prefix}artifacts").glob("*.json"):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        _write_json(path, replace_case_ids(value))
+
+
 def _build(tmp_path: Path):
     root, _, _ = _fixture(tmp_path)
     return build_evidence_bundle(
@@ -146,6 +179,132 @@ def _build(tmp_path: Path):
         producer_head=PRODUCER_HEAD,
         transport_head=TRANSPORT_HEAD,
     )
+
+
+def test_bundle_selects_requested_case_across_prefixes(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path)
+    _clone_evidence_set(root, LEGACY_PREFIX, NEW_PREFIX, NEW_CASE_ID)
+
+    built = build_evidence_bundle(
+        root,
+        case_id=NEW_CASE_ID,
+        repository="acme/codemesh",
+        pr_number=2,
+        producer_head=PRODUCER_HEAD,
+        transport_head=TRANSPORT_HEAD,
+    )
+
+    assert built.case_id == NEW_CASE_ID
+
+
+def test_bundle_rejects_duplicate_requested_case_across_prefixes(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path)
+    _clone_evidence_set(root, LEGACY_PREFIX, NEW_PREFIX, CASE_ID)
+
+    with pytest.raises(BundleError, match="multiple authoritative Cases"):
+        build_evidence_bundle(
+            root,
+            case_id=CASE_ID,
+            repository="acme/codemesh",
+            pr_number=2,
+            producer_head=PRODUCER_HEAD,
+            transport_head=TRANSPORT_HEAD,
+        )
+
+
+def test_duplicate_case_is_rejected_before_publication_remote(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path)
+    _clone_evidence_set(root, LEGACY_PREFIX, NEW_PREFIX, CASE_ID)
+    calls: list[str] = []
+
+    class FailRemote:
+        def publish(self, **_kwargs):
+            calls.append("publish")
+            raise AssertionError("remote publish must not be called")
+
+        def cleanup(self, **_kwargs):
+            calls.append("cleanup")
+            raise AssertionError("remote cleanup must not be called")
+
+    publication = CasePublication(
+        evidence_root=root,
+        repository="acme/codemesh",
+        transport_head=TRANSPORT_HEAD,
+        remote=FailRemote(),
+    )
+
+    with pytest.raises(BundleError, match="multiple authoritative Cases"):
+        publication.publish(case_id=CASE_ID, target_pr=2, producer_head=PRODUCER_HEAD)
+    assert calls == []
+
+
+def test_bundle_rejects_case_id_without_a_matching_candidate(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path)
+
+    with pytest.raises(BundleError, match="no authoritative Case"):
+        build_evidence_bundle(
+            root,
+            case_id="case_missing",
+            repository="acme/codemesh",
+            pr_number=2,
+            producer_head=PRODUCER_HEAD,
+            transport_head=TRANSPORT_HEAD,
+        )
+
+
+def test_bundle_keeps_explicit_legacy_prefix_selection(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path)
+
+    built = build_evidence_bundle(
+        root,
+        case_id=CASE_ID,
+        repository="acme/codemesh",
+        pr_number=2,
+        producer_head=PRODUCER_HEAD,
+        transport_head=TRANSPORT_HEAD,
+        prefix=LEGACY_PREFIX,
+    )
+
+    assert built.case_id == CASE_ID
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "directory"])
+def test_bundle_rejects_nonregular_case_candidate(tmp_path: Path, entry_kind: str) -> None:
+    root, _, _ = _fixture(tmp_path)
+    candidate = root / f"{NEW_PREFIX}authoritative-case.json"
+    if entry_kind == "symlink":
+        candidate.symlink_to(root / f"{LEGACY_PREFIX}authoritative-case.json")
+    else:
+        candidate.mkdir()
+
+    with pytest.raises(BundleError, match="regular non-symlink"):
+        build_evidence_bundle(
+            root,
+            case_id=CASE_ID,
+            repository="acme/codemesh",
+            pr_number=2,
+            producer_head=PRODUCER_HEAD,
+            transport_head=TRANSPORT_HEAD,
+        )
+
+
+def test_bundle_rejects_too_many_case_candidates(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path)
+    for index in range(65):
+        _write_json(
+            root / f"candidate-{index}-authoritative-case.json",
+            {"case_id": f"candidate-{index}"},
+        )
+
+    with pytest.raises(BundleError, match="too many authoritative Case candidates"):
+        build_evidence_bundle(
+            root,
+            case_id=CASE_ID,
+            repository="acme/codemesh",
+            pr_number=2,
+            producer_head=PRODUCER_HEAD,
+            transport_head=TRANSPORT_HEAD,
+        )
 
 
 def test_bundle_is_canonical_content_addressed_and_closes_objects(tmp_path: Path) -> None:
