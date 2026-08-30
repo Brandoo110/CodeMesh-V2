@@ -219,16 +219,19 @@ jobs:
           case = json.loads((root / "case.json").read_text(encoding="utf-8"))
           passport = json.loads((root / "passport.json").read_text(encoding="utf-8"))
           policy_gate = case.get("policy_gate")
+          case_gate = case.get("gate")
           if (
               case.get("case_id") != run.get("case_id")
               or case.get("subject_digest") != run.get("subject_digest")
               or case.get("acceptance_state") != run.get("state")
               or not isinstance(policy_gate, dict)
               or policy_gate.get("status") != run.get("gate")
+              or not isinstance(case_gate, str)
+              or not case_gate.strip()
               or passport.get("case_id") != run.get("case_id")
               or passport.get("subject_digest") != run.get("subject_digest")
               or passport.get("state") != case.get("acceptance_state")
-              or passport.get("gate") != run.get("gate")
+              or passport.get("gate") != case_gate
           ):
               raise SystemExit("authoritative Case/Passport lineage did not match")
           print("case_passport_lineage=verified")
@@ -285,6 +288,7 @@ jobs:
           passport = read("passport.json")
           check = read("check.json")
           policy_gate = case.get("policy_gate")
+          case_gate = case.get("gate")
           required_artifacts = (
               "run.json",
               "case.json",
@@ -300,10 +304,12 @@ jobs:
               or case.get("acceptance_state") != run.get("state")
               or not isinstance(policy_gate, dict)
               or policy_gate.get("status") != run.get("gate")
+              or not isinstance(case_gate, str)
+              or not case_gate.strip()
               or passport.get("case_id") != run.get("case_id")
               or passport.get("subject_digest") != run.get("subject_digest")
               or passport.get("state") != case.get("acceptance_state")
-              or passport.get("gate") != run.get("gate")
+              or passport.get("gate") != case_gate
               or check.get("case_id") != run.get("case_id")
               or check.get("subject_digest") != run.get("subject_digest")
               or check.get("head_sha") != os.environ["GITHUB_SHA"]
@@ -330,6 +336,8 @@ jobs:
               "subject_digest": run["subject_digest"],
               "case_state": run["state"],
               "policy_gate": run["gate"],
+              "case_gate": case_gate,
+              "passport_gate": passport["gate"],
               "check_id": check["check_id"],
               "check_conclusion": check["conclusion"],
               "check_url": check.get("check_url"),
