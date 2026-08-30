@@ -49,6 +49,7 @@ try {
 
   await page.locator("aside button").filter({ hasText: fresh.case_id }).click();
   const main = page.getByRole("main");
+  const freshnessAxis = main.getByText("Freshness", { exact: true }).locator("..");
   await main.getByText("Change Passport · CaseView v1").waitFor();
   await main.getByText("Lineage").waitFor();
   await main.getByText("Findings").waitFor();
@@ -59,6 +60,7 @@ try {
   await main.getByText("The handover owner must confirm the change boundary.", { exact: true }).click();
   await page.getByText("Authorized Artifacts").waitFor();
   await page.getByRole("button", { name: "关闭证据面板" }).click();
+  await freshnessAxis.scrollIntoViewIfNeeded();
   await page.screenshot({
     path: `${outputDir}/desktop-fresh-before-decision.png`,
     fullPage: true,
@@ -75,6 +77,7 @@ try {
   assert.equal(accepted.acceptance_state, "ACCEPTED");
   assert.equal(accepted.freshness.status, "FRESH");
   assert.equal(accepted.case.human_decision_refs.length, 1);
+  await acceptanceAxis.scrollIntoViewIfNeeded();
   await page.screenshot({
     path: `${outputDir}/desktop-readback-accepted.png`,
     fullPage: true,
@@ -123,6 +126,7 @@ try {
   );
   assert.deepEqual(stableProjection(unavailableBefore), stableProjection(unavailableAfter));
   assert.deepEqual(unavailableAfter.case.human_decision_refs, []);
+  await freshnessAxis.scrollIntoViewIfNeeded();
   await page.screenshot({
     path: `${outputDir}/desktop-unavailable-no-drift.png`,
     fullPage: true,
