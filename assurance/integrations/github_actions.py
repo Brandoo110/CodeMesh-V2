@@ -50,15 +50,75 @@ _WORKFLOW_FILE = "codemesh-assurance.yml"
 _BUNDLE_FILE = "bundle.json"
 _MAX_ZIP_BYTES = 4 * 1024 * 1024
 _MAX_ZIP_UNCOMPRESSED_BYTES = 8 * 1024 * 1024
+_MAX_DIAGNOSTIC_MESSAGE = 240
+_HTTP_STATUS_RE = re.compile(r"\bHTTP\s+([1-5][0-9]{2})\b", re.IGNORECASE)
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"\b(?:authorization|bearer|token|cookie|password|secret|api[_ -]?key)\b"
+    r"\s*(?:[:=]\s*|\s+)\S+",
+    re.IGNORECASE,
+)
+_AUTH_VALUE_RE = re.compile(r"\b(?:Bearer|Basic)\s+\S+", re.IGNORECASE)
+_GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[psor]_[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_-]+)\b")
+_CASE_ID_RE = re.compile(r"\bcase_[A-Za-z0-9_-]+\b")
+_RUN_ID_RE = re.compile(r"\brun_[A-Za-z0-9_-]+\b")
+_DIGEST_RE = re.compile(r"\bsha256:[0-9a-f]{64}\b", re.IGNORECASE)
+_HASH_RE = re.compile(r"\b[0-9a-f]{40,64}\b", re.IGNORECASE)
+_LONG_VALUE_RE = re.compile(r"\b[A-Za-z0-9+/=_-]{48,}\b")
 
 
 class GitHubActionsError(PublicationRemoteError):
     """A GitHub or Actions operation failed."""
 
-    def __init__(self, message: str, *, status_code: int | None = None, unknown: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        unknown: bool = False,
+        stage: str | None = None,
+        github_error_code: str | int | None = None,
+        safe_message: str | None = None,
+        exception_class: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.unknown = unknown
+        self.stage = stage
+        self.github_error_code = github_error_code
+        self.safe_message = safe_message
+        self.exception_class = exception_class or type(self).__name__
+
+    def diagnostic(
+        self,
+        *,
+        default_stage: str = "unknown",
+        secrets: Sequence[str] | None = None,
+    ) -> dict[str, object]:
+        stage = self.stage if isinstance(self.stage, str) and self.stage else default_stage
+        exception_class = (
+            self.exception_class
+            if isinstance(self.exception_class, str) and self.exception_class
+            else type(self).__name__
+        )
+        code: str | int | None
+        if type(self.github_error_code) is int:
+            code = self.github_error_code
+        elif type(self.github_error_code) is str and self.github_error_code.strip():
+            code = _redact_diagnostic_text(self.github_error_code, secrets=secrets)
+        else:
+            code = None
+        return {
+            "schema_version": "v1",
+            "stage": stage,
+            "exception_class": exception_class,
+            "http_status": self.status_code,
+            "github_error_code": code,
+            "message": _redact_diagnostic_text(
+                self.safe_message if self.safe_message is not None else str(self),
+                secrets=secrets,
+            ),
+            "unknown": self.unknown,
+        }
 
 
 @dataclass(frozen=True)
@@ -81,6 +141,126 @@ def _nonblank(value: object, field: str) -> str:
     if type(value) is not str or not value.strip() or "\x00" in value:
         raise GitHubActionsError(f"{field} is invalid")
     return value
+
+
+def _redact_diagnostic_text(
+    value: object,
+    *,
+    secrets: Sequence[str] | None = None,
+) -> str:
+    """Return a short diagnostic message without credentials or Bundle facts."""
+
+    text = str(value)
+    for secret in sorted(
+        (item for item in (secrets or ()) if isinstance(item, str) and item),
+        key=len,
+        reverse=True,
+    ):
+        text = text.replace(secret, "[REDACTED]")
+    text = _AUTH_VALUE_RE.sub("[REDACTED]", text)
+    text = _SENSITIVE_ASSIGNMENT_RE.sub("[REDACTED]", text)
+    text = _GITHUB_TOKEN_RE.sub("[REDACTED]", text)
+    text = _CASE_ID_RE.sub("[CASE_REDACTED]", text)
+    text = _RUN_ID_RE.sub("[RUN_REDACTED]", text)
+    text = _DIGEST_RE.sub("[DIGEST_REDACTED]", text)
+    text = _HASH_RE.sub("[HASH_REDACTED]", text)
+    text = _LONG_VALUE_RE.sub("[LONG_VALUE_REDACTED]", text)
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > _MAX_DIAGNOSTIC_MESSAGE:
+        return text[: _MAX_DIAGNOSTIC_MESSAGE - 3] + "..."
+    return text
+
+
+def _github_error_details(response: httpx.Response) -> tuple[str | int | None, str | None]:
+    """Read only GitHub's bounded error fields; never retain the response body."""
+
+    try:
+        payload = response.json()
+    except (ValueError, TypeError, binascii.Error):
+        return None, None
+    if not isinstance(payload, Mapping):
+        return None, None
+    code = payload.get("code")
+    if type(code) not in (str, int) or (type(code) is str and not code.strip()):
+        code = None
+    if code is None:
+        errors = payload.get("errors")
+        if isinstance(errors, list):
+            for item in errors:
+                if not isinstance(item, Mapping):
+                    continue
+                candidate = item.get("code")
+                if type(candidate) in (str, int) and (
+                    type(candidate) is not str or candidate.strip()
+                ):
+                    code = candidate
+                    break
+    message = payload.get("message")
+    return code, message if type(message) is str else None
+
+
+def _request_stage(method: str, endpoint: str) -> str:
+    path = endpoint.split("?", 1)[0]
+    if "/check-runs" in path:
+        if method.upper() == "POST":
+            return "check_publish"
+        return "check_publish_lookup" if path.endswith("/check-runs") else "check_readback"
+    if "/pulls/" in path:
+        return "target_pr_readback"
+    if "/git/ref/heads/codex/evidence/" in path:
+        return "temporary_ref_readback"
+    if "/git/" in path:
+        return "temporary_ref_publish"
+    if "/actions/" in path:
+        return "actions_readback"
+    return "github_api"
+
+
+def _status_from_exception(exc: BaseException) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if type(status) is int and 100 <= status <= 599:
+        return status
+    match = _HTTP_STATUS_RE.search(str(exc))
+    return int(match.group(1)) if match is not None else None
+
+
+def _stage_error(stage: str, exc: BaseException, *, secrets: Sequence[str] = ()) -> GitHubActionsError:
+    if isinstance(exc, GitHubActionsError):
+        if exc.stage:
+            return exc
+        return GitHubActionsError(
+            str(exc),
+            status_code=exc.status_code,
+            unknown=exc.unknown,
+            stage=stage,
+            github_error_code=exc.github_error_code,
+            safe_message=exc.safe_message,
+            exception_class=exc.exception_class,
+        )
+    return GitHubActionsError(
+        "Actions stage failed",
+        status_code=_status_from_exception(exc),
+        stage=stage,
+        safe_message=_redact_diagnostic_text(str(exc), secrets=secrets),
+        exception_class=type(exc).__name__,
+    )
+
+
+def _diagnostic_for_exception(
+    exc: BaseException,
+    *,
+    default_stage: str,
+    secrets: Sequence[str] = (),
+) -> dict[str, object]:
+    if isinstance(exc, GitHubActionsError):
+        return exc.diagnostic(default_stage=default_stage, secrets=secrets)
+    return GitHubActionsError(
+        "Actions stage failed",
+        stage=default_stage,
+        safe_message=_redact_diagnostic_text(str(exc), secrets=secrets),
+        exception_class=type(exc).__name__,
+    ).diagnostic(secrets=secrets)
 
 
 def _sha1(value: object, field: str) -> str:
@@ -192,12 +372,25 @@ class _GitHubApi:
                 params=dict(params or {}),
             )
         except httpx.RequestError as exc:
-            raise GitHubActionsError("GitHub API is unavailable", unknown=True) from exc
+            raise GitHubActionsError(
+                "GitHub API is unavailable",
+                unknown=True,
+                stage=_request_stage(method, endpoint),
+                safe_message="GitHub API request was unavailable",
+                exception_class=type(exc).__name__,
+            ) from exc
         if response.status_code not in expected:
+            github_error_code, github_message = _github_error_details(response)
             raise GitHubActionsError(
                 f"GitHub API request failed (HTTP {response.status_code})",
                 status_code=response.status_code,
                 unknown=response.status_code >= 500,
+                stage=_request_stage(method, endpoint),
+                github_error_code=github_error_code,
+                safe_message=_redact_diagnostic_text(
+                    github_message or f"GitHub API returned HTTP {response.status_code}",
+                    secrets=(self._token,),
+                ),
             )
         if not binary and response.content and response.headers.get("content-type", "").startswith(
             "application/json"
@@ -643,7 +836,7 @@ def import_authoritative_bundle(
                     head_sha=str(document["producer_head"]),
                 )
         except Exception as exc:
-            raise GitHubActionsError("Actions Check publisher failed") from exc
+            raise _stage_error("check_publish", exc, secrets=(token,)) from exc
         if published.passport_digest != document["passport_digest"]:
             raise GitHubActionsError("publisher Passport digest did not match Bundle")
         marker = _check_marker(document)
@@ -1415,7 +1608,12 @@ def _cli_main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     token = (os.getenv(args.token_env) or "").strip()
     if not token:
-        print("authoritative bundle import failed", file=os.sys.stderr)
+        diagnostic = GitHubActionsError(
+            "GitHub token is missing",
+            stage="token_read",
+            safe_message="GitHub token is missing",
+        ).diagnostic(default_stage="token_read")
+        print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True), file=os.sys.stderr)
         return 1
     try:
         result = import_from_environment(
@@ -1431,8 +1629,13 @@ def _cli_main(argv: Sequence[str] | None = None) -> int:
             run_attempt=args.run_attempt,
             api_url=args.api_url,
         )
-    except Exception:
-        print("authoritative bundle import failed", file=os.sys.stderr)
+    except Exception as exc:
+        diagnostic = _diagnostic_for_exception(
+            exc,
+            default_stage="bundle_import",
+            secrets=(token,),
+        )
+        print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True), file=os.sys.stderr)
         return 1
     print(
         json.dumps(

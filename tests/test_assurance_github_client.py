@@ -409,3 +409,102 @@ def test_actions_rerun_waits_for_same_run_id_with_new_attempt(monkeypatch):
     assert result["id"] == 77
     assert result["run_attempt"] == 2
     assert result["conclusion"] == "success"
+
+
+def test_actions_api_failure_exposes_redacted_structured_diagnostic():
+    token = "ghs-secret-token"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={
+                "message": f"Bad credentials Authorization: Bearer {token}",
+                "errors": [{"code": "custom", "message": f"token={token}"}],
+                "sensitive_full_response": "must-not-be-copied",
+            },
+        )
+
+    api = github_actions._GitHubApi(
+        token=token,
+        owner="acme",
+        repo="codemesh",
+        api_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(github_actions.GitHubActionsError) as caught:
+            api.request(
+                "GET",
+                "/repos/acme/codemesh/pulls/2",
+                expected={200},
+            )
+    finally:
+        api.close()
+
+    diagnostic = caught.value.diagnostic()
+    serialized = json.dumps(diagnostic, sort_keys=True)
+    assert diagnostic["stage"] == "target_pr_readback"
+    assert diagnostic["exception_class"] == "GitHubActionsError"
+    assert diagnostic["http_status"] == 403
+    assert diagnostic["github_error_code"] == "custom"
+    assert token not in serialized
+    assert "sensitive_full_response" not in serialized
+    assert len(diagnostic["message"]) <= 240
+
+
+def test_actions_cli_failure_prints_structured_redacted_diagnostic(monkeypatch, capsys):
+    token = "ghs-secret-token"
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+
+    def fail(**_kwargs):
+        raise github_actions.GitHubActionsError(
+            "Actions Check publisher failed",
+            stage="check_publish",
+            status_code=403,
+            github_error_code="custom",
+            safe_message=f"provider echoed token={token}",
+        )
+
+    monkeypatch.setattr(github_actions, "import_from_environment", fail)
+    result = github_actions._cli_main(
+        [
+            "--bundle",
+            "/tmp/bundle.json",
+            "--output-dir",
+            "/tmp/output",
+            "--repository-root",
+            "/tmp/repository",
+            "--transport-head",
+            "a" * 40,
+            "--transport-ref-commit",
+            "b" * 40,
+            "--ci-run-id",
+            "9001",
+            "--ci-job-id",
+            "assurance",
+            "--run-attempt",
+            "1",
+        ]
+    )
+
+    assert result == 1
+    diagnostic = json.loads(capsys.readouterr().err)
+    assert diagnostic["stage"] == "check_publish"
+    assert diagnostic["exception_class"] == "GitHubActionsError"
+    assert diagnostic["http_status"] == 403
+    assert diagnostic["github_error_code"] == "custom"
+    assert token not in json.dumps(diagnostic, sort_keys=True)
+
+
+def test_actions_publisher_failure_preserves_http_status_without_secret_echo():
+    error = github_actions._stage_error(
+        "check_publish",
+        GitHubPublishError("GitHub API request failed (HTTP 403)"),
+    )
+
+    diagnostic = error.diagnostic()
+    assert diagnostic["stage"] == "check_publish"
+    assert diagnostic["exception_class"] == "GitHubPublishError"
+    assert diagnostic["http_status"] == 403
+    assert diagnostic["github_error_code"] is None
+    assert diagnostic["message"] == "GitHub API request failed (HTTP 403)"
