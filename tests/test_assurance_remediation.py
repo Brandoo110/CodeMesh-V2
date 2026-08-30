@@ -250,6 +250,68 @@ def test_workspace_detaches_copied_worktree_git_admin_for_snapshot_collection(
     assert result.snapshot.complete is True
 
 
+def test_workspace_pins_branch_worktree_head_for_snapshot_collection(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*args: str) -> bytes:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8", errors="replace"
+        )
+        return result.stdout
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (repository / "fix.json").write_text('{"valid": false}\n', encoding="utf-8")
+    git("add", "fix.json")
+    git("commit", "-qm", "baseline")
+    base_revision = git("rev-parse", "HEAD").decode().strip()
+
+    seed = tmp_path / "seed-branch-worktree"
+    git("worktree", "add", "-b", "seed-branch", str(seed), base_revision)
+    (seed / "fix.json").write_text('{"valid": true}\n', encoding="utf-8")
+    source_head_before = git("rev-parse", "refs/heads/seed-branch").decode().strip()
+    source_status_before = git("status", "--porcelain")
+
+    with IsolatedWorkspace.prepare(seed, _grant("fix.json")) as workspace:
+        isolated_head = (
+            subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                cwd=workspace.root,
+                capture_output=True,
+                check=False,
+            )
+            .stdout.decode("utf-8")
+            .strip()
+        )
+        assert isolated_head == base_revision
+        assert len((workspace.root / ".git" / "HEAD").read_text().strip()) == 40
+
+        result = GitSnapshotCollector(command_timeout_seconds=1.0).collect(
+            workspace.root,
+            repository_identity="codemesh/fixture",
+            base_ref=base_revision,
+            task_digest=TASK_DIGEST,
+            policy_version="policy-v1",
+            rubric_version="rubric-v1",
+            artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        )
+
+    assert [change.path for change in result.snapshot.changes] == ["fix.json"]
+    assert result.snapshot.complete is True
+    assert git("rev-parse", "refs/heads/seed-branch").decode().strip() == source_head_before
+    assert git("status", "--porcelain") == source_status_before
+
+
 def test_workspace_publishes_repaired_root_after_temp_cleanup_without_overwrite(
     tmp_path: Path,
 ) -> None:
