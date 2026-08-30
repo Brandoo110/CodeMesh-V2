@@ -210,7 +210,7 @@ def _request_stage(method: str, endpoint: str) -> str:
         return "check_publish_lookup" if path.endswith("/check-runs") else "check_readback"
     if "/pulls/" in path:
         return "target_pr_readback"
-    if "/git/ref/heads/codex/evidence/" in path:
+    if "/git/ref/heads/codex/evidence-v2/" in path:
         return "temporary_ref_readback"
     if "/git/" in path:
         return "temporary_ref_publish"
@@ -417,7 +417,7 @@ def _ref_endpoint(ref: str) -> str:
     if parts is None:
         raise GitHubActionsError("temporary ref is invalid")
     producer_head, transport_head = parts
-    return f"/git/ref/heads/codex/evidence/{producer_head}/{transport_head}"
+    return f"/git/ref/heads/codex/evidence-v2/{producer_head}/{transport_head}"
 
 
 def _select_transport_ref(

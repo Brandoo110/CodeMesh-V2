@@ -31,7 +31,7 @@ _REPOSITORY_RE = re.compile(r"^[^/\s?#]+/[^/\s?#]+$")
 _ARTIFACT_FILE_RE = re.compile(r"^sha256_([0-9a-f]{64})$")
 _INDEX_FILE_RE = re.compile(r"^ev_[A-Za-z0-9_-]+-index\.json$")
 _TRANSPORT_REF_RE = re.compile(
-    r"^refs/heads/codex/evidence/([0-9a-f]{40})/([0-9a-f]{40})$"
+    r"^refs/heads/codex/evidence-v2/([0-9a-f]{40})/([0-9a-f]{40})$"
 )
 _MAX_OBJECT_BYTES = 256 * 1024
 _MAX_BUNDLE_BYTES = 900 * 1024
@@ -262,7 +262,7 @@ def transport_ref_for(*, producer_head: str, transport_head: str) -> str:
 
     producer = _require_sha1(producer_head, field="producer_head")
     transport = _require_sha1(transport_head, field="transport_head")
-    return f"refs/heads/codex/evidence/{producer}/{transport}"
+    return f"refs/heads/codex/evidence-v2/{producer}/{transport}"
 
 
 def parse_transport_ref(ref: object) -> tuple[str, str] | None:

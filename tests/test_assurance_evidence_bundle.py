@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -153,6 +154,9 @@ def test_bundle_is_canonical_content_addressed_and_closes_objects(tmp_path: Path
     verified = verify_evidence_bundle(built.bundle_bytes)
     document = verified.document
 
+    assert built.transport_ref == (
+        "refs/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    )
     assert built.transport_ref == transport_ref_for(
         producer_head=PRODUCER_HEAD,
         transport_head=TRANSPORT_HEAD,
@@ -196,6 +200,48 @@ def test_bundle_rejects_legacy_single_segment_transport_ref(tmp_path: Path) -> N
 
     with pytest.raises(BundleError, match="transport_ref"):
         verify_evidence_bundle(tampered)
+
+
+def test_bare_git_ref_probe_separates_legacy_leaf_from_evidence_v2_child(tmp_path: Path) -> None:
+    bare = tmp_path / "probe.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    env = {
+        **os.environ,
+        "GIT_DIR": str(bare),
+        "GIT_AUTHOR_NAME": "codemesh-probe",
+        "GIT_AUTHOR_EMAIL": "codemesh-probe@example.invalid",
+        "GIT_COMMITTER_NAME": "codemesh-probe",
+        "GIT_COMMITTER_EMAIL": "codemesh-probe@example.invalid",
+    }
+    commit = subprocess.check_output(
+        [
+            "git",
+            "commit-tree",
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "-m",
+            "ref namespace probe",
+        ],
+        env=env,
+        text=True,
+    ).strip()
+    legacy = "refs/heads/codex/evidence/" + PRODUCER_HEAD
+    evidence_v2 = "refs/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    legacy_child = legacy + "/" + TRANSPORT_HEAD
+
+    for ref in (legacy, evidence_v2):
+        subprocess.run(["git", "update-ref", ref, commit], env=env, check=True)
+    for ref in (legacy, evidence_v2):
+        subprocess.run(["git", "show-ref", "--verify", "--quiet", ref], env=env, check=True)
+
+    conflict = subprocess.run(
+        ["git", "update-ref", legacy_child, commit],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert conflict.returncode != 0
+    assert "exists; cannot create" in conflict.stderr
 
 
 def test_bundle_rejects_tampered_object_bytes(tmp_path: Path) -> None:

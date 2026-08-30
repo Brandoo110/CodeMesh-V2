@@ -186,13 +186,13 @@ def test_publish_rejects_mismatched_github_readback_without_echoing_token():
 
 def test_dual_transport_ref_endpoint_rejects_legacy_single_segment_ref():
     ref = (
-        "refs/heads/codex/evidence/"
+        "refs/heads/codex/evidence-v2/"
         + PRODUCER_HEAD
         + "/"
         + TRANSPORT_HEAD
     )
     assert github_actions._ref_endpoint(ref) == (
-        "/git/ref/heads/codex/evidence/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+        "/git/ref/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
     )
     with pytest.raises(github_actions.GitHubActionsError, match="temporary ref"):
         github_actions._ref_endpoint("refs/heads/codex/evidence/" + PRODUCER_HEAD)
@@ -200,12 +200,12 @@ def test_dual_transport_ref_endpoint_rejects_legacy_single_segment_ref():
 
 def test_transport_ref_selection_ignores_legacy_and_other_transport_heads():
     current_ref = (
-        "refs/heads/codex/evidence/"
+        "refs/heads/codex/evidence-v2/"
         + PRODUCER_HEAD
         + "/"
         + TRANSPORT_HEAD
     )
-    other_ref = "refs/heads/codex/evidence/" + PRODUCER_HEAD + "/" + "c" * 40
+    other_ref = "refs/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + "c" * 40
     refs = [
         ("d" * 40, "refs/heads/codex/evidence/" + PRODUCER_HEAD),
         ("e" * 40, other_ref),
@@ -220,8 +220,8 @@ def test_transport_ref_selection_ignores_legacy_and_other_transport_heads():
 
 def test_transport_ref_selection_rejects_multiple_current_refs():
     refs = [
-        ("d" * 40, "refs/heads/codex/evidence/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD),
-        ("e" * 40, "refs/heads/codex/evidence/" + "c" * 40 + "/" + TRANSPORT_HEAD),
+        ("d" * 40, "refs/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD),
+        ("e" * 40, "refs/heads/codex/evidence-v2/" + "c" * 40 + "/" + TRANSPORT_HEAD),
     ]
 
     with pytest.raises(github_actions.GitHubActionsError, match="exactly one"):
@@ -231,7 +231,7 @@ def test_transport_ref_selection_rejects_multiple_current_refs():
 def test_same_dual_transport_ref_with_different_bytes_is_idempotency_conflict(tmp_path):
     _, bundle = _build_fixture_bundle(tmp_path)
     expected_ref_path = (
-        "/git/ref/heads/codex/evidence/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+        "/git/ref/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -276,7 +276,7 @@ def test_cleanup_cannot_target_preserved_legacy_ref_when_new_ref_is_active():
             )
         ),
     )
-    new_ref = "refs/heads/codex/evidence/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
+    new_ref = "refs/heads/codex/evidence-v2/" + PRODUCER_HEAD + "/" + TRANSPORT_HEAD
     legacy_ref = "refs/heads/codex/evidence/" + PRODUCER_HEAD
     transport._active_ref = (new_ref, "c" * 40)
     try:
@@ -321,6 +321,13 @@ def test_import_event_head_mismatch_happens_before_github_mutation(tmp_path, mon
             api_transport=httpx.MockTransport(handler),
         )
     assert requests == []
+
+
+def test_workflow_queries_only_current_evidence_v2_transport_ref():
+    workflow = Path(".github/workflows/codemesh-assurance.yml").read_text(encoding="utf-8")
+
+    assert "refs/heads/codex/evidence-v2/*/" in workflow
+    assert "refs/heads/codex/evidence/*/" not in workflow
 
 
 def test_import_checkout_mismatch_happens_before_github_mutation(tmp_path, monkeypatch):
@@ -418,7 +425,7 @@ def _import_fixture(tmp_path: Path, monkeypatch):
             )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and "/git/ref/heads/codex/evidence/" in request.url.path:
+        if request.method == "GET" and "/git/ref/heads/codex/evidence-v2/" in request.url.path:
             return httpx.Response(200, json={"object": {"sha": "c" * 40}})
         if request.method == "GET" and request.url.path.endswith("/pulls/2"):
             return httpx.Response(

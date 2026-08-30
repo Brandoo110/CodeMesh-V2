@@ -56,7 +56,7 @@ jobs:
                   "ls-remote",
                   "--heads",
                   "origin",
-                  f"refs/heads/codex/evidence/*/{os.environ['CODEMESH_TRANSPORT_HEAD']}",
+                  f"refs/heads/codex/evidence-v2/*/{os.environ['CODEMESH_TRANSPORT_HEAD']}",
               ],
               check=True,
               capture_output=True,
