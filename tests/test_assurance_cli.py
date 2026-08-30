@@ -1,8 +1,13 @@
 import json
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
 from assurance import cli
+from assurance.case_publication import PublicationReceipt
+import assurance.case_publication as case_publication
+import assurance.integrations.github_actions as github_actions
+import cli as root_cli
 
 
 def _args(tmp_path, *command):
@@ -172,3 +177,122 @@ def test_live_run_command_prints_case_subject_gate_freshness_and_workbench(
     assert "FRESH" in result.stdout
     assert "http://127.0.0.1:3010/?view=assurance" in result.stdout
     assert str(tmp_path) not in result.stdout
+
+
+def test_publish_case_command_uses_one_deep_module_and_returns_safe_receipt(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(root_cli, "_publish_require_clean", lambda _root: None)
+    monkeypatch.setattr(root_cli, "_publish_repository", lambda _root: "acme/codemesh")
+    monkeypatch.setattr(root_cli, "_publish_token", lambda: "ghs-secret-token")
+
+    def fake_git(_root, *arguments):
+        if arguments[:2] == ("symbolic-ref", "--quiet"):
+            return "codex/authoritative-publication"
+        if arguments[:2] == ("rev-parse", "HEAD"):
+            return "b" * 40
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(root_cli, "_publish_git_value", fake_git)
+    captured: dict[str, object] = {}
+
+    class FakeTransport:
+        def __init__(self, **kwargs):
+            captured["transport"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+    class FakePublication:
+        def __init__(self, **kwargs):
+            captured["publication"] = kwargs
+
+        def publish(self, **kwargs):
+            captured["publish"] = kwargs
+            return PublicationReceipt(
+                schema_version="v1",
+                origin="local_authoritative_bundle",
+                transport_id="transport-1",
+                transport_ref="refs/heads/codex/evidence/" + "a" * 40,
+                transport_ref_commit="c" * 40,
+                transport_head="b" * 40,
+                producer_head="a" * 40,
+                repository="acme/codemesh",
+                target_pr=2,
+                bundle_digest="sha256:" + "1" * 64,
+                passport_digest="sha256:" + "2" * 64,
+                case_id="case-1",
+                run_id="run-1",
+                subject_digest="sha256:" + "3" * 64,
+                ci_run_id="9001",
+                ci_job_id="assurance",
+                run_attempt=1,
+                artifact_id="artifact-1",
+                check_id=123,
+                check_url="https://github.com/acme/codemesh/runs/123",
+                conclusion="success",
+                workbench={},
+            )
+
+    monkeypatch.setattr(github_actions, "GitHubActionsTransport", FakeTransport)
+    monkeypatch.setattr(case_publication, "CasePublication", FakePublication)
+    result = CliRunner().invoke(
+        root_cli.app,
+        [
+            "publish-case",
+            "--case-id",
+            "case-1",
+            "--pr",
+            "2",
+            "--producer-head",
+            "a" * 40,
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["case_id"] == "case-1"
+    assert payload["check_id"] == 123
+    assert payload["producer_head"] == "a" * 40
+    assert "ghs-secret-token" not in result.stdout
+    assert captured["publish"] == {
+        "case_id": "case-1",
+        "target_pr": 2,
+        "producer_head": "a" * 40,
+    }
+
+
+def test_publish_case_failure_is_explicitly_unconfirmed(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(root_cli, "_publish_require_clean", lambda _root: None)
+    monkeypatch.setattr(root_cli, "_publish_repository", lambda _root: "acme/codemesh")
+    monkeypatch.setattr(root_cli, "_publish_token", lambda: (_ for _ in ()).throw(ValueError("a GitHub token is required")))
+    monkeypatch.setattr(
+        root_cli,
+        "_publish_git_value",
+        lambda _root, *arguments: "codex/authoritative-publication"
+        if arguments[:2] == ("symbolic-ref", "--quiet")
+        else "b" * 40,
+    )
+    result = CliRunner().invoke(
+        root_cli.app,
+        [
+            "publish-case",
+            "--case-id",
+            "case-1",
+            "--pr",
+            "2",
+            "--producer-head",
+            "a" * 40,
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["confirmed"] is False
+    assert payload["error"] == "ValueError"
+    assert "token" in payload["message"]

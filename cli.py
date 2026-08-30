@@ -18,9 +18,14 @@ Typer 子命令用 @app.command() 定义多个函数，每个就是一个子命�
 """
 
 import asyncio
+import json
 import os
+import re
+import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import typer
 from dotenv import load_dotenv
@@ -55,6 +60,95 @@ _KEY_ENVS = (
     "GOOGLE_API_KEY",
     "MINIMAX_API_KEY",
 )
+
+_PUBLISH_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+_PUBLISH_REPOSITORY_RE = re.compile(r"^[^/\s?#]+/[^/\s?#]+$")
+_PUBLISH_DEFAULT_BRANCH = "codex/authoritative-publication"
+_PUBLISH_DEFAULT_BASE = "codex/local-acceptance-vertical"
+_PUBLISH_DEFAULT_EVIDENCE_ROOT = "~/.codemesh/codemesh-v2-dogfood"
+
+
+def _publish_git_value(repository: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("Git repository state could not be read") from exc
+    if completed.returncode != 0:
+        raise ValueError("Git repository state could not be read")
+    value = completed.stdout.strip()
+    if not value:
+        raise ValueError("Git repository state was empty")
+    return value
+
+
+def _publish_require_clean(repository: Path) -> None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository), "status", "--porcelain=v1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("Git repository state could not be read") from exc
+    if completed.returncode != 0:
+        raise ValueError("Git repository state could not be read")
+    if completed.stdout.strip():
+        raise ValueError("transport worktree must be clean")
+
+
+def _publish_repository(repository: Path) -> str:
+    configured = (os.getenv("GITHUB_REPOSITORY") or "").strip()
+    if configured and _PUBLISH_REPOSITORY_RE.fullmatch(configured):
+        return configured
+    remote = _publish_git_value(repository, "config", "--get", "remote.origin.url")
+    if remote.startswith("git@github.com:"):
+        candidate = remote.removeprefix("git@github.com:").removesuffix(".git")
+    else:
+        parsed = urlsplit(remote)
+        if parsed.hostname not in {"github.com", "www.github.com"}:
+            raise ValueError("a GitHub origin is required")
+        candidate = parsed.path.strip("/").removesuffix(".git")
+    if _PUBLISH_REPOSITORY_RE.fullmatch(candidate) is None:
+        raise ValueError("GitHub repository identity is invalid")
+    return candidate
+
+
+def _publish_token() -> str:
+    for env_name in ("CODEMESH_GITHUB_TOKEN", "GITHUB_TOKEN"):
+        value = (os.getenv(env_name) or "").strip()
+        if value:
+            return value
+    try:
+        completed = subprocess.run(
+            ["gh", "auth", "token"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("a GitHub token is required") from exc
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or not value:
+        raise ValueError("a GitHub token is required")
+    return value
+
+
+def _publish_payload(receipt) -> dict[str, object]:
+    payload = asdict(receipt)
+    payload.pop("workbench", None)
+    return payload
 
 
 def _preflight() -> None:
@@ -130,6 +224,106 @@ def _safe_run(coro) -> None:
             console.print(f"[red]✗[/red] {hint}")
             sys.exit(1)
         raise
+
+
+@app.command("publish-case")
+def publish_case(
+    case_id: str = typer.Option(..., "--case-id", help="要发布的本地权威 Case ID"),
+    target_pr: int = typer.Option(..., "--pr", min=1, help="绑定的 producer PR 编号"),
+    producer_head: str = typer.Option(..., "--producer-head", help="producer PR 的精确 HEAD SHA"),
+    as_json: bool = typer.Option(False, "--json", help="输出机器可读 receipt"),
+) -> None:
+    """将一个本地权威 Case 通过 CI Bundle 发布并完成远端读回。"""
+
+    try:
+        # Keep the existing top-level CLI import graph light: publishing is a
+        # deliberate external operation and loads its adapter only on demand.
+        from assurance.case_publication import CasePublication
+        from assurance.integrations.github_actions import GitHubActionsTransport
+
+        repository_root = Path.cwd().resolve(strict=True)
+        if not repository_root.is_dir():
+            raise ValueError("current directory is not a repository")
+        _publish_require_clean(repository_root)
+        transport_branch = os.getenv(
+            "CODEMESH_TRANSPORT_BRANCH", _PUBLISH_DEFAULT_BRANCH
+        )
+        base_branch = os.getenv("CODEMESH_TRANSPORT_BASE", _PUBLISH_DEFAULT_BASE)
+        actual_branch = _publish_git_value(
+            repository_root, "symbolic-ref", "--quiet", "--short", "HEAD"
+        )
+        if actual_branch != transport_branch:
+            raise ValueError("publish-case must run from the transport branch")
+        transport_head = _publish_git_value(repository_root, "rev-parse", "HEAD")
+        if _PUBLISH_SHA1_RE.fullmatch(transport_head) is None:
+            raise ValueError("transport HEAD is invalid")
+        if _PUBLISH_SHA1_RE.fullmatch(producer_head) is None:
+            raise ValueError("producer HEAD is invalid")
+        repository = _publish_repository(repository_root)
+        token = _publish_token()
+        evidence_root = Path(
+            os.getenv("CODEMESH_EVIDENCE_ROOT", _PUBLISH_DEFAULT_EVIDENCE_ROOT)
+        ).expanduser()
+        with GitHubActionsTransport(
+            token=token,
+            repository=repository,
+            transport_branch=transport_branch,
+            base_branch=base_branch,
+        ) as transport:
+            receipt = CasePublication(
+                evidence_root=evidence_root,
+                repository=repository,
+                transport_head=transport_head,
+                remote=transport,
+            ).publish(
+                case_id=case_id,
+                target_pr=target_pr,
+                producer_head=producer_head,
+            )
+        payload = _publish_payload(receipt)
+    except Exception as exc:
+        if as_json:
+            typer.echo(
+                json.dumps(
+                    {
+                        "schema_version": "v1",
+                        "confirmed": False,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        else:
+            typer.echo(
+                f"publish-case failed; authoritative result was not confirmed ({type(exc).__name__}: {exc})",
+                err=True,
+            )
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    for field in (
+        "case_id",
+        "run_id",
+        "subject_digest",
+        "bundle_digest",
+        "passport_digest",
+        "producer_head",
+        "transport_head",
+        "transport_ref",
+        "transport_ref_commit",
+        "ci_run_id",
+        "ci_job_id",
+        "run_attempt",
+        "artifact_id",
+        "check_id",
+        "check_url",
+        "conclusion",
+    ):
+        typer.echo(f"{field}: {payload[field]}")
 
 
 # ─────────────── run ───────────────
