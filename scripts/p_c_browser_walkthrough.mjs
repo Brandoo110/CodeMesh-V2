@@ -17,7 +17,7 @@ try {
   await page.getByText("Change Passport · CaseView v1").waitFor();
   await page.getByText("Lineage").waitFor();
   await page.getByText("Findings").waitFor();
-  await page.getByText("UNAVAILABLE").waitFor();
+  await page.getByText("UNAVAILABLE", { exact: true }).waitFor();
   await page.screenshot({ path: `${outputDir}/desktop-case-passport.png`, fullPage: true });
 
   await page.getByPlaceholder("Owner").fill("release-owner");
