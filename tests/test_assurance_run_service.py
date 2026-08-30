@@ -2,10 +2,12 @@
 
 import asyncio
 import hashlib
+import io
 import json
 import shutil
 import subprocess
 import threading
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -77,7 +79,12 @@ def _repository(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (root / "changed.txt").write_text("changed\n", encoding="utf-8")
-    _git(root, "add", "TASK.md", "POLICY.md")
+    workflow = root / ".github" / "workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "p-c-handover.yml").write_text(
+        "name: P-C Handover Experience\n", encoding="utf-8"
+    )
+    _git(root, "add", "TASK.md", "POLICY.md", ".github/workflows/p-c-handover.yml")
     _git(root, "commit", "-qm", "base")
     (root / "changed.txt").write_text("changed again\n", encoding="utf-8")
     return root
@@ -171,7 +178,14 @@ class _Committer:
         self.calls.append(("lookup", idempotency_key, request_digest))
         return self.cached
 
-    def commit(self, bundle, *, idempotency_key, request_digest):
+    def commit(
+        self,
+        bundle,
+        *,
+        idempotency_key,
+        request_digest,
+        official_proofs=(),
+    ):
         self.calls.append(("commit", idempotency_key, request_digest))
         self.cached = AssuranceRunResult(
             run_id=bundle.run_id,
@@ -180,6 +194,30 @@ class _Committer:
             bundle=bundle,
         )
         return self.cached
+
+
+class _OfficialProofCapturingCommitter:
+    def __init__(self):
+        self.proofs = ()
+
+    def lookup(self, _idempotency_key, _request_digest):
+        return None
+
+    def commit(
+        self,
+        bundle,
+        *,
+        idempotency_key,
+        request_digest,
+        official_proofs=(),
+    ):
+        self.proofs = official_proofs
+        return AssuranceRunResult(
+            run_id=bundle.run_id,
+            request_digest=request_digest,
+            cached=False,
+            bundle=bundle,
+        )
 
 
 def _service(
@@ -257,73 +295,95 @@ def test_intent_rejects_duplicate_or_empty_command_ids_before_io(tmp_path):
 def _fake_official_import(
     artifact_store: ArtifactStore,
     *,
+    repository_path: Path,
     kind: str,
     subject_digest: str,
     head_revision: str,
     collected_at: datetime,
 ) -> OfficialEvidenceImport:
-    result_path = (
-        "dependency-audit-result.json"
-        if kind == "dependency_audit"
-        else "ci-iac-result.json"
-    )
-    result_bytes = b'{"status":"success"}'
-    result_digest = "sha256:" + hashlib.sha256(result_bytes).hexdigest()
-    source_path = (
-        "TASK.md"
-        if kind == "dependency_audit"
-        else ".github/workflows/p-c-handover.yml"
-    )
-    source = OfficialEvidenceSource(
-        path=source_path,
-        digest="sha256:" + "2" * 64,
-        byte_size=1,
-    )
-    checks = ()
-    audit_command = "pnpm audit --prod --audit-level=high --json"
-    if kind == "ci_iac_validation":
-        checks = tuple(
-            {
-                "name": name,
-                "status": "success",
-                "conclusion": "success",
-            }
-            for name in (
-                "checkout",
-                "install",
-                "focused_checks",
-                "build",
-                "browser_walkthrough",
-            )
+    def build_report(report_kind: str) -> tuple[OfficialEvidenceReport, bytes, bytes]:
+        result_path = (
+            "dependency-audit-result.json"
+            if report_kind == "dependency_audit"
+            else "ci-iac-result.json"
         )
-        audit_command = None
-    report = OfficialEvidenceReport(
-        kind=kind,
-        repository_identity="example/service",
-        head_revision=head_revision,
-        subject_digest=subject_digest,
-        producer="collector." + kind,
-        source_paths=(source,),
-        workflow_name="P-C Handover Experience",
-        workflow_path=".github/workflows/p-c-handover.yml",
-        event="workflow_dispatch",
-        pull_request_number=7,
-        workflow_run_id="123",
-        workflow_run_attempt=1,
-        job_id="handover",
-        job_name="handover",
-        status="success",
-        conclusion="success",
-        result_path=result_path,
-        result_digest=result_digest,
-        result_byte_size=len(result_bytes),
-        checks=checks,
-        audit_command=audit_command,
-    )
-    report_bytes = json.dumps(
-        report.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    remote_zip = b"official-zip"
+        result_bytes = b'{"status":"success"}'
+        result_digest = "sha256:" + hashlib.sha256(result_bytes).hexdigest()
+        source_path = (
+            "TASK.md"
+            if report_kind == "dependency_audit"
+            else ".github/workflows/p-c-handover.yml"
+        )
+        source_bytes = (repository_path / source_path).read_bytes()
+        source = OfficialEvidenceSource(
+            path=source_path,
+            digest="sha256:" + hashlib.sha256(source_bytes).hexdigest(),
+            byte_size=len(source_bytes),
+        )
+        checks = ()
+        audit_command = "pnpm audit --prod --audit-level=high --json"
+        if report_kind == "ci_iac_validation":
+            checks = tuple(
+                {
+                    "name": name,
+                    "status": "success",
+                    "conclusion": "success",
+                }
+                for name in (
+                    "checkout",
+                    "install",
+                    "focused_checks",
+                    "build",
+                    "browser_walkthrough",
+                )
+            )
+            audit_command = None
+        report = OfficialEvidenceReport(
+            kind=report_kind,
+            repository_identity="example/service",
+            head_revision=head_revision,
+            subject_digest=subject_digest,
+            producer="collector." + report_kind,
+            source_paths=(source,),
+            workflow_name="P-C Handover Experience",
+            workflow_path=".github/workflows/p-c-handover.yml",
+            event="workflow_dispatch",
+            pull_request_number=7,
+            workflow_run_id="123",
+            workflow_run_attempt=1,
+            job_id="handover",
+            job_name="handover",
+            status="success",
+            conclusion="success",
+            result_path=result_path,
+            result_digest=result_digest,
+            result_byte_size=len(result_bytes),
+            checks=checks,
+            audit_command=audit_command,
+        )
+        report_bytes = json.dumps(
+            report.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return report, report_bytes, result_bytes
+
+    reports = {
+        report_kind: build_report(report_kind)
+        for report_kind in ("dependency_audit", "ci_iac_validation")
+    }
+    remote_buffer = io.BytesIO()
+    with zipfile.ZipFile(remote_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for report_kind, (report, report_bytes, result_bytes) in reports.items():
+            archive.writestr(
+                "dependency_audit.json"
+                if report_kind == "dependency_audit"
+                else "ci_iac_validation.json",
+                report_bytes,
+            )
+            archive.writestr(report.result_path, result_bytes)
+    remote_zip = remote_buffer.getvalue()
+    report, report_bytes, result_bytes = reports[kind]
+    source = report.source_paths[0]
+    result_digest = report.result_digest
     remote_zip_digest = "sha256:" + hashlib.sha256(remote_zip).hexdigest()
     receipt = OfficialEvidenceReceipt(
         kind=kind,
@@ -346,7 +406,7 @@ def _fake_official_import(
         artifact_byte_size=len(remote_zip),
         report_digest="sha256:" + hashlib.sha256(report_bytes).hexdigest(),
         report_byte_size=len(report_bytes),
-        result_path=result_path,
+        result_path=report.result_path,
         result_digest=result_digest,
         result_byte_size=len(result_bytes),
         report=report,
@@ -395,6 +455,7 @@ class _FakeOfficialImporter:
         return tuple(
             _fake_official_import(
                 self.kwargs["artifact_store"],
+                repository_path=self.kwargs["repository_path"],
                 kind=kind,
                 subject_digest=self.kwargs["subject_digest"],
                 head_revision=self.kwargs["head_revision"],
@@ -438,6 +499,32 @@ def test_official_dependency_evidence_flows_through_manifest_risk_policy_and_bun
     assert result.bundle.case.state == "EVIDENCE_COLLECTED"
     assert _FakeOfficialImporter.calls == 1
     assert _FakeOfficialImporter.verified == 2
+
+
+def test_service_passes_verified_official_commit_proofs_to_committer(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    committer = _OfficialProofCapturingCommitter()
+    service, intent = _service(tmp_path, committer=committer)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    result = asyncio.run(service.run(intent, idempotency_key="official-proof"))
+
+    assert result.bundle.case.state == "EVIDENCE_COLLECTED"
+    assert len(committer.proofs) == 2
+    assert {proof.kind for proof in committer.proofs} == {
+        "dependency_audit",
+        "ci_iac_validation",
+    }
+    assert all(proof.evidence_id in {item.evidence_id for item in result.bundle.evidence} for proof in committer.proofs)
 
 
 def test_missing_official_dependency_evidence_keeps_policy_blocked(tmp_path):

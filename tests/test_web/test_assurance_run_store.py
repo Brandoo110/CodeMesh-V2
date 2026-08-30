@@ -1,6 +1,8 @@
 """Focused GP-03 persistence tests for complete assurance runs."""
 
 import asyncio
+import base64
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -9,6 +11,7 @@ from datetime import datetime, timezone
 from threading import Barrier
 
 import pytest
+import assurance.run_service as run_service_module
 
 from assurance.remediation import (
     PreparedRemediationHandoff,
@@ -18,6 +21,8 @@ from assurance.remediation_validation import ValidationStatus
 from assurance.remediation_reviewer import AssuranceRemediationReviewer
 from assurance.live_freshness import FreshnessStatus, LiveFreshness
 from tests.test_assurance_run_service import _Reviewer, _service
+from tests.test_assurance_run_service import _FakeOfficialImporter
+from assurance.run_service import AssuranceRunResult
 from tests.test_assurance_remediation import _FakeExecutor
 from tests.test_assurance_remediation_reviewer import (
     _FindingReviewer,
@@ -30,6 +35,7 @@ from web.assurance_store import (
     AssuranceWebError,
     AssuranceWebRepository,
 )
+from web.assurance_run_committer import _json_digest, _source_binding_json
 
 
 def _durable_service(tmp_path):
@@ -79,12 +85,15 @@ def test_commit_lookup_projects_run_and_keeps_local_source_private(tmp_path):
 
     result = asyncio.run(service.run(intent, idempotency_key="run:happy"))
     assert result.cached is False
-    assert result.bundle.freshness_source_binding.repository_path == intent.repository_path
+    expected_source_path = intent.repository_path.resolve()
+    assert (
+        result.bundle.freshness_source_binding.repository_path == expected_source_path
+    )
 
     public_bundle = result.bundle.model_dump(mode="json")
     assert "freshness_source_binding" not in public_bundle
     public_json = json.dumps(public_bundle, ensure_ascii=False, sort_keys=True)
-    assert str(intent.repository_path) not in public_json
+    assert str(expected_source_path) not in public_json
 
     run_row = _db_rows(
         repository,
@@ -93,8 +102,8 @@ def test_commit_lookup_projects_run_and_keeps_local_source_private(tmp_path):
     stored_public = json.loads(run_row["bundle_json"])
     stored_source = json.loads(run_row["source_binding_json"])
     assert "freshness_source_binding" not in stored_public
-    assert str(intent.repository_path) not in run_row["bundle_json"]
-    assert stored_source["repository_path"] == str(intent.repository_path)
+    assert str(expected_source_path) not in run_row["bundle_json"]
+    assert stored_source["repository_path"] == str(expected_source_path)
     assert stored_source["author"] == "author-agent"
     assert stored_source["author_provenance"] == "caller_declared"
 
@@ -538,6 +547,536 @@ def test_questions_replay_as_additive_projection_and_keep_missing_refs(tmp_path)
     assert replay is not None
     assert replay.cached is True
     assert replay.bundle.questions == (question,)
+
+
+def test_same_subject_new_key_continues_blocked_case_with_authoritative_final(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+
+    preflight = asyncio.run(service.run(intent, idempotency_key="run:preflight"))
+    assert preflight.bundle.policy.decision.outcome == "BLOCKED"
+    assert service._reviewer_invoker.calls == 0
+
+    final_intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    final = asyncio.run(service.run(final_intent, idempotency_key="run:final"))
+
+    assert final.cached is False
+    assert final.bundle.case.case_id == preflight.bundle.case.case_id
+    assert final.bundle.run_id != preflight.bundle.run_id
+    assert final.bundle.policy.decision.outcome != "BLOCKED"
+    assert service._reviewer_invoker.calls == 1
+    assert _FakeOfficialImporter.calls == 1
+    assert _FakeOfficialImporter.verified == 2
+
+    projection = repository.get_change(final.bundle.case.case_id)
+    assert projection["case"]["case_id"] == preflight.bundle.case.case_id
+    assert projection["case"]["state"] == final.bundle.case.state
+    assert projection["reviewer_runs"] == [
+        {
+            "run_id": preflight.bundle.run_id,
+            "status": preflight.bundle.reviewer.status,
+            "planned_route": preflight.bundle.reviewer.planned_route.model_dump(
+                mode="json"
+            ),
+            "rubric_version": preflight.bundle.reviewer.rubric_version,
+            "prompt_id": preflight.bundle.reviewer.prompt_id,
+            "prompt_digest": preflight.bundle.reviewer.prompt_digest,
+            "actual_provider": preflight.bundle.reviewer.actual_provider,
+            "actual_model_ref": preflight.bundle.reviewer.actual_model_ref,
+            "schema_status": preflight.bundle.reviewer.schema_status,
+            "raw_response_artifact_digest": preflight.bundle.reviewer.raw_response_artifact_digest,
+            "canonical_response_digest": preflight.bundle.reviewer.canonical_response_digest,
+            "result_id": preflight.bundle.reviewer.result_id,
+            "result_digest": preflight.bundle.reviewer.result_digest,
+            "usage_status": preflight.bundle.reviewer.usage_status,
+            "input_tokens": preflight.bundle.reviewer.input_tokens,
+            "output_tokens": preflight.bundle.reviewer.output_tokens,
+            "cost_usd": preflight.bundle.reviewer.cost_usd,
+            "error_code": preflight.bundle.reviewer.error_code,
+        },
+        {
+            "run_id": final.bundle.run_id,
+            "status": final.bundle.reviewer.status,
+            "planned_route": final.bundle.reviewer.planned_route.model_dump(
+                mode="json"
+            ),
+            "rubric_version": final.bundle.reviewer.rubric_version,
+            "prompt_id": final.bundle.reviewer.prompt_id,
+            "prompt_digest": final.bundle.reviewer.prompt_digest,
+            "actual_provider": final.bundle.reviewer.actual_provider,
+            "actual_model_ref": final.bundle.reviewer.actual_model_ref,
+            "schema_status": final.bundle.reviewer.schema_status,
+            "raw_response_artifact_digest": final.bundle.reviewer.raw_response_artifact_digest,
+            "canonical_response_digest": final.bundle.reviewer.canonical_response_digest,
+            "result_id": final.bundle.reviewer.result_id,
+            "result_digest": final.bundle.reviewer.result_digest,
+            "usage_status": final.bundle.reviewer.usage_status,
+            "input_tokens": final.bundle.reviewer.input_tokens,
+            "output_tokens": final.bundle.reviewer.output_tokens,
+            "cost_usd": final.bundle.reviewer.cost_usd,
+            "error_code": final.bundle.reviewer.error_code,
+        },
+    ]
+    assert len(projection["receipts"]) == 2
+
+    replay = asyncio.run(service.run(intent, idempotency_key="run:preflight"))
+    assert replay.cached is True
+    assert replay.bundle.policy.decision.outcome == "BLOCKED"
+    assert service._reviewer_invoker.calls == 1
+
+    with pytest.raises(AssuranceWebConflictError, match="request digest"):
+        asyncio.run(service.run(final_intent, idempotency_key="run:preflight"))
+    assert _FakeOfficialImporter.calls == 1
+    assert service._reviewer_invoker.calls == 1
+
+
+def test_continuation_rejects_official_provenance_mismatch_without_partial_state(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    preflight = asyncio.run(service.run(intent, idempotency_key="run:preflight"))
+    staged = asyncio.run(
+        service.prepare(
+            intent.model_copy(update={"official_evidence_run_id": "123"}),
+            idempotency_key="run:forged",
+        )
+    )
+    forged_evidence = tuple(
+        item.model_copy(
+            update={
+                "source_ref": item.source_ref.replace(":run:123:", ":run:999:")
+            }
+        )
+        if item.kind == "dependency_audit"
+        else item
+        for item in staged.evidence
+    )
+    forged = staged.model_copy(update={"evidence": forged_evidence})
+
+    with pytest.raises(AssuranceWebError, match="provenance"):
+        repository.commit_run(
+            forged,
+            idempotency_key=staged.idempotency_key,
+            request_digest=staged.request_digest,
+        )
+
+    counts = {
+        name: _db_rows(repository, f"SELECT COUNT(*) AS count FROM {name}")[0]["count"]
+        for name in (
+            "assurance_cases",
+            "assurance_case_events",
+            "assurance_decisions",
+            "assurance_web_cases",
+            "assurance_web_runs",
+            "assurance_web_idempotency",
+        )
+    }
+    assert counts == {
+        "assurance_cases": 1,
+        "assurance_case_events": len(preflight.bundle.events),
+        "assurance_decisions": 1,
+        "assurance_web_cases": 1,
+        "assurance_web_runs": 1,
+        "assurance_web_idempotency": 1,
+    }
+
+
+def test_concurrent_same_subject_new_keys_have_one_progression_winner(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    preflight = asyncio.run(service.run(intent, idempotency_key="run:preflight"))
+    final_intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    request_digest = service._request_digest(final_intent)
+    staged = [
+        asyncio.run(
+            service._prepare_bundle(
+                final_intent,
+                idempotency_key=key,
+                request_digest=request_digest,
+                with_proofs=True,
+            )
+        )
+        for key in ("run:final-a", "run:final-b")
+    ]
+    barrier = Barrier(2)
+
+    def commit_once(prepared):
+        bundle, official_proofs = prepared
+        barrier.wait()
+        try:
+            return repository.commit_run(
+                bundle,
+                idempotency_key=bundle.idempotency_key,
+                request_digest=bundle.request_digest,
+                official_proofs=official_proofs,
+            )
+        except Exception as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(commit_once, (item for item in staged)))
+
+    assert sum(isinstance(item, AssuranceWebError) for item in results) == 1
+    assert sum(
+        isinstance(item, AssuranceRunResult) and item.cached is False
+        for item in results
+    ) == 1
+    assert _db_rows(
+        repository, "SELECT COUNT(*) AS count FROM assurance_web_runs"
+    )[0]["count"] == 2
+    assert _db_rows(
+        repository, "SELECT COUNT(*) AS count FROM assurance_case_events"
+    )[0]["count"] == len(preflight.bundle.events) + 1
+    assert _db_rows(
+        repository, "SELECT COUNT(*) AS count FROM assurance_decisions"
+    )[0]["count"] == 2
+
+
+def test_continuation_projection_failure_rolls_back_without_automatic_provider_retry(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    preflight = asyncio.run(service.run(intent, idempotency_key="run:preflight"))
+    final_intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    original_projection = repository._projection_in_transaction
+
+    def fail_projection(*args, **kwargs):
+        if kwargs.get("require_run_pointers") is False:
+            raise RuntimeError("injected continuation projection failure")
+        return original_projection(*args, **kwargs)
+
+    repository._projection_in_transaction = fail_projection
+    with pytest.raises(RuntimeError, match="continuation projection"):
+        asyncio.run(service.run(final_intent, idempotency_key="run:final"))
+    assert service._reviewer_invoker.calls == 1
+    assert _FakeOfficialImporter.calls == 1
+    assert _db_rows(
+        repository, "SELECT COUNT(*) AS count FROM assurance_web_runs"
+    )[0]["count"] == 1
+    assert _db_rows(
+        repository, "SELECT COUNT(*) AS count FROM assurance_case_events"
+    )[0]["count"] == len(preflight.bundle.events)
+    repository._projection_in_transaction = original_projection
+
+    retry = asyncio.run(service.run(final_intent, idempotency_key="run:final"))
+    assert retry.cached is False
+    assert service._reviewer_invoker.calls == 2
+    assert _FakeOfficialImporter.calls == 2
+
+
+def test_continuation_locks_complete_freshness_source_binding_before_write(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+
+    class _SourceTamperingCommitter:
+        def lookup(self, key, digest):
+            return repository.lookup_run(key, digest)
+
+        def commit(self, bundle, *, idempotency_key, request_digest, official_proofs=()):
+            if official_proofs:
+                source = bundle.freshness_source_binding.model_copy(
+                    update={"author": "forged-author"}
+                )
+                bundle = bundle.model_copy(
+                    update={
+                        "freshness_source_binding": source,
+                        "freshness_source_binding_digest": _json_digest(
+                            _source_binding_json(source)
+                        ),
+                    }
+                )
+            return repository.commit_run(
+                bundle,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                official_proofs=official_proofs,
+            )
+
+    service._committer = _SourceTamperingCommitter()
+    preflight = asyncio.run(service.run(intent, idempotency_key="run:source-base"))
+    final_intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    with pytest.raises(AssuranceWebError, match="freshness|source|provenance"):
+        asyncio.run(service.run(final_intent, idempotency_key="run:source-drift"))
+
+    assert service._reviewer_invoker.calls == 1
+    assert _FakeOfficialImporter.calls == 1
+    assert _db_rows(
+        repository, "SELECT COUNT(*) AS count FROM assurance_web_runs"
+    )[0]["count"] == 1
+    assert repository.get_change(preflight.bundle.case.case_id)["metadata"]["author"] == (
+        "author-agent"
+    )
+
+
+def test_continuation_requires_run_policy_to_be_referenced_by_its_events(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+
+    class _PolicyForkingCommitter:
+        def lookup(self, key, digest):
+            return repository.lookup_run(key, digest)
+
+        def commit(self, bundle, *, idempotency_key, request_digest, official_proofs=()):
+            if official_proofs:
+                forged_policy_id = "policy-forged"
+                events = tuple(
+                    event.model_copy(
+                        update={
+                            "policy_decision_refs": (
+                                *event.policy_decision_refs,
+                                forged_policy_id,
+                            )
+                        }
+                    )
+                    if event.kind == "COLLECT_EVIDENCE"
+                    else event
+                    for event in bundle.events
+                )
+                case = bundle.case.model_copy(
+                    update={
+                        "policy_decision_refs": (
+                            *bundle.case.policy_decision_refs,
+                            forged_policy_id,
+                        )
+                    }
+                )
+                bundle = bundle.model_copy(update={"case": case, "events": events})
+            return repository.commit_run(
+                bundle,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                official_proofs=official_proofs,
+            )
+
+    service._committer = _PolicyForkingCommitter()
+    preflight = asyncio.run(service.run(intent, idempotency_key="run:policy-base"))
+    final_intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    with pytest.raises(AssuranceWebError, match="policy|event"):
+        asyncio.run(service.run(final_intent, idempotency_key="run:policy-fork"))
+
+    assert _db_rows(
+        repository, "SELECT COUNT(*) AS count FROM assurance_web_runs"
+    )[0]["count"] == 1
+    assert _db_rows(
+        repository, "SELECT COUNT(*) AS count FROM assurance_case_events"
+    )[0]["count"] == len(preflight.bundle.events)
+
+
+@pytest.mark.parametrize("tamper", ("receipt", "report", "result", "source", "missing"))
+def test_historical_official_proof_readback_fails_closed_on_byte_or_row_tamper(
+    tmp_path, monkeypatch, tamper
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    result = asyncio.run(service.run(intent, idempotency_key="run:proof-history"))
+
+    conn = sqlite3.connect(repository._db_path)
+    try:
+        row = conn.execute(
+            "SELECT run_id, evidence_id, receipt_bytes, report_bytes, result_bytes, source_bindings_json"
+            " FROM assurance_official_evidence_proofs ORDER BY evidence_id LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        if tamper == "missing":
+            conn.execute(
+                "DELETE FROM assurance_official_evidence_proofs WHERE run_id = ?",
+                (row[0],),
+            )
+        elif tamper == "receipt":
+            conn.execute(
+                "UPDATE assurance_official_evidence_proofs SET receipt_bytes = ?"
+                " WHERE run_id = ? AND evidence_id = ?",
+                (row[2] + b"x", row[0], row[1]),
+            )
+        elif tamper == "report":
+            conn.execute(
+                "UPDATE assurance_official_evidence_proofs SET report_bytes = ?"
+                " WHERE run_id = ? AND evidence_id = ?",
+                (row[3] + b"x", row[0], row[1]),
+            )
+        elif tamper == "result":
+            conn.execute(
+                "UPDATE assurance_official_evidence_proofs SET result_bytes = ?"
+                " WHERE run_id = ? AND evidence_id = ?",
+                (row[4] + b"x", row[0], row[1]),
+            )
+        else:
+            sources = json.loads(row[5])
+            sources[0]["bytes"] = base64.b64encode(b"forged-source").decode("ascii")
+            conn.execute(
+                "UPDATE assurance_official_evidence_proofs SET source_bindings_json = ?"
+                " WHERE run_id = ? AND evidence_id = ?",
+                (json.dumps(sources, sort_keys=True, separators=(",", ":")), row[0], row[1]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(AssuranceWebError, match="proof|official|receipt|source|history"):
+        repository.lookup_run("run:proof-history", result.request_digest)
+
+
+def test_official_proof_rows_are_immutable_unique_and_foreign_key_bound(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    result = asyncio.run(service.run(intent, idempotency_key="run:proof-constraints"))
+
+    rows = _db_rows(
+        repository,
+        "SELECT run_id, evidence_id, kind FROM assurance_official_evidence_proofs",
+    )
+    assert len(rows) == 2
+    with pytest.raises(sqlite3.IntegrityError):
+        conn = sqlite3.connect(repository._db_path)
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(
+                "INSERT INTO assurance_official_evidence_proofs"
+                " (run_id, evidence_id, kind, subject_digest, evidence_mode,"
+                " workflow_run_id, workflow_run_attempt, job_id, artifact_id,"
+                " artifact_digest, artifact_byte_size, receipt_digest, receipt_byte_size,"
+                " receipt_bytes, report_digest, report_byte_size, report_bytes,"
+                " result_digest, result_byte_size, result_bytes, source_bindings_json)"
+                " SELECT run_id, evidence_id, kind, subject_digest, evidence_mode,"
+                " workflow_run_id, workflow_run_attempt, job_id, artifact_id,"
+                " artifact_digest, artifact_byte_size, receipt_digest, receipt_byte_size,"
+                " receipt_bytes, report_digest, report_byte_size, report_bytes,"
+                " result_digest, result_byte_size, result_bytes, source_bindings_json"
+                " FROM assurance_official_evidence_proofs WHERE run_id = ? LIMIT 1",
+                (result.bundle.run_id,),
+            )
+        finally:
+            conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn = sqlite3.connect(repository._db_path)
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(
+                "INSERT INTO assurance_official_evidence_proofs"
+                " (run_id, evidence_id, kind, subject_digest, evidence_mode,"
+                " workflow_run_id, workflow_run_attempt, job_id, artifact_id,"
+                " artifact_digest, artifact_byte_size, receipt_digest, receipt_byte_size,"
+                " receipt_bytes, report_digest, report_byte_size, report_bytes,"
+                " result_digest, result_byte_size, result_bytes, source_bindings_json)"
+                " SELECT 'missing-run', evidence_id, kind, subject_digest, evidence_mode,"
+                " workflow_run_id, workflow_run_attempt, job_id, artifact_id,"
+                " artifact_digest, artifact_byte_size, receipt_digest, receipt_byte_size,"
+                " receipt_bytes, report_digest, report_byte_size, report_bytes,"
+                " result_digest, result_byte_size, result_bytes, source_bindings_json"
+                " FROM assurance_official_evidence_proofs WHERE run_id = ? LIMIT 1",
+                (result.bundle.run_id,),
+            )
+        finally:
+            conn.close()
+
+
+def test_existing_v1_run_schema_additively_migrates_official_proof_table(tmp_path):
+    database = tmp_path / "assurance.sqlite"
+    repository = AssuranceWebRepository(database)
+    repository._store.initialize()
+    conn = sqlite3.connect(database)
+    try:
+        conn.execute(
+            "CREATE TABLE assurance_run_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO assurance_run_schema_migrations(version, applied_at) VALUES (1, datetime('now'))"
+        )
+        conn.execute(
+            "CREATE TABLE assurance_web_runs ("
+            "idempotency_key TEXT PRIMARY KEY, request_digest TEXT NOT NULL,"
+            "run_id TEXT NOT NULL UNIQUE, case_id TEXT NOT NULL, subject_digest TEXT NOT NULL,"
+            "bundle_json TEXT NOT NULL, source_binding_json TEXT NOT NULL, committed_at TEXT NOT NULL,"
+            "FOREIGN KEY(case_id) REFERENCES assurance_cases(case_id))"
+        )
+        conn.execute(
+            "CREATE INDEX assurance_web_runs_case ON assurance_web_runs(case_id, committed_at, run_id)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    repository.initialize()
+    assert [row[0] for row in _db_rows(
+        repository, "SELECT version FROM assurance_run_schema_migrations ORDER BY version"
+    )] == [1, 2]
+    assert _db_rows(
+        repository,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='assurance_official_evidence_proofs'",
+    )
 
 
 def _prepared_success(tmp_path, monkeypatch):

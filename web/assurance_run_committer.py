@@ -21,6 +21,7 @@ from assurance.run_service import (
     AssuranceRunBundle,
     AssuranceRunResult,
     FreshnessSourceBinding,
+    _OfficialEvidenceCommitProof,
     ReviewerRunRecord,
 )
 from assurance.contracts import (
@@ -47,9 +48,10 @@ from assurance.state_machine import AcceptanceBinding, AcceptanceEvent
 from assurance.single_reviewer import ReviewQuestion
 
 
-RUN_SCHEMA_VERSION = 1
+RUN_SCHEMA_VERSION = 2
 _RUN_MIGRATION_TABLE = "assurance_run_schema_migrations"
 _RUN_TABLE = "assurance_web_runs"
+_OFFICIAL_PROOF_TABLE = "assurance_official_evidence_proofs"
 _RUN_POINTER_OPERATION = "run"
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -131,6 +133,40 @@ def _ensure_run_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             f"INSERT INTO {_RUN_MIGRATION_TABLE} (version, applied_at)"
             " VALUES (1, datetime('now'))"
+        )
+    if version < 2:
+        conn.execute(
+            f"CREATE TABLE {_OFFICIAL_PROOF_TABLE} ("
+            "run_id TEXT NOT NULL,"
+            "evidence_id TEXT NOT NULL,"
+            "kind TEXT NOT NULL,"
+            "subject_digest TEXT NOT NULL,"
+            "evidence_mode TEXT NOT NULL CHECK(evidence_mode = 'official'),"
+            "workflow_run_id TEXT NOT NULL,"
+            "workflow_run_attempt INTEGER NOT NULL CHECK(workflow_run_attempt > 0),"
+            "job_id TEXT NOT NULL,"
+            "artifact_id TEXT NOT NULL,"
+            "artifact_digest TEXT NOT NULL,"
+            "artifact_byte_size INTEGER NOT NULL CHECK(artifact_byte_size > 0),"
+            "artifact_bytes BLOB NOT NULL,"
+            "receipt_digest TEXT NOT NULL,"
+            "receipt_byte_size INTEGER NOT NULL CHECK(receipt_byte_size > 0),"
+            "receipt_bytes BLOB NOT NULL,"
+            "report_digest TEXT NOT NULL,"
+            "report_byte_size INTEGER NOT NULL CHECK(report_byte_size >= 0),"
+            "report_bytes BLOB NOT NULL,"
+            "result_digest TEXT NOT NULL,"
+            "result_byte_size INTEGER NOT NULL CHECK(result_byte_size >= 0),"
+            "result_bytes BLOB NOT NULL,"
+            "source_bindings_json TEXT NOT NULL,"
+            "PRIMARY KEY(run_id, evidence_id),"
+            "UNIQUE(run_id, kind),"
+            f"FOREIGN KEY(run_id) REFERENCES {_RUN_TABLE}(run_id)"
+            ")"
+        )
+        conn.execute(
+            f"INSERT INTO {_RUN_MIGRATION_TABLE} (version, applied_at)"
+            " VALUES (2, datetime('now'))"
         )
     _validate_run_schema_objects(conn)
 
@@ -218,6 +254,109 @@ def _validate_run_schema_objects(conn: sqlite3.Connection) -> None:
         raise AssuranceRunMigrationError(
             "run table foreign key does not match migration v1"
         )
+    _validate_official_proof_schema(conn)
+
+
+def _validate_official_proof_schema(conn: sqlite3.Connection) -> None:
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+        (_OFFICIAL_PROOF_TABLE,),
+    ).fetchone()
+    if table is None:
+        raise AssuranceRunMigrationError(
+            "run schema migration is missing the official proof table"
+        )
+    expected_columns = [
+        ("run_id", "TEXT", 1, None, 1),
+        ("evidence_id", "TEXT", 1, None, 2),
+        ("kind", "TEXT", 1, None, 0),
+        ("subject_digest", "TEXT", 1, None, 0),
+        ("evidence_mode", "TEXT", 1, None, 0),
+        ("workflow_run_id", "TEXT", 1, None, 0),
+        ("workflow_run_attempt", "INTEGER", 1, None, 0),
+        ("job_id", "TEXT", 1, None, 0),
+        ("artifact_id", "TEXT", 1, None, 0),
+        ("artifact_digest", "TEXT", 1, None, 0),
+        ("artifact_byte_size", "INTEGER", 1, None, 0),
+        ("artifact_bytes", "BLOB", 1, None, 0),
+        ("receipt_digest", "TEXT", 1, None, 0),
+        ("receipt_byte_size", "INTEGER", 1, None, 0),
+        ("receipt_bytes", "BLOB", 1, None, 0),
+        ("report_digest", "TEXT", 1, None, 0),
+        ("report_byte_size", "INTEGER", 1, None, 0),
+        ("report_bytes", "BLOB", 1, None, 0),
+        ("result_digest", "TEXT", 1, None, 0),
+        ("result_byte_size", "INTEGER", 1, None, 0),
+        ("result_bytes", "BLOB", 1, None, 0),
+        ("source_bindings_json", "TEXT", 1, None, 0),
+    ]
+    _validate_table_columns(conn, _OFFICIAL_PROOF_TABLE, expected_columns)
+    indexes = conn.execute(
+        f"PRAGMA index_list({_OFFICIAL_PROOF_TABLE})"
+    ).fetchall()
+    found = set()
+    for index in indexes:
+        columns = _index_columns(conn, index["name"])
+        if (
+            index["unique"] == 1
+            and index["partial"] == 0
+            and index["origin"] == "pk"
+            and columns == ("run_id", "evidence_id")
+        ):
+            _validate_index_xinfo(
+                conn,
+                index["name"],
+                ("run_id", "evidence_id"),
+                expected_cids={"run_id": 0, "evidence_id": 1},
+            )
+            found.add("primary")
+        elif (
+            index["unique"] == 1
+            and index["partial"] == 0
+            and index["origin"] == "u"
+            and columns == ("run_id", "kind")
+        ):
+            _validate_index_xinfo(
+                conn,
+                index["name"],
+                ("run_id", "kind"),
+                expected_cids={"run_id": 0, "kind": 2},
+            )
+            found.add("kind")
+        else:
+            raise AssuranceRunMigrationError(
+                "official proof table indexes do not match migration v2"
+            )
+    if found != {"primary", "kind"}:
+        raise AssuranceRunMigrationError(
+            "official proof table indexes do not match migration v2"
+        )
+    foreign_keys = conn.execute(
+        f"PRAGMA foreign_key_list({_OFFICIAL_PROOF_TABLE})"
+    ).fetchall()
+    expected_foreign_key = (
+        _RUN_TABLE,
+        "run_id",
+        "run_id",
+        "NO ACTION",
+        "NO ACTION",
+        "NONE",
+    )
+    actual_foreign_keys = tuple(
+        (
+            row["table"],
+            row["from"],
+            row["to"],
+            row["on_update"],
+            row["on_delete"],
+            row["match"],
+        )
+        for row in foreign_keys
+    )
+    if actual_foreign_keys != (expected_foreign_key,):
+        raise AssuranceRunMigrationError(
+            "official proof foreign key does not match migration v2"
+        )
 
 
 def _validate_idempotency_primary_key(conn: sqlite3.Connection) -> None:
@@ -302,7 +441,11 @@ def _index_columns(conn: sqlite3.Connection, name: str) -> tuple[str, ...]:
 
 
 def _validate_index_xinfo(
-    conn: sqlite3.Connection, name: str, expected_columns: tuple[str, ...]
+    conn: sqlite3.Connection,
+    name: str,
+    expected_columns: tuple[str, ...],
+    *,
+    expected_cids: dict[str, int] | None = None,
 ) -> None:
     escaped = name.replace("'", "''")
     rows = sorted(
@@ -313,7 +456,7 @@ def _validate_index_xinfo(
         raise AssuranceRunMigrationError(
             "run index key columns do not match migration v1"
         )
-    expected_cids = {
+    expected_cids = expected_cids or {
         "idempotency_key": 0,
         "run_id": 2,
         "case_id": 3,
@@ -392,11 +535,13 @@ class AssuranceRunStoreAdapter:
         *,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult:
         return self._repository._commit_run_in_transaction_boundary(
             bundle,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            official_proofs=official_proofs,
         )
 
     def _commit_run_in_transaction(
@@ -405,13 +550,32 @@ class AssuranceRunStoreAdapter:
         *args: Any,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult:
-        return _commit_run_in_transaction(
+        bundle = args[-1] if args else None
+        unit_of_work = (
+            connection_or_unit_of_work
+            if len(args) == 1
+            else args[0]
+            if len(args) == 2
+            else None
+        )
+        if bundle is None or unit_of_work is None:
+            raise TypeError("run transaction helper requires a bundle and UOW")
+        result = _commit_run_in_transaction(
             connection_or_unit_of_work,
             *args,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            official_proofs=official_proofs,
         )
+        if not result.cached:
+            self._repository._persist_official_commit_proofs_in_transaction(
+                unit_of_work.connection,
+                bundle,
+                official_proofs,
+            )
+        return result
 
 
 class AssuranceRunCommitter:
@@ -431,11 +595,13 @@ class AssuranceRunCommitter:
         *,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult:
         return self._adapter.commit_run(
             bundle,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            official_proofs=official_proofs,
         )
 
     def _commit_run_in_transaction(
@@ -444,12 +610,14 @@ class AssuranceRunCommitter:
         *args: Any,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult:
         return self._adapter._commit_run_in_transaction(
             connection_or_unit_of_work,
             *args,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            official_proofs=official_proofs,
         )
 
     # The GP-02 protocol uses the short names.  Keep both spellings so the
@@ -465,11 +633,13 @@ class AssuranceRunCommitter:
         *,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult:
         return self.commit_run(
             bundle,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            official_proofs=official_proofs,
         )
 
 
@@ -558,6 +728,7 @@ def _commit_run_in_transaction(
     *args: Any,
     idempotency_key: str,
     request_digest: str,
+    official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
 ) -> AssuranceRunResult:
     """Persist a run row and pointer on an already-open assurance UOW.
 

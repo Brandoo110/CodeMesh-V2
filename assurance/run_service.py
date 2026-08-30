@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import inspect
 import json
 import os
 import stat
+import subprocess
+import zipfile
 from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -58,8 +61,11 @@ from .manifest import (
 from .official_evidence import (
     OFFICIAL_EVIDENCE_KINDS,
     OfficialEvidenceImport,
+    OfficialEvidenceSource,
     OfficialEvidenceError,
     OfficialEvidenceImporter,
+    parse_official_evidence_receipt,
+    parse_official_evidence_report,
 )
 from .policy import PolicyEvaluationInput, PolicyGate, PolicyGateResult
 from .risk import (
@@ -405,6 +411,33 @@ class FreshnessSourceBinding(BaseModel):
         if self.subject.policy_version != self.policy_version:
             raise ValueError("source policy version must match subject")
         return self
+
+
+@dataclass(frozen=True)
+class _OfficialEvidenceCommitProof:
+    """Verified official bytes handed only to the internal commit seam."""
+
+    evidence_id: str
+    kind: str
+    subject_digest: str
+    evidence_mode: Literal["official"]
+    workflow_run_id: str
+    workflow_run_attempt: int
+    job_id: str
+    artifact_id: str
+    artifact_digest: str
+    artifact_byte_size: int
+    artifact_bytes: bytes
+    receipt_digest: str
+    receipt_byte_size: int
+    receipt_bytes: bytes
+    report_digest: str
+    report_byte_size: int
+    report_bytes: bytes
+    result_digest: str
+    result_byte_size: int
+    result_bytes: bytes
+    source_bindings: tuple[tuple[OfficialEvidenceSource, bytes], ...]
 
 
 class ReviewerRoute(BaseModel):
@@ -1175,6 +1208,7 @@ class RunCommitter(Protocol):
         *,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult | AssuranceRunBundle:
         """Persist one complete bundle atomically."""
 
@@ -1246,16 +1280,23 @@ class AssuranceRunService:
         if cached_result is not None:
             return cached_result
 
-        bundle = await self._prepare_bundle(
+        prepared = await self._prepare_bundle(
             intent,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            with_proofs=True,
         )
+        bundle, official_proofs = prepared
+        commit_kwargs = {
+            "idempotency_key": idempotency_key,
+            "request_digest": request_digest,
+        }
+        if official_proofs:
+            commit_kwargs["official_proofs"] = official_proofs
         committed = await asyncio.to_thread(
             self._committer.commit,
             bundle,
-            idempotency_key=idempotency_key,
-            request_digest=request_digest,
+            **commit_kwargs,
         )
         if committed is None:
             raise AssuranceRunError("committer.commit did not return a persisted result")
@@ -1270,7 +1311,8 @@ class AssuranceRunService:
         *,
         idempotency_key: str,
         request_digest: str,
-    ) -> AssuranceRunBundle:
+        with_proofs: bool = False,
+    ) -> AssuranceRunBundle | tuple[AssuranceRunBundle, tuple[_OfficialEvidenceCommitProof, ...]]:
         """Build the complete in-memory bundle shared by prepare and run."""
 
         await asyncio.to_thread(self._validate_workspace, intent)
@@ -1455,7 +1497,7 @@ class AssuranceRunService:
             policy=policy_result,
             occurred_at=fence_at,
         )
-        return AssuranceRunBundle(
+        bundle = AssuranceRunBundle(
             schema_version="v1",
             run_id=self._run_id(request_digest, idempotency_key),
             idempotency_key=idempotency_key,
@@ -1483,6 +1525,158 @@ class AssuranceRunService:
             started_at=started_at,
             completed_at=fence_at,
         )
+        official_proofs = self._build_official_commit_proofs(
+            official_imports,
+            repository_path=intent.repository_path,
+            head_revision=git_result.snapshot.head_revision,
+        )
+        if with_proofs:
+            return bundle, official_proofs
+        return bundle
+
+    @staticmethod
+    def _build_official_commit_proofs(
+        official_imports: tuple[OfficialEvidenceImport, ...],
+        *,
+        repository_path: Path,
+        head_revision: str,
+    ) -> tuple[_OfficialEvidenceCommitProof, ...]:
+        """Materialize only bytes already fenced by the verified importer."""
+
+        if not official_imports:
+            return ()
+        proofs = []
+        expected_zip_files = {
+            "dependency_audit": "dependency_audit.json",
+            "ci_iac_validation": "ci_iac_validation.json",
+        }
+        expected_result_files = {
+            "dependency_audit": "dependency-audit-result.json",
+            "ci_iac_validation": "ci-iac-result.json",
+        }
+        for imported in official_imports:
+            if type(imported) is not OfficialEvidenceImport:
+                raise AssuranceRunOfficialEvidenceError(
+                    "official evidence import is not a verified typed result"
+                )
+            receipt = imported.receipt
+            evidence = imported.evidence
+            receipt_bytes = imported.receipt_bytes
+            artifact_bytes = imported.remote_zip_bytes
+            if (
+                type(receipt_bytes) is not bytes
+                or type(artifact_bytes) is not bytes
+                or imported.receipt_digest != _sha256(receipt_bytes)
+                or imported.receipt_byte_size != len(receipt_bytes)
+                or imported.remote_zip_digest != _sha256(artifact_bytes)
+                or imported.remote_zip_byte_size != len(artifact_bytes)
+                or receipt.artifact_digest != imported.remote_zip_digest
+                or receipt.artifact_byte_size != imported.remote_zip_byte_size
+                or evidence.artifact_digest != imported.receipt_digest
+                or evidence.kind != receipt.kind
+                or evidence.subject_digest != receipt.subject_digest
+                or receipt.evidence_mode != "official"
+            ):
+                raise AssuranceRunOfficialEvidenceError(
+                    "official evidence import byte binding is invalid"
+                )
+            try:
+                parsed_receipt = parse_official_evidence_receipt(receipt_bytes)
+                if parsed_receipt != receipt:
+                    raise ValueError("receipt bytes do not reparse exactly")
+                with zipfile.ZipFile(io.BytesIO(artifact_bytes)) as archive:
+                    names = tuple(info.filename for info in archive.infolist())
+                    if set(names) != {
+                        "dependency_audit.json",
+                        "ci_iac_validation.json",
+                        "dependency-audit-result.json",
+                        "ci-iac-result.json",
+                    } or len(names) != 4:
+                        raise ValueError("official artifact file set is invalid")
+                    report_bytes = archive.read(expected_zip_files[receipt.kind])
+                    result_bytes = archive.read(expected_result_files[receipt.kind])
+                parsed_report = parse_official_evidence_report(report_bytes)
+                if parsed_report != receipt.report:
+                    raise ValueError("report bytes do not reparse exactly")
+                parsed_result = json.loads(
+                    result_bytes.decode("utf-8"),
+                    parse_constant=lambda _value: (_ for _ in ()).throw(
+                        ValueError("invalid JSON constant")
+                    ),
+                )
+                if not isinstance(parsed_result, (dict, list)) or parsed_result != receipt.result:
+                    raise ValueError("result bytes do not bind to receipt")
+            except (OSError, ValueError, TypeError, UnicodeDecodeError, zipfile.BadZipFile) as exc:
+                raise AssuranceRunOfficialEvidenceError(
+                    "official evidence artifact bytes are not bound"
+                ) from exc
+            if (
+                _sha256(report_bytes) != receipt.report_digest
+                or len(report_bytes) != receipt.report_byte_size
+                or _sha256(result_bytes) != receipt.result_digest
+                or len(result_bytes) != receipt.result_byte_size
+            ):
+                raise AssuranceRunOfficialEvidenceError(
+                    "official report or result bytes do not match receipt"
+                )
+            source_bindings = []
+            for source in imported.source_bindings:
+                if type(source) is not OfficialEvidenceSource:
+                    raise AssuranceRunOfficialEvidenceError(
+                        "official source binding is invalid"
+                    )
+                try:
+                    blob = subprocess.run(
+                        (
+                            "git",
+                            "cat-file",
+                            "blob",
+                            f"{head_revision}:{source.path}",
+                        ),
+                        cwd=repository_path,
+                        check=True,
+                        capture_output=True,
+                        timeout=5.0,
+                    ).stdout
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise AssuranceRunOfficialEvidenceError(
+                        "official source bytes cannot be read from the fenced Git revision"
+                    ) from exc
+                if len(blob) != source.byte_size or _sha256(blob) != source.digest:
+                    raise AssuranceRunOfficialEvidenceError(
+                        "official source bytes do not match receipt"
+                    )
+                source_bindings.append((source, blob))
+            if tuple(source for source, _ in source_bindings) != receipt.source_paths:
+                raise AssuranceRunOfficialEvidenceError(
+                    "official source bindings do not match receipt"
+                )
+            proofs.append(
+                _OfficialEvidenceCommitProof(
+                    evidence_id=evidence.evidence_id,
+                    kind=receipt.kind,
+                    subject_digest=receipt.subject_digest,
+                    evidence_mode=receipt.evidence_mode,
+                    workflow_run_id=receipt.workflow_run_id,
+                    workflow_run_attempt=receipt.workflow_run_attempt,
+                    job_id=receipt.job_id,
+                    artifact_id=receipt.artifact_id,
+                    artifact_digest=receipt.artifact_digest,
+                    artifact_byte_size=receipt.artifact_byte_size,
+                    artifact_bytes=artifact_bytes,
+                    receipt_digest=imported.receipt_digest,
+                    receipt_byte_size=imported.receipt_byte_size,
+                    receipt_bytes=receipt_bytes,
+                    report_digest=receipt.report_digest,
+                    report_byte_size=receipt.report_byte_size,
+                    report_bytes=report_bytes,
+                    result_digest=receipt.result_digest,
+                    result_byte_size=receipt.result_byte_size,
+                    result_bytes=result_bytes,
+                    source_bindings=tuple(source_bindings),
+                )
+            )
+        return tuple(proofs)
 
     def _import_official_evidence(
         self,
