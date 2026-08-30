@@ -69,7 +69,8 @@ try {
   await main.getByPlaceholder("签收理由（必填）").fill("CI walkthrough owner decision");
   await main.getByLabel("我已复核高风险变更并进行二次确认").check();
   await main.getByRole("button", { name: "提交签收" }).click();
-  await main.getByText("ACCEPTED", { exact: true }).waitFor();
+  const acceptanceAxis = main.getByText("Acceptance", { exact: true }).locator("..");
+  await acceptanceAxis.getByText("ACCEPTED", { exact: true }).waitFor();
   const accepted = await readApi(`/api/assurance/changes/${encodeURIComponent(fresh.case_id)}`);
   assert.equal(accepted.acceptance_state, "ACCEPTED");
   assert.equal(accepted.freshness.status, "FRESH");
