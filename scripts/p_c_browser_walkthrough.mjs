@@ -48,14 +48,15 @@ try {
   await page.getByText("Change Queue").waitFor();
 
   await page.locator("aside button").filter({ hasText: fresh.case_id }).click();
-  await page.getByText("Change Passport · CaseView v1").waitFor();
-  await page.getByText("Lineage").waitFor();
-  await page.getByText("Findings").waitFor();
-  await page.getByText("Evidence", { exact: true }).waitFor();
-  await page.getByText("FRESH", { exact: true }).waitFor();
-  await page.getByText("FRESHNESS_MATCH", { exact: true }).waitFor();
-  await page.getByText(`Required role: ${approve.required_human_role}`).waitFor();
-  await page.getByText("The handover owner must confirm the change boundary.", { exact: true }).click();
+  const main = page.getByRole("main");
+  await main.getByText("Change Passport · CaseView v1").waitFor();
+  await main.getByText("Lineage").waitFor();
+  await main.getByText("Findings").waitFor();
+  await main.getByText("Evidence", { exact: true }).waitFor();
+  await main.getByText("FRESH", { exact: true }).waitFor();
+  await main.getByText("FRESHNESS_MATCH", { exact: true }).waitFor();
+  await main.getByText(`Required role: ${approve.required_human_role}`).waitFor();
+  await main.getByText("The handover owner must confirm the change boundary.", { exact: true }).click();
   await page.getByText("Authorized Artifacts").waitFor();
   await page.getByRole("button", { name: "关闭证据面板" }).click();
   await page.screenshot({
@@ -63,12 +64,12 @@ try {
     fullPage: true,
   });
 
-  await page.getByPlaceholder("Owner", { exact: true }).fill("handover-owner");
-  await page.getByPlaceholder(/Role/).fill(approve.required_human_role);
-  await page.getByPlaceholder("签收理由（必填）").fill("CI walkthrough owner decision");
-  await page.getByLabel("我已复核高风险变更并进行二次确认").check();
-  await page.getByRole("button", { name: "提交签收" }).click();
-  await page.getByText("ACCEPTED", { exact: true }).first().waitFor();
+  await main.getByPlaceholder("Owner", { exact: true }).fill("handover-owner");
+  await main.getByPlaceholder(/Role/).fill(approve.required_human_role);
+  await main.getByPlaceholder("签收理由（必填）").fill("CI walkthrough owner decision");
+  await main.getByLabel("我已复核高风险变更并进行二次确认").check();
+  await main.getByRole("button", { name: "提交签收" }).click();
+  await main.getByText("ACCEPTED", { exact: true }).waitFor();
   const accepted = await readApi(`/api/assurance/changes/${encodeURIComponent(fresh.case_id)}`);
   assert.equal(accepted.acceptance_state, "ACCEPTED");
   assert.equal(accepted.freshness.status, "FRESH");
@@ -79,9 +80,9 @@ try {
   });
 
   await page.locator("aside button").filter({ hasText: unavailable.case_id }).click();
-  await page.getByText("Change Passport · CaseView v1").waitFor();
-  await page.getByText("UNAVAILABLE", { exact: true }).waitFor();
-  await page.getByText("当前 Case 没有可执行的 Decision action；只可导出 Passport").waitFor();
+  await main.getByText("Change Passport · CaseView v1").waitFor();
+  await main.getByText("UNAVAILABLE", { exact: true }).waitFor();
+  await main.getByText("当前 Case 没有可执行的 Decision action；只可导出 Passport").waitFor();
   const unavailableBefore = await readApi(
     `/api/assurance/changes/${encodeURIComponent(unavailable.case_id)}`,
   );
@@ -131,7 +132,8 @@ try {
   await mobile.goto(baseUrl, { waitUntil: "networkidle" });
   await mobile.getByRole("button", { name: "验收" }).click();
   await mobile.locator("aside button").filter({ hasText: fresh.case_id }).click();
-  await mobile.getByText("Change Passport · CaseView v1").waitFor();
+  const mobileMain = mobile.getByRole("main");
+  await mobileMain.getByText("Change Passport · CaseView v1").waitFor();
   const overflow = await mobile.evaluate(
     () => document.documentElement.scrollWidth <= window.innerWidth,
   );
