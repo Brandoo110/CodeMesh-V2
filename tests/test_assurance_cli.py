@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from assurance import cli
@@ -258,6 +259,222 @@ def test_live_run_does_not_expose_run_create_timeout_option():
 
     assert result.exit_code == 0
     assert "--run-create-timeout" not in result.stdout
+
+
+def test_default_idempotency_key_distinguishes_clean_repository_heads(
+    monkeypatch, tmp_path
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    heads = {"value": b"a" * 40}
+
+    def fake_git(_repository, *arguments):
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ):
+            return b""
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return heads["value"]
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    request = {"repository_identity": "acme/widget"}
+    first = cli._idempotency_key(tmp_path, request, ("task.md",))
+
+    heads["value"] = b"b" * 40
+    second = cli._idempotency_key(tmp_path, request, ("task.md",))
+
+    assert first != second
+
+
+def test_default_idempotency_key_is_stable_for_same_clean_head(monkeypatch, tmp_path):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+
+    def fake_git(_repository, *arguments):
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ):
+            return b""
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return b"a" * 40 + b"\n"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    request = {"repository_identity": "acme/widget"}
+
+    assert cli._idempotency_key(tmp_path, request, ("task.md",)) == cli._idempotency_key(
+        tmp_path, request, ("task.md",)
+    )
+
+
+def test_default_idempotency_key_changes_when_worktree_is_dirty(
+    monkeypatch, tmp_path
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    status = {"value": b""}
+
+    def fake_git(_repository, *arguments):
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ):
+            return status["value"]
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return b"a" * 40
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    request = {"repository_identity": "acme/widget"}
+    clean = cli._idempotency_key(tmp_path, request, ("task.md",))
+
+    status["value"] = b" M task.md\0"
+    dirty = cli._idempotency_key(tmp_path, request, ("task.md",))
+
+    assert clean != dirty
+
+
+@pytest.mark.parametrize("head", [b"a" * 40, b"b" * 64], ids=["sha1", "sha256"])
+def test_repository_head_accepts_40_or_64_lowercase_hex(
+    monkeypatch, tmp_path, head
+):
+    calls = []
+
+    def fake_git(_repository, *arguments):
+        calls.append(arguments)
+        assert arguments == ("rev-parse", "--verify", "HEAD^{commit}")
+        return head + b"\n"
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+
+    assert cli._repository_head(tmp_path) == head.decode("ascii")
+    assert calls == [("rev-parse", "--verify", "HEAD^{commit}")]
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        None,
+        b"",
+        b"a" * 40 + b"\n" + b"b" * 40,
+        b" " + b"a" * 40,
+        b"a" * 40 + b" ",
+        b"A" * 40,
+        b"g" * 40,
+    ],
+    ids=["missing", "empty", "multiline", "leading-space", "trailing-space", "uppercase", "nonhex"],
+)
+def test_invalid_repository_head_fails_before_http_post(
+    monkeypatch, tmp_path, head
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    calls = []
+
+    def fake_git(_repository, *arguments):
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return head
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ):
+            return b""
+        raise AssertionError(arguments)
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("client")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def run_and_readback(self, *_args, **_kwargs):
+            calls.append("post")
+            raise AssertionError("HTTP POST must not run")
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    monkeypatch.setattr(cli, "AssuranceHttpClient", FakeClient)
+
+    with pytest.raises(ValueError, match="repository HEAD"):
+        cli._perform_live_run(
+            repository=tmp_path,
+            repository_identity="acme/widget",
+            author="tester",
+            base_ref="main",
+            task_path=task,
+            policy_paths=(),
+            adr_paths=(),
+            runbook_paths=(),
+            command_ids=("diff-check",),
+            official_evidence_run_id=None,
+            changed_lines_total=None,
+            external_side_effects="none_declared",
+            provider_boundary="within_declared_boundary",
+            idempotency_key=None,
+            api_url="http://127.0.0.1:8010",
+        )
+
+    assert calls == []
+
+
+def test_explicit_idempotency_key_bypasses_default_head_and_is_verbatim(
+    monkeypatch, tmp_path
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("default idempotency key path must not run")
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def run_and_readback(self, _request, *, idempotency_key):
+            assert idempotency_key == ""
+            return {"ok": True}
+
+    monkeypatch.setattr(cli, "_git_output", fail_if_called)
+    monkeypatch.setattr(cli, "_idempotency_key", fail_if_called)
+    monkeypatch.setattr(cli, "AssuranceHttpClient", FakeClient)
+
+    cli._perform_live_run(
+        repository=tmp_path,
+        repository_identity="acme/widget",
+        author="tester",
+        base_ref="main",
+        task_path=task,
+        policy_paths=(),
+        adr_paths=(),
+        runbook_paths=(),
+        command_ids=("diff-check",),
+        official_evidence_run_id=None,
+        changed_lines_total=None,
+        external_side_effects="none_declared",
+        provider_boundary="within_declared_boundary",
+        idempotency_key="",
+        api_url="http://127.0.0.1:8010",
+    )
 
 
 def test_publish_case_command_uses_one_deep_module_and_returns_safe_receipt(monkeypatch, tmp_path):
