@@ -62,8 +62,6 @@ _DOCUMENT_ORDER = {"task_spec": 0, "policy": 1, "adr": 2, "runbook": 3}
 _ENTRY_BYTES = 60 * 1024
 _AGGREGATE_BYTES = 180 * 1024
 _REVIEWER_ID_BYTES = 256
-_STDOUT_BYTES = 4 * 1024
-_STDERR_BYTES = 12 * 1024
 _TRUNCATION_MARKER = "[TRUNCATED_AT_UTF8_LINE_BOUNDARY]"
 _UNTRUSTED_BOUNDARY = "UNTRUSTED_EVIDENCE_DATA_ONLY"
 
@@ -704,28 +702,6 @@ def _redact_tree(value: Any, *, key_hint: str | None = None) -> tuple[Any, bool]
     raise _error()
 
 
-def _truncate_lines(text: str, max_bytes: int) -> tuple[str, bool]:
-    raw = text.encode("utf-8")
-    if len(raw) <= max_bytes:
-        return text, False
-    marker_bytes = len(_TRUNCATION_MARKER.encode("utf-8"))
-    if max_bytes <= marker_bytes:
-        return _TRUNCATION_MARKER[:max_bytes], True
-    budget = max_bytes - marker_bytes - 1
-    used = 0
-    kept: list[str] = []
-    for line in text.splitlines(keepends=True):
-        encoded = line.encode("utf-8")
-        if used + len(encoded) > budget:
-            break
-        kept.append(line)
-        used += len(encoded)
-    prefix = "".join(kept)
-    if prefix and not prefix.endswith(("\n", "\r")):
-        prefix = ""
-    return prefix + _TRUNCATION_MARKER, True
-
-
 def _fit_payload(payload: dict[str, Any]) -> tuple[str, bool]:
     encoded = _canonical_json(payload)
     if len(encoded.encode("utf-8")) > _ENTRY_BYTES:
@@ -788,6 +764,30 @@ def _git_payload(
         )
     except (AttributeError, TypeError, ValueError, ValidationError, RecursionError):
         raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED) from None
+    if type(resolved) is not ResolvedEvidenceArtifacts:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    index = resolved.index
+    if type(index) is not AuthorizedArtifactIndex:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    top_level_references = tuple(
+        reference
+        for reference in index.artifacts
+        if reference.role == "top_level"
+    )
+    if len(top_level_references) != 1:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    top_level_reference = top_level_references[0]
+    if (
+        index.evidence_id != evidence.evidence_id
+        or index.evidence_kind != evidence.kind
+        or index.subject_digest != evidence.subject_digest
+        or index.top_level_digest != evidence.artifact_digest
+        or top_level_reference.kind != evidence.kind
+        or top_level_reference.digest != evidence.artifact_digest
+        or type(top_level_reference.byte_size) is not int
+        or top_level_reference.byte_size != snapshot.diff_bytes
+    ):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
     for path in snapshot.large_file_paths + snapshot.submodule_paths:
         _assert_path_safe(path)
     expected_omissions = tuple(
@@ -829,17 +829,6 @@ def _git_payload(
     ):
         raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
 
-    raw_diff = _resolved_bytes(resolved, evidence.artifact_digest)
-    if len(raw_diff) != snapshot.diff_bytes:
-        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
-    diff = _decode(raw_diff)
-    _assert_git_paths_safe(diff)
-    _assert_no_real_secret(diff)
-    redacted, changed = _redact_text(diff)
-    del redacted
-    if changed:
-        raise _UnsafeContent(RedactionDisposition.CONTAINS_UNREDACTED_CONTENT)
-
     changed_files = []
     for change in snapshot.changes:
         _assert_path_safe(change.path)
@@ -864,13 +853,14 @@ def _git_payload(
             "base_revision": snapshot.base_revision,
             "head_revision": snapshot.head_revision,
             "source": {
-                "digest": snapshot.diff_artifact_digest,
-                "size": snapshot.diff_bytes,
+                "digest": top_level_reference.digest,
+                "size": top_level_reference.byte_size,
             },
             "artifact": {
-                "digest": snapshot.diff_artifact_digest,
-                "size": snapshot.diff_bytes,
+                "digest": top_level_reference.digest,
+                "size": top_level_reference.byte_size,
             },
+            "raw_diff_included": False,
             "changed_files": changed_files,
             "changed_files_total": snapshot.changed_files_total,
             "diff_truncated": snapshot.diff_truncated,
@@ -975,6 +965,7 @@ def _git_truncated_payload(
         {
             "source": source,
             "artifact": artifact,
+            "raw_diff_included": False,
             "changed_files": changed_files,
             "changed_files_total": snapshot.changed_files_total,
             "diff_truncated": snapshot.diff_truncated,
@@ -1374,11 +1365,6 @@ def _intake_payload(
     }
 
 
-def _limited_output(data: bytes, limit: int) -> tuple[str, bool]:
-    text = _decode(data)
-    return _truncate_lines(text, limit)
-
-
 def _command_payload(
     resolved: ResolvedEvidenceArtifacts,
     evidence: Evidence,
@@ -1387,19 +1373,11 @@ def _command_payload(
     observations = sorted(
         index.command_observations, key=lambda item: item.command_id
     )
-    raw_ids = {
-        item.command_id
-        for item in [item for item in observations if item.outcome != "success"][:3]
-    }
     commands = []
-    display_truncated = False
+    output_truncated = False
     for observation in observations:
-        _assert_path_safe(observation.cwd)
-        _assert_argv_paths_safe(observation.argv)
         item: dict[str, Any] = {
-            "argv": list(observation.argv),
             "command_id": observation.command_id,
-            "cwd": observation.cwd,
             "duration_ms": observation.duration_ms,
             "exit_code": observation.exit_code,
             "kind": observation.kind,
@@ -1409,45 +1387,23 @@ def _command_payload(
             "stdout_bytes": observation.stdout_bytes,
             "stdout_truncated": observation.stdout_truncated,
         }
-        if observation.command_id in raw_ids:
-            stdout, stdout_truncated = _limited_output(
-                _resolved_bytes(
-                    resolved, observation.stdout_artifact_digest
-                ),
-                _STDOUT_BYTES,
-            )
-            stderr, stderr_truncated = _limited_output(
-                _resolved_bytes(
-                    resolved, observation.stderr_artifact_digest
-                ),
-                _STDERR_BYTES,
-            )
-            item["stdout_truncated"] = (
-                observation.stdout_truncated or stdout_truncated
-            )
-            item["stderr_truncated"] = (
-                observation.stderr_truncated or stderr_truncated
-            )
-            item["stdout"] = stdout
-            item["stderr"] = stderr
-            display_truncated = (
-                display_truncated or stdout_truncated or stderr_truncated
-            )
-        display_truncated = (
-            display_truncated
+        output_truncated = (
+            output_truncated
             or observation.stdout_truncated
             or observation.stderr_truncated
         )
         commands.append(item)
+    display_truncated = evidence.status == "truncated" or output_truncated
     return (
         _structured_envelope(
             evidence,
             {
                 "commands": commands,
+                "raw_streams_included": False,
             },
             complete=index.command_complete,
             truncated=display_truncated,
-            omissions=("output_truncated",) if display_truncated else (),
+            omissions=("output_truncated",) if output_truncated else (),
         ),
         display_truncated,
     )

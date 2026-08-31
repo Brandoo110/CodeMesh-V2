@@ -368,9 +368,10 @@ def test_real_artifacts_build_stable_bounded_context_and_omit_forbidden_data(
     command = json.loads(_by_kind(first)["command_batch"].content)
     commands = command["payload"]["commands"]
     assert [item["command_id"] for item in commands] == ["lint", "unit"]
-    assert commands[0]["stdout"] == "lint stdout\n"
-    assert commands[0]["stderr"] == "lint stderr\n"
-    assert "stdout" not in commands[1]
+    assert command["payload"]["raw_streams_included"] is False
+    assert all("stdout" not in item and "stderr" not in item for item in commands)
+    assert all(item["stdout_truncated"] is False for item in commands)
+    assert all(item["stderr_truncated"] is False for item in commands)
     intake = json.loads(_by_kind(first)["intake_documents"].content)
     runbook = next(
         item
@@ -418,7 +419,147 @@ def test_command_failure_projection_preserves_complete_snapshot_status(tmp_path)
     assert summary["truncated"] is False
 
 
-def test_only_first_three_sorted_failed_commands_expose_bounded_raw_output(tmp_path):
+def test_git_projection_uses_typed_metadata_without_reading_raw_diff(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    git = (
+        b"diff --git a/a.py b/a.py\n"
+        b"+absolute=/Users/alice/private/file.py\n"
+        b"+unc=\\\\server\\share\\SENTINEL_UNC\\a.py\n"
+        b"+url=file:///Users/alice/SENTINEL_FILE_URL/a.py\n"
+        b"+api_key=SENTINEL_RAW_GIT_SECRET\n"
+    )
+
+    entry = _by_kind(_prepare(store, _base_evidences(store, git=git)))[
+        "git_snapshot"
+    ]
+
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert entry.content is not None
+    payload = json.loads(entry.content)["payload"]
+    assert payload["raw_diff_included"] is False
+    assert payload["changed_files"][0]["path"] == "a.py"
+    assert "unified_diff" not in entry.content
+    for forbidden in (
+        "/Users/alice/private/file.py",
+        "SENTINEL_UNC",
+        "SENTINEL_FILE_URL",
+        "SENTINEL_RAW_GIT_SECRET",
+    ):
+        assert forbidden not in entry.content
+
+
+def test_git_projection_rejects_authorized_top_level_size_drift(
+    tmp_path, monkeypatch
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    original_resolve = reviewer_context_module.EvidenceArtifactResolver.resolve
+
+    def resolve(evidence, *, artifact_store, subject_digest):
+        resolved = original_resolve(
+            evidence,
+            artifact_store=artifact_store,
+            subject_digest=subject_digest,
+        )
+        if evidence.kind != "git_snapshot":
+            return resolved
+        top_level = resolved.index.artifacts[0]
+        forged_reference = top_level.model_copy(
+            update={"byte_size": top_level.byte_size + 1}
+        )
+        forged_index = resolved.index.model_copy(
+            update={"artifacts": (forged_reference,)}
+        )
+        return resolved.model_copy(update={"index": forged_index})
+
+    monkeypatch.setattr(
+        reviewer_context_module.EvidenceArtifactResolver,
+        "resolve",
+        staticmethod(resolve),
+    )
+
+    entry = _by_kind(_prepare(store, _base_evidences(store)))["git_snapshot"]
+
+    assert entry.disposition is RedactionDisposition.NOT_ASSESSED
+    assert entry.content is None
+
+
+def test_command_projection_omits_runtime_argv_and_cwd(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path / "artifacts")
+    runtime_cwd = "/Users/junjieli/CodeMesh-v2-dogfood-workspace/handover-experience"
+    runtime_argv = (
+        "/Users/junjieli/miniconda3/bin/python",
+        "-m",
+        "pytest",
+        runtime_cwd + "/tests/test_assurance_reviewer_context.py",
+    )
+    baseline = _observation(
+        store,
+        "unit",
+        "failure",
+        stdout=b"failure output\n",
+        stderr=b"failure error\n",
+    )
+    observation = baseline.model_copy(
+        update={"argv": runtime_argv, "cwd": runtime_cwd}
+    )
+    original_resolve = reviewer_context_module.EvidenceArtifactResolver.resolve
+    stream_digests = {
+        baseline.stdout_artifact_digest,
+        baseline.stderr_artifact_digest,
+    }
+    original_resolved_bytes = reviewer_context_module._resolved_bytes
+
+    def resolve(evidence, *, artifact_store, subject_digest):
+        resolved = original_resolve(
+            evidence,
+            artifact_store=artifact_store,
+            subject_digest=subject_digest,
+        )
+        if evidence.kind != "command_batch":
+            return resolved
+        forged_index = resolved.index.model_copy(
+            update={"command_observations": (observation,)}
+        )
+        return resolved.model_copy(update={"index": forged_index})
+
+    monkeypatch.setattr(
+        reviewer_context_module.EvidenceArtifactResolver,
+        "resolve",
+        staticmethod(resolve),
+    )
+
+    def fail_stream_read(resolved, digest):
+        if digest in stream_digests:
+            raise AssertionError("command projection read a raw stream artifact")
+        return original_resolved_bytes(resolved, digest)
+
+    monkeypatch.setattr(
+        reviewer_context_module, "_resolved_bytes", fail_stream_read
+    )
+
+    entry = _by_kind(
+        _prepare(
+            store,
+            _base_evidences(
+                store,
+                observations=(baseline,),
+                command_status="failure",
+            ),
+        )
+    )["command_batch"]
+
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert entry.content is not None
+    assert json.loads(entry.content)["payload"]["raw_streams_included"] is False
+    command = json.loads(entry.content)["payload"]["commands"][0]
+    assert "argv" not in command
+    assert "cwd" not in command
+    assert runtime_cwd not in entry.content
+    for argument in runtime_argv:
+        assert argument not in entry.content
+
+
+def test_command_projection_omits_all_raw_output_even_for_failed_commands(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     observations = tuple(
         _observation(
@@ -437,15 +578,14 @@ def test_only_first_three_sorted_failed_commands_expose_bounded_raw_output(tmp_p
         ),
     )
     entry = _by_kind(plan)["command_batch"]
-    commands = json.loads(entry.content)["payload"]["commands"]
+    payload = json.loads(entry.content)["payload"]
+    commands = payload["commands"]
     assert [item["command_id"] for item in commands] == ["a", "b", "c", "d"]
-    assert all("stdout" in item and "stderr" in item for item in commands[:3])
-    assert "stdout" not in commands[3] and "stderr" not in commands[3]
-    assert len(commands[0]["stdout"].encode()) <= 4 * 1024
-    assert len(commands[0]["stderr"].encode()) <= 12 * 1024
-    assert commands[0]["stdout_truncated"] is True
-    assert commands[0]["stderr_truncated"] is True
-    assert entry.truncated is True
+    assert payload["raw_streams_included"] is False
+    assert all("stdout" not in item and "stderr" not in item for item in commands)
+    assert all(item["stdout_truncated"] is False for item in commands)
+    assert all(item["stderr_truncated"] is False for item in commands)
+    assert entry.truncated is False
 
 
 def test_truncated_evidence_is_not_assessed_without_reading_missing_artifact(tmp_path):
@@ -522,6 +662,7 @@ def test_truncated_git_uses_bounded_structured_projection(tmp_path):
     assert entry.truncated is True
     payload = json.loads(entry.content)
     assert payload["payload"]["truncated"] is True
+    assert payload["payload"]["raw_diff_included"] is False
     assert payload["payload"]["artifact"]["digest"] == digest
     assert payload["payload"]["artifact"]["size"] == 123
     assert payload["payload"]["source"]["digest"] == digest
@@ -591,9 +732,11 @@ def test_git_projection_rejects_stale_changed_file_count(tmp_path):
             "truncated",
             {"complete": False, "omissions": ("diff_truncated",)},
         ),
+        ("success", {"subject_digest": "sha256:" + "9" * 64}),
+        ("success", {"diff_artifact_digest": "sha256:" + "9" * 64}),
     ),
 )
-def test_git_projection_rejects_inconsistent_truncation_flags(
+def test_git_projection_rejects_inconsistent_binding_or_truncation_flags(
     tmp_path, monkeypatch, evidence_status, snapshot_update
 ):
     store = ArtifactStore(tmp_path / "artifacts")
@@ -698,6 +841,62 @@ def test_git_projection_checks_summary_path_lists_for_sensitive_paths(
     assert ".pem" not in repr(entry)
 
 
+@pytest.mark.parametrize(
+    "dangerous_path",
+    (
+        "/Users/alice/private/file.py",
+        r"\\server\share\SENTINEL_UNC\a.py",
+        "file:///Users/alice/SENTINEL_FILE_URL/a.py",
+        ".env",
+    ),
+)
+def test_git_projection_rejects_dangerous_typed_change_paths(
+    tmp_path, monkeypatch, dangerous_path
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    evidences = list(_base_evidences(store))
+    evidences[0] = evidences[0].model_copy(update={"status": "truncated"})
+    digest = evidences[0].artifact_digest
+    safe_change = GitChange(
+        path="a.py",
+        status="modified",
+        current_size=12,
+        current_digest="sha256:" + "2" * 64,
+    )
+    forged_change = safe_change.model_copy(update={"path": dangerous_path})
+    snapshot = GitSnapshot(
+        subject_digest=SUBJECT,
+        repository="example/service",
+        base_revision="a" * 40,
+        head_revision="b" * 40,
+        worktree_dirty=True,
+        changes=(safe_change,),
+        changed_files_total=1,
+        diff_artifact_digest=digest,
+        diff_bytes=len(store.get_bytes(digest)),
+        diff_truncated=True,
+        files_truncated=False,
+        ignored_files_lower_bound=0,
+        ignored_scan_truncated=False,
+        omissions=("diff_truncated",),
+        complete=False,
+        collected_at=NOW,
+    )
+    forged = snapshot.model_copy(update={"changes": (forged_change,)})
+    monkeypatch.setattr(
+        reviewer_context_module.GitSnapshot,
+        "model_validate",
+        classmethod(lambda _cls, _value: forged),
+    )
+
+    entry = _by_kind(
+        _prepare(store, tuple(evidences), git_snapshot=snapshot)
+    )["git_snapshot"]
+
+    assert entry.disposition is RedactionDisposition.CONTAINS_UNREDACTED_CONTENT
+    assert entry.content is None
+
+
 def test_command_projection_preserves_upstream_output_truncation(
     tmp_path,
 ):
@@ -746,6 +945,10 @@ def test_command_projection_preserves_upstream_output_truncation(
     assert display_truncated is True
     assert payload["payload"]["truncated"] is True
     assert payload["payload"]["omissions"] == ["output_truncated"]
+    assert payload["payload"]["complete"] is False
+    assert payload["payload"]["raw_streams_included"] is False
+    assert "stdout" not in payload["payload"]["commands"][0]
+    assert "stderr" not in payload["payload"]["commands"][0]
     assert payload["payload"]["commands"][0]["stdout_truncated"] is True
     assert payload["payload"]["commands"][0]["stderr_truncated"] is True
 
@@ -789,69 +992,33 @@ def test_api_contract_is_bounded_and_redacted_before_reviewer_context(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("git", "expected"),
+    "git",
     (
-        (
-            b"diff --git a/a.py b/a.py\n+api_key=supersecretvalue\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/a.py b/a.py\n+/Users/alice/private/file.py\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/a.py b/a.py\n+/root/private/file.py\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/a.py b/a.py\n+/Library/Application Support/CodeMesh/cache.json\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/a.py b/a.py\n+path=\\\\server\\share\\SENTINEL_UNC\\a.py\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/a.py b/a.py\n+C:\\Users\\alice\\SENTINEL_WINDOWS\\a.py\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/a.py b/a.py\n+file:///Users/alice/SENTINEL_FILE_URL/a.py\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/.env b/.env\n+TOKEN=secret\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/.git-credentials b/.git-credentials\n+secret\n",
-            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        ),
-        (
-            b"diff --git a/a.py b/a.py\n+\x1b[31mred\x1b[0m\n",
-            RedactionDisposition.NOT_ASSESSED,
-        ),
-        (
-            b"\xff\xfe\x00\x01",
-            RedactionDisposition.NOT_ASSESSED,
-        ),
+        b"diff --git a/a.py b/a.py\n+api_key=supersecretvalue\n",
+        b"diff --git a/a.py b/a.py\n+/Users/alice/private/file.py\n",
+        b"diff --git a/a.py b/a.py\n+/root/private/file.py\n",
+        b"diff --git a/a.py b/a.py\n+/Library/Application Support/CodeMesh/cache.json\n",
+        b"diff --git a/a.py b/a.py\n+path=\\\\server\\share\\SENTINEL_UNC\\a.py\n",
+        b"diff --git a/a.py b/a.py\n+C:\\Users\\alice\\SENTINEL_WINDOWS\\a.py\n",
+        b"diff --git a/a.py b/a.py\n+file:///Users/alice/SENTINEL_FILE_URL/a.py\n",
+        b"diff --git a/.env b/.env\n+TOKEN=secret\n",
+        b"diff --git a/.git-credentials b/.git-credentials\n+secret\n",
+        b"diff --git a/a.py b/a.py\n+\x1b[31mred\x1b[0m\n",
+        b"\xff\xfe\x00\x01",
     ),
 )
-def test_scanner_redacts_or_blocks_without_leaking_raw_value(tmp_path, git, expected):
+def test_raw_git_diff_is_not_projected_or_scanned(tmp_path, git):
     store = ArtifactStore(tmp_path / "artifacts")
     entry = _by_kind(_prepare(store, _base_evidences(store, git=git)))[
         "git_snapshot"
     ]
-    assert entry.disposition is expected
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert entry.content is not None
     serialized = entry.model_dump_json()
     assert "supersecretvalue" not in serialized
     assert "/Users/alice/private/file.py" not in serialized
     assert "SENTINEL_UNC" not in serialized
-    if expected in {
-        RedactionDisposition.CONTAINS_UNREDACTED_CONTENT,
-        RedactionDisposition.NOT_ASSESSED,
-    }:
-        assert entry.content is None
+    assert "unified_diff" not in serialized
 
 
 def test_prompt_injection_remains_inert_framed_data(tmp_path):
@@ -1307,7 +1474,7 @@ def test_artifact_preparation_failure_exposes_validated_kind_without_leaks(
         '+config.password = "SENTINEL NESTED PASSWORD"',
     ),
 )
-def test_high_confidence_secret_variants_are_redacted_from_plan_repr(
+def test_raw_git_secret_variants_are_not_projected(
     tmp_path, secret_line
 ):
     store = ArtifactStore(tmp_path / "artifacts")
@@ -1315,8 +1482,8 @@ def test_high_confidence_secret_variants_are_redacted_from_plan_repr(
     entry = _by_kind(_prepare(store, _base_evidences(store, git=git)))[
         "git_snapshot"
     ]
-    assert entry.disposition is RedactionDisposition.CONTAINS_UNREDACTED_CONTENT
-    assert entry.content is None
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert entry.content is not None
     assert "SENTINEL" not in repr(entry)
     assert "ASIAABCDEFGHIJKLMNOP" not in repr(entry)
     assert "YWJjZGVmZ2hp.amtsbW5vcHFyc3Q.dXZ3eHl6MDEyMzQ" not in repr(entry)
@@ -1336,23 +1503,19 @@ def test_high_confidence_secret_variants_are_redacted_from_plan_repr(
         "binary-file\npath: .env",
     ),
 )
-def test_non_text_stack_and_private_key_payloads_are_blocked(tmp_path, unsafe_line):
+def test_raw_git_non_text_payloads_are_not_projected(tmp_path, unsafe_line):
     store = ArtifactStore(tmp_path / "artifacts")
     git = f"diff --git a/a.py b/a.py\n{unsafe_line}\n".encode()
     entry = _by_kind(_prepare(store, _base_evidences(store, git=git)))[
         "git_snapshot"
     ]
-    expected = (
-        RedactionDisposition.CONTAINS_UNREDACTED_CONTENT
-        if "PRIVATE KEY" in unsafe_line
-        else RedactionDisposition.NOT_ASSESSED
-    )
-    assert entry.disposition is expected
-    assert entry.content is None
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert entry.content is not None
+    assert unsafe_line not in repr(entry)
 
 
 @pytest.mark.parametrize("indicator", (">", "|2-"))
-def test_yaml_multiline_secret_assignment_blocks_entire_evidence(
+def test_raw_git_multiline_secret_is_not_projected(
     tmp_path, indicator
 ):
     store = ArtifactStore(tmp_path / "artifacts")
@@ -1364,14 +1527,12 @@ def test_yaml_multiline_secret_assignment_blocks_entire_evidence(
     entry = _by_kind(_prepare(store, _base_evidences(store, git=git)))[
         "git_snapshot"
     ]
-    assert entry.disposition is (
-        RedactionDisposition.CONTAINS_UNREDACTED_CONTENT
-    )
-    assert entry.content is None
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert entry.content is not None
     assert "SENTINEL_MULTILINE_SECRET" not in repr(entry)
 
 
-def test_structured_metadata_and_split_argv_secrets_are_redacted(tmp_path):
+def test_structured_metadata_is_redacted_and_runtime_argv_is_omitted(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     command = _observation(
         store,
@@ -1393,7 +1554,7 @@ def test_structured_metadata_and_split_argv_secrets_are_redacted(tmp_path):
     assert "SENTINEL_ARGV_SECRET" not in repr(plan)
     assert "SENTINEL_METADATA_SECRET" not in repr(plan)
     assert _by_kind(plan)["command_batch"].disposition is (
-        RedactionDisposition.DECLARED_REDACTED
+        RedactionDisposition.NOT_APPLICABLE
     )
     assert _by_kind(plan)["intake_documents"].disposition is (
         RedactionDisposition.DECLARED_REDACTED
@@ -1517,7 +1678,9 @@ def test_prepare_parses_each_authoritative_closure_once(tmp_path, monkeypatch):
     assert len(set(calls["digests"])) == 9
 
 
-def test_reviewer_context_uses_bounded_structured_git_projection(tmp_path):
+def test_reviewer_context_uses_bounded_structured_git_projection(
+    tmp_path, monkeypatch
+):
     store = ArtifactStore(tmp_path / "artifacts")
     git = (
         b"diff --git a/frontend/components/AssuranceView.tsx "
@@ -1526,6 +1689,17 @@ def test_reviewer_context_uses_bounded_structured_git_projection(tmp_path):
     )
     evidences = _base_evidences(store, git=git)
     git_digest = evidences[0].artifact_digest
+    original_resolved_bytes = reviewer_context_module._resolved_bytes
+
+    def fail_git_raw_read(resolved, digest):
+        if digest == git_digest:
+            raise AssertionError("Git projection read raw CAS bytes")
+        return original_resolved_bytes(resolved, digest)
+
+    monkeypatch.setattr(
+        reviewer_context_module, "_resolved_bytes", fail_git_raw_read
+    )
+
     snapshot = GitSnapshot(
         subject_digest=SUBJECT,
         repository="example/service",
@@ -1566,6 +1740,7 @@ def test_reviewer_context_uses_bounded_structured_git_projection(tmp_path):
         "omissions": [],
         "subject_digest": SUBJECT,
     }
+    assert payload["payload"]["raw_diff_included"] is False
     assert "unified_diff" not in payload["payload"]
     assert payload["payload"]["changed_files"] == [
         {
