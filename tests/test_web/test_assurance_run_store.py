@@ -2,13 +2,16 @@
 
 import asyncio
 import base64
+from dataclasses import replace
 import hashlib
+import io
 import json
 import shutil
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Barrier
+import zipfile
 
 import pytest
 import assurance.run_service as run_service_module
@@ -23,6 +26,7 @@ from assurance.live_freshness import FreshnessStatus, LiveFreshness
 from tests.test_assurance_run_service import _Reviewer, _service
 from tests.test_assurance_run_service import _FakeOfficialImporter
 from assurance.run_service import AssuranceRunResult
+from assurance.official_evidence import parse_official_evidence_receipt
 from tests.test_assurance_remediation import _FakeExecutor
 from tests.test_assurance_remediation_reviewer import (
     _FindingReviewer,
@@ -35,7 +39,11 @@ from web.assurance_store import (
     AssuranceWebError,
     AssuranceWebRepository,
 )
-from web.assurance_run_committer import _json_digest, _source_binding_json
+from web.assurance_run_committer import (
+    AssuranceRunPersistenceError,
+    _json_digest,
+    _source_binding_json,
+)
 
 
 def _durable_service(tmp_path):
@@ -53,6 +61,161 @@ def _db_rows(repository: AssuranceWebRepository, query: str):
         return conn.execute(query).fetchall()
     finally:
         conn.close()
+
+
+def _bytes_digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _raw_external_official_fixture(bundle, proofs):
+    """Make real-shaped non-canonical report/result members for validator tests."""
+
+    raw_members = {}
+    receipts = {}
+    raw_payloads = {}
+    receipt_digests = {}
+    with zipfile.ZipFile(io.BytesIO(proofs[0].artifact_bytes)) as archive:
+        members = {
+            info.filename: archive.read(info.filename)
+            for info in archive.infolist()
+        }
+    for proof in proofs:
+        receipt = parse_official_evidence_receipt(proof.receipt_bytes)
+        report_name = (
+            "dependency_audit.json"
+            if proof.kind == "dependency_audit"
+            else "ci_iac_validation.json"
+        )
+        result_name = (
+            "dependency-audit-result.json"
+            if proof.kind == "dependency_audit"
+            else "ci-iac-result.json"
+        )
+        raw_result = b"\n" + members[result_name]
+        report = receipt.report.model_copy(
+            update={
+                "result_digest": _bytes_digest(raw_result),
+                "result_byte_size": len(raw_result),
+            }
+        )
+        raw_report = b"\n" + json.dumps(
+            report.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        receipt = receipt.model_copy(
+            update={
+                "report": report,
+                "report_digest": _bytes_digest(raw_report),
+                "report_byte_size": len(raw_report),
+                "result_digest": _bytes_digest(raw_result),
+                "result_byte_size": len(raw_result),
+            }
+        )
+        receipts[proof.kind] = receipt
+        raw_payloads[proof.kind] = (raw_report, raw_result)
+        raw_members[report_name] = raw_report
+        raw_members[result_name] = raw_result
+
+    members.update(raw_members)
+    artifact_buffer = io.BytesIO()
+    with zipfile.ZipFile(
+        artifact_buffer, "w", compression=zipfile.ZIP_DEFLATED
+    ) as artifact:
+        for name, data in members.items():
+            artifact.writestr(name, data)
+    artifact_bytes = artifact_buffer.getvalue()
+    artifact_digest = _bytes_digest(artifact_bytes)
+    raw_proofs = []
+    for proof in proofs:
+        raw_report, raw_result = raw_payloads[proof.kind]
+        receipt = receipts[proof.kind].model_copy(
+            update={
+                "artifact_digest": artifact_digest,
+                "artifact_byte_size": len(artifact_bytes),
+            }
+        )
+        receipt_bytes = json.dumps(
+            receipt.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        raw_proofs.append(
+            replace(
+                proof,
+                artifact_digest=artifact_digest,
+                artifact_byte_size=len(artifact_bytes),
+                artifact_bytes=artifact_bytes,
+                receipt_digest=_bytes_digest(receipt_bytes),
+                receipt_byte_size=len(receipt_bytes),
+                receipt_bytes=receipt_bytes,
+                report_digest=_bytes_digest(raw_report),
+                report_byte_size=len(raw_report),
+                report_bytes=raw_report,
+                result_digest=_bytes_digest(raw_result),
+                result_byte_size=len(raw_result),
+                result_bytes=raw_result,
+            )
+        )
+        receipt_digests[proof.evidence_id] = _bytes_digest(receipt_bytes)
+
+    evidence = tuple(
+        item.model_copy(
+            update={"artifact_digest": receipt_digests[item.evidence_id]}
+        )
+        if item.evidence_id in receipt_digests
+        else item
+        for item in bundle.evidence
+    )
+    entries = tuple(
+        entry.model_copy(
+            update={"artifact_digest": receipt_digests[entry.evidence_id]}
+        )
+        if entry.evidence_id in receipt_digests
+        else entry
+        for entry in bundle.manifest.manifest.entries
+    )
+    manifest = bundle.manifest.model_copy(
+        update={
+            "manifest": bundle.manifest.manifest.model_copy(
+                update={"entries": entries}
+            )
+        }
+    )
+    return bundle.model_copy(update={"evidence": evidence, "manifest": manifest}), tuple(
+        raw_proofs
+    )
+
+
+def test_official_proof_validator_accepts_raw_external_members(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    prepared = asyncio.run(
+        service._prepare_bundle(
+            intent,
+            idempotency_key="run:raw-external-members",
+            request_digest=service._request_digest(intent),
+            with_proofs=True,
+        )
+    )
+    bundle, proofs = _raw_external_official_fixture(*prepared)
+
+    assert all(
+        proof.report_bytes.startswith(b"\n")
+        and proof.result_bytes.startswith(b"\n")
+        for proof in proofs
+    )
+    rows = repository._validate_official_commit_proofs(bundle, proofs)
+
+    assert len(rows) == 2
 
 
 class _FreshnessFixture:

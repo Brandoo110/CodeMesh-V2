@@ -2534,19 +2534,14 @@ class AssuranceWebRepository:
                 canonical_receipt = _canonical_json(
                     receipt.model_dump(mode="json")
                 ).encode("utf-8")
-                canonical_report = _canonical_json(
-                    report.model_dump(mode="json")
-                ).encode("utf-8")
-                canonical_result = _canonical_json(result).encode("utf-8")
             except (TypeError, ValueError, UnicodeEncodeError) as exc:
                 raise AssuranceRunPersistenceError(
                     "official proof bytes cannot be canonically serialized"
                 ) from exc
-            if (
-                proof.receipt_bytes != canonical_receipt
-                or proof.report_bytes != canonical_report
-                or proof.result_bytes != canonical_result
-            ):
+            # The trusted internal receipt remains canonical.  Report/result
+            # members are provider-owned raw JSON; typed equality and the ZIP
+            # member check below retain their semantic and byte binding.
+            if proof.receipt_bytes != canonical_receipt:
                 raise AssuranceRunPersistenceError(
                     "official proof bytes are not canonical"
                 )
