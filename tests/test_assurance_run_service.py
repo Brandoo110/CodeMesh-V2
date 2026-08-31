@@ -141,9 +141,10 @@ class _ContextBuilder:
 
 
 class _Reviewer:
-    def __init__(self, status="success", questions=False):
+    def __init__(self, status="success", questions=False, empty_findings=False):
         self.status = status
         self.questions = questions
+        self.empty_findings = empty_findings
         self.calls = 0
 
     async def invoke(self, prompt, *, run_id, route):
@@ -174,7 +175,19 @@ class _Reviewer:
             "schema_version": "v1",
             "subject_digest": prompt.input.subject.subject_digest,
             "rubric_hash": prompt.rubric_hash,
-            "findings": [],
+            "findings": (
+                []
+                if self.empty_findings
+                else [
+                    {
+                        "reviewer_role": "intent",
+                        "claim": "The acceptance scope is documented.",
+                        "evidence_refs": [prompt.input.contexts[0].evidence_id],
+                        "severity": "low",
+                        "confidence": 0.5,
+                    }
+                ]
+            ),
             "questions": list(questions),
         }
         return ReviewerInvocationResponse(
@@ -1313,6 +1326,88 @@ def test_new_safe_reviewer_failure_stage_is_durable_without_raw_transport_data(t
         assert secret not in serialized
 
 
+@pytest.mark.parametrize(
+    "failure_category",
+    (
+        "auth",
+        "rate_or_quota",
+        "model_availability",
+        "network_or_transport",
+        "provider_or_server",
+        "permission_or_policy",
+    ),
+)
+def test_categorized_nonzero_failure_stays_generic_and_blocks_persistence(
+    tmp_path, failure_category
+):
+    class _CategorizedFailureReviewer:
+        async def invoke(self, prompt, *, run_id, route):
+            return ReviewerInvocationResponse(
+                status="failure",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                error_code="REVIEWER_PROCESS_NONZERO_EXIT",
+                failure_category=failure_category,
+            )
+
+    service, intent = _service(tmp_path, reviewer=_CategorizedFailureReviewer())
+    result = asyncio.run(
+        service.run(intent, idempotency_key="run-categorized-" + failure_category)
+    )
+
+    assert result.bundle.reviewer.status == "failure"
+    assert result.bundle.reviewer.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert all(
+        step.fallback_reason == failure_category
+        for step in result.bundle.execution_receipt.steps
+    )
+    assert all(step.schema_status == "not_produced" for step in result.bundle.execution_receipt.steps)
+    serialized = json.dumps(result.model_dump(mode="json"), sort_keys=True)
+    assert "REVIEWER_PROCESS_NONZERO_EXIT" not in serialized
+
+
+def test_unknown_category_preserves_historical_nonzero_receipt_stage(tmp_path):
+    class _UnknownFailureReviewer:
+        async def invoke(self, prompt, *, run_id, route):
+            return ReviewerInvocationResponse(
+                status="failure",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                error_code="REVIEWER_PROVIDER_FAILURE",
+                failure_category="unknown",
+            )
+
+    service, intent = _service(tmp_path, reviewer=_UnknownFailureReviewer())
+    result = asyncio.run(
+        service.run(intent, idempotency_key="run-unknown-category")
+    )
+
+    assert result.bundle.reviewer.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert all(
+        step.fallback_reason == "nonzero_exit"
+        for step in result.bundle.execution_receipt.steps
+    )
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+
+
+def test_empty_reviewer_findings_are_blocked_not_published(tmp_path):
+    service, intent = _service(tmp_path, reviewer=_Reviewer(empty_findings=True))
+
+    result = asyncio.run(
+        service.run(intent, idempotency_key="run-empty-findings")
+    )
+
+    assert result.bundle.reviewer.status == "failure"
+    assert result.bundle.reviewer.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert result.bundle.execution_receipt.overall_result == "failure"
+    assert all(
+        step.fallback_reason == "empty_findings"
+        for step in result.bundle.execution_receipt.steps
+    )
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+
+
 @pytest.mark.parametrize("variant", ["timeout", "cancelled", "invalid_json", "blocked", "failure_valid"])
 def test_reviewer_record_enforces_exact_status_error_and_fact_combinations(tmp_path, variant):
     service, intent = _service(tmp_path)
@@ -1489,7 +1584,15 @@ def test_unverified_transport_is_normalized_before_persisting_valid(tmp_path):
                 "schema_version": "v1",
                 "subject_digest": prompt.input.subject.subject_digest,
                 "rubric_hash": prompt.rubric_hash,
-                "findings": [],
+                "findings": [
+                    {
+                        "reviewer_role": "intent",
+                        "claim": "The acceptance scope is documented.",
+                        "evidence_refs": [prompt.input.contexts[0].evidence_id],
+                        "severity": "low",
+                        "confidence": 0.5,
+                    }
+                ],
                 "questions": [],
             }
             return ReviewerInvocationResponse(

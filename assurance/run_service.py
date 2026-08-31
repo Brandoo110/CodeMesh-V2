@@ -142,6 +142,20 @@ _REVIEWER_FAILURE_STAGE_CODES = MappingProxyType(
         "final_schema_invalid": "REVIEWER_RESPONSE_SCHEMA_INVALID",
     }
 )
+_REVIEWER_FAILURE_CATEGORIES = frozenset(
+    {
+        "auth",
+        "rate_or_quota",
+        "model_availability",
+        "network_or_transport",
+        "provider_or_server",
+        "permission_or_policy",
+        "unknown",
+    }
+)
+_REVIEWER_CLASSIFIED_FAILURE_CATEGORIES = frozenset(
+    _REVIEWER_FAILURE_CATEGORIES - {"unknown"}
+)
 _REVIEWER_FAILURE_CODE_FACTS = {
     code: ("REVIEWER_PROVIDER_FAILURE", stage)
     for stage, code in _REVIEWER_FAILURE_STAGE_CODES.items()
@@ -798,6 +812,15 @@ class ReviewerInvocationResponse(BaseModel):
     ] = "not_produced"
     error_code: str | None = Field(default=None, min_length=1)
     error_message: str | None = Field(default=None, min_length=1)
+    failure_category: Literal[
+        "auth",
+        "rate_or_quota",
+        "model_availability",
+        "network_or_transport",
+        "provider_or_server",
+        "permission_or_policy",
+        "unknown",
+    ] | None = None
 
     @field_validator("raw_response", mode="before")
     @classmethod
@@ -819,7 +842,11 @@ class ReviewerInvocationResponse(BaseModel):
                 raise ValueError("transport success must be unverified")
             if self.raw_response is None or not self.raw_response:
                 raise ValueError("transport success requires nonempty raw_response")
-            if self.error_code is not None or self.error_message is not None:
+            if (
+                self.error_code is not None
+                or self.error_message is not None
+                or self.failure_category is not None
+            ):
                 raise ValueError("transport success must not carry error facts")
         else:
             if self.raw_response is not None:
@@ -830,6 +857,16 @@ class ReviewerInvocationResponse(BaseModel):
                 raise ValueError("reviewer status and error_code do not match")
             if self.error_message is not None:
                 raise ValueError("reviewer error_message is not a domain fact")
+            if self.failure_category is not None:
+                if self.status != "failure":
+                    raise ValueError("failure category is only valid for nonzero failure")
+                if self.error_code not in {
+                    "REVIEWER_PROVIDER_FAILURE",
+                    _REVIEWER_FAILURE_STAGE_CODES["nonzero_exit"],
+                }:
+                    raise ValueError("failure category requires a nonzero-exit code")
+                if self.failure_category not in _REVIEWER_FAILURE_CATEGORIES:
+                    raise ValueError("failure category is not a stable enum value")
         usage_values = (self.input_tokens, self.output_tokens, self.cost_usd)
         if self.usage_status == "measured" and any(
             value is None for value in usage_values
@@ -2379,6 +2416,13 @@ class AssuranceRunService:
             if response_error_code not in _REVIEWER_STATUS_ERROR_CODES[response.status]:
                 response_error_code = _REVIEWER_FAILURE_CODES[response.status]
                 failure_stage = None
+            if response.failure_category in _REVIEWER_CLASSIFIED_FAILURE_CATEGORIES:
+                failure_stage = response.failure_category
+            elif (
+                response.failure_category == "unknown"
+                and response.error_code == "REVIEWER_PROVIDER_FAILURE"
+            ):
+                failure_stage = "nonzero_exit"
             receipt = self._failure_receipt(
                 run_id=run_id,
                 subject_digest=subject.subject_digest,
@@ -2488,6 +2532,41 @@ class AssuranceRunService:
                 self._artifact_store,
             )
             self._require_type(normalized, SingleReviewerResult, "reviewer normalization result")
+            if not normalized.findings:
+                receipt = self._failure_receipt(
+                    run_id=run_id,
+                    subject_digest=subject.subject_digest,
+                    status="failure",
+                    route=self._config.reviewer_route,
+                    started_at=started,
+                    completed_at=completed,
+                    actual_provider=actual_provider,
+                    actual_model_ref=actual_model_ref,
+                    input_tokens=self._usage_value(response, "input_tokens") or 0,
+                    output_tokens=self._usage_value(response, "output_tokens") or 0,
+                    cost_usd=self._usage_value(response, "cost_usd") or 0.0,
+                    fallback_reason="empty_findings",
+                )
+                return (
+                    ReviewerRunRecord(
+                        status="failure",
+                        planned_route=self._config.reviewer_route,
+                        rubric_version=self._config.rubric_version,
+                        prompt_id=prompt.prompt_id,
+                        prompt_digest=prompt.prompt_digest,
+                        actual_provider=actual_provider,
+                        actual_model_ref=actual_model_ref,
+                        schema_status="not_produced",
+                        usage_status=self._usage_status(response),
+                        input_tokens=self._usage_value(response, "input_tokens"),
+                        output_tokens=self._usage_value(response, "output_tokens"),
+                        cost_usd=self._usage_value(response, "cost_usd"),
+                        error_code="REVIEWER_PROVIDER_FAILURE",
+                    ),
+                    (),
+                    normalized.questions,
+                    receipt,
+                )
             receipt = self._bind_success_receipt_route(normalized.execution_receipt)
             return (
                 ReviewerRunRecord(

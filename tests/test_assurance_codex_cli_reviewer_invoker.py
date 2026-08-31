@@ -8,7 +8,7 @@ import pytest
 
 import assurance.codex_cli_reviewer_invoker as codex_module
 from assurance.codex_cli_reviewer_invoker import CodexCliReviewerInvoker
-from assurance.run_service import ReviewerRoute
+from assurance.run_service import ReviewerInvocationResponse, ReviewerRoute
 
 
 def _route(**updates):
@@ -645,6 +645,170 @@ def test_nonzero_exit_exposes_only_fixed_safe_failure_code(tmp_path, monkeypatch
     assert result.status == "failure"
     assert result.error_code == "REVIEWER_PROCESS_NONZERO_EXIT"
     assert result.raw_response is None
+
+
+@pytest.mark.parametrize(
+    ("signal_text", "expected_category"),
+    (
+        ("authentication required: please log in", "auth"),
+        ("rate limit exceeded for this account", "rate_or_quota"),
+        ("model not found: gpt-5.6-luna", "model_availability"),
+        ("network connection refused by transport", "network_or_transport"),
+        ("provider internal server error", "provider_or_server"),
+        ("permission denied by policy", "permission_or_policy"),
+        ("cli failed without a known reason", "unknown"),
+    ),
+)
+def test_nonzero_exit_classifies_bounded_stderr_to_fixed_category(
+    tmp_path, monkeypatch, signal_text, expected_category
+):
+    process = _FakeProcess(
+        stdout=b"",
+        stderr=signal_text.encode("utf-8"),
+        returncode=17,
+    )
+    _install_launcher(monkeypatch, process, final=None)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-classified-nonzero", route=_route())
+    )
+
+    assert result.status == "failure"
+    assert result.error_code == "REVIEWER_PROCESS_NONZERO_EXIT"
+    assert result.failure_category == expected_category
+    assert result.raw_response is None
+    assert result.error_message is None
+
+
+def test_nonzero_failure_category_uses_explicit_precedence_for_mixed_signals(
+    tmp_path, monkeypatch
+):
+    process = _FakeProcess(
+        stderr=(
+            b"permission denied; rate limit exceeded; authentication required; "
+            b"network connection reset"
+        ),
+        returncode=17,
+    )
+    _install_launcher(monkeypatch, process, final=None)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-classified-precedence", route=_route())
+    )
+
+    assert result.failure_category == "auth"
+
+
+def test_structured_jsonl_failure_reads_only_allowlisted_fields(
+    tmp_path, monkeypatch
+):
+    event = json.dumps(
+        {
+            "type": "error",
+            "code": "AUTH_REQUIRED",
+            "status": "failed",
+            "message": "authentication required",
+            "details": {
+                "secret": "token=do-not-leak",
+                "path": "/private/hidden/provider-output",
+            },
+        },
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    process = _FakeProcess(stdout=event, returncode=17)
+    _install_launcher(monkeypatch, process, final=None)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-structured-failure", route=_route())
+    )
+
+    assert result.failure_category == "auth"
+    serialized = json.dumps(result.model_dump(mode="json"), sort_keys=True)
+    assert "do-not-leak" not in serialized
+    assert "/private/hidden/provider-output" not in serialized
+
+
+def test_failure_classification_invalid_utf8_is_unknown_and_bounded(
+    tmp_path, monkeypatch
+):
+    process = _FakeProcess(stderr=b"authentication required\xff", returncode=17)
+    _install_launcher(monkeypatch, process, final=None)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-invalid-utf8", route=_route())
+    )
+
+    assert result.failure_category == "unknown"
+
+
+def test_failure_classification_over_cap_is_unknown(tmp_path, monkeypatch):
+    value = b"authentication required" + b"x" * codex_module._MAX_FAILURE_SIGNAL_BYTES
+    process = _FakeProcess(stderr=value, returncode=17)
+    _install_launcher(monkeypatch, process, final=None)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-over-cap", route=_route())
+    )
+
+    assert result.failure_category == "unknown"
+
+
+@pytest.mark.parametrize(
+    "stream_name, signal_text",
+    (
+        ("stdout", b"provider failed token=do-not-leak"),
+        ("stderr", b"provider failed OPENAI_API_KEY=do-not-leak"),
+        ("stderr", b"provider failed /private/local-output"),
+        ("stdout", b"provider failed \\\\server\\\\share\\\\local-output"),
+        ("stderr", b"provider failed file:///private/local-output"),
+    ),
+)
+def test_unsafe_failure_signal_only_returns_fixed_category_without_leak(
+    tmp_path, monkeypatch, stream_name, signal_text
+):
+    process = _FakeProcess(
+        stdout=signal_text if stream_name == "stdout" else b"",
+        stderr=signal_text if stream_name == "stderr" else b"",
+        returncode=17,
+    )
+    _install_launcher(monkeypatch, process, final=None)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-unsafe-signal", route=_route())
+    )
+
+    assert result.failure_category == "unknown"
+    serialized = json.dumps(result.model_dump(mode="json"), sort_keys=True)
+    for marker in ("do-not-leak", "/private/local-output", "\\\\server", "file://"):
+        assert marker not in serialized
+
+
+def test_historical_generic_nonzero_response_round_trips_without_category():
+    response = ReviewerInvocationResponse(
+        status="failure",
+        provider="openai-codex-desktop",
+        model_ref="gpt-5.6-luna",
+        error_code="REVIEWER_PROCESS_NONZERO_EXIT",
+    )
+
+    restored = ReviewerInvocationResponse.model_validate(
+        response.model_dump(mode="python")
+    )
+
+    assert restored.error_code == "REVIEWER_PROCESS_NONZERO_EXIT"
+    assert restored.failure_category is None
 
 
 def test_event_stream_invalid_exposes_only_fixed_safe_failure_code(

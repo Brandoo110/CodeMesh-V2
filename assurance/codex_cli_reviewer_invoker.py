@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -74,6 +75,120 @@ _ITEM_EVENTS = frozenset(
 _SAFE_ITEM_TYPES = frozenset({"reasoning", "agent_message"})
 _RESPONSE_KEYS = frozenset(
     {"schema_version", "subject_digest", "rubric_hash", "findings", "questions"}
+)
+_MAX_FAILURE_SIGNAL_BYTES = 16 * 1024
+_FAILURE_EVENT_KEYS = ("code", "type", "status", "message")
+_FAILURE_SECRET_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])(?:access[_-]?token|api[_-]?key|apikey|password|passwd|private[_-]?key|secret|token)\s*[:=]|"
+    r"(?<![A-Za-z0-9])(?:ghp_|github_pat_|xoxb-|xoxp-)|-----begin\s+)",
+    re.IGNORECASE,
+)
+_FAILURE_LOCAL_PATH_RE = re.compile(
+    r"(?:file://|(?<![/A-Za-z0-9_])/[^/\s\"'`]+|"
+    r"(?<![:A-Za-z0-9_])//[^/\s]+/[^\s\"'`]+|"
+    r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\"'`]+|"
+    r"(?<![A-Za-z0-9_])\\\\[^\\/\s]+[\\/][^\s\"'`]+)",
+    re.IGNORECASE,
+)
+_FAILURE_CATEGORY_RULES = (
+    (
+        "auth",
+        (
+            "authentication",
+            "unauthorized",
+            "not authenticated",
+            "login required",
+            "sign in required",
+            "invalid api key",
+            "invalid token",
+            "auth_required",
+            "auth_failed",
+            "authentication_required",
+            "credential",
+            "401",
+        ),
+    ),
+    (
+        "rate_or_quota",
+        (
+            "rate limit",
+            "rate_limit",
+            "rate_limited",
+            "quota",
+            "too many requests",
+            "throttl",
+            "429",
+        ),
+    ),
+    (
+        "model_availability",
+        (
+            "model not found",
+            "model not available",
+            "model unavailable",
+            "model is unavailable",
+            "model_not_found",
+            "model_unavailable",
+            "unknown model",
+            "unsupported model",
+            "no such model",
+            "model does not exist",
+        ),
+    ),
+    (
+        "network_or_transport",
+        (
+            "network",
+            "connection",
+            "connect",
+            "timed out",
+            "timeout",
+            "dns",
+            "name resolution",
+            "socket",
+            "tls",
+            "transport",
+            "eof",
+            "econn",
+            "unreachable",
+            "reset by peer",
+        ),
+    ),
+    (
+        "provider_or_server",
+        (
+            "internal server",
+            "internal_server",
+            "server error",
+            "server_error",
+            "service unavailable",
+            "bad gateway",
+            "gateway error",
+            "upstream",
+            "provider",
+            "provider_error",
+            "500",
+            "502",
+            "503",
+            "504",
+        ),
+    ),
+    (
+        "permission_or_policy",
+        (
+            "permission",
+            "forbidden",
+            "policy",
+            "approval",
+            "sandbox",
+            "not allowed",
+            "not permitted",
+            "operation not permitted",
+            "model_access_denied",
+            "access denied",
+            "403",
+        ),
+    ),
 )
 
 _MISSING = object()
@@ -354,6 +469,83 @@ def _validate_final_response(raw: bytes) -> None:
         raise _MalformedOutput from None
 
 
+def _failure_signal_is_unsafe(text: str) -> bool:
+    lowered = text.casefold()
+    return bool(
+        "\x00" in text
+        or _FAILURE_SECRET_RE.search(lowered)
+        or _FAILURE_LOCAL_PATH_RE.search(text)
+    )
+
+
+def _structured_failure_fields(raw: bytes) -> tuple[str, ...] | None:
+    """Read only allowlisted JSONL failure fields, never arbitrary payloads."""
+
+    if not raw or len(raw) > _MAX_FAILURE_SIGNAL_BYTES:
+        return () if not raw else None
+    lines = raw.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    if not lines:
+        return ()
+    values: list[str] = []
+    for line in lines:
+        if not line:
+            return None
+        try:
+            event = json.loads(
+                line.decode("utf-8", errors="strict"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if type(event) is not dict:
+            return None
+        for key in _FAILURE_EVENT_KEYS:
+            value = event.get(key, _MISSING)
+            if type(value) is str and value:
+                values.append(value)
+    return tuple(values)
+
+
+def _failure_signal_text(raw: bytes) -> str | None:
+    if type(raw) is not bytes or not raw or len(raw) > _MAX_FAILURE_SIGNAL_BYTES:
+        return None
+    structured = _structured_failure_fields(raw)
+    if structured is not None:
+        text = " ".join(structured)
+    else:
+        try:
+            text = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+        if text.lstrip().startswith(("{", "[")):
+            return None
+    if _failure_signal_is_unsafe(text):
+        return None
+    return text
+
+
+def _classify_failure_signal(stdout: bytes, stderr: bytes) -> str:
+    """Classify a nonzero CLI exit from bounded, ephemeral safe signals."""
+
+    signals = []
+    for raw in (stderr, stdout):
+        if type(raw) is not bytes or len(raw) > _MAX_FAILURE_SIGNAL_BYTES:
+            return "unknown"
+        text = _failure_signal_text(raw)
+        if text is None and raw:
+            return "unknown"
+        if text:
+            signals.append(text.casefold())
+    combined = " ".join(signals)
+    for category, markers in _FAILURE_CATEGORY_RULES:
+        if any(marker in combined for marker in markers):
+            return category
+    return "unknown"
+
+
 def _process_returncode(process: Any) -> int | None:
     try:
         value = process.returncode
@@ -557,7 +749,7 @@ class CodexCliReviewerInvoker:
                     state.process = None
                     raise asyncio.CancelledError
                 try:
-                    stdout, _stderr, returncode = await asyncio.wait_for(
+                    stdout, stderr, returncode = await asyncio.wait_for(
                         _communicate(
                             process,
                             prompt.prompt_text.encode("utf-8"),
@@ -607,6 +799,7 @@ class CodexCliReviewerInvoker:
                         status="failure",
                         error_code="REVIEWER_PROVIDER_FAILURE",
                         failure_stage="nonzero_exit",
+                        failure_category=_classify_failure_signal(stdout, stderr),
                     )
                 try:
                     messages = _parse_event_stream(stdout)
@@ -733,6 +926,7 @@ class CodexCliReviewerInvoker:
         status: str,
         error_code: str,
         failure_stage: str | None = None,
+        failure_category: str | None = None,
     ) -> ReviewerInvocationResponse:
         if failure_stage is not None:
             error_code = _REVIEWER_FAILURE_STAGE_CODES[failure_stage]
@@ -744,6 +938,7 @@ class CodexCliReviewerInvoker:
             completed_at=completed,
             schema_status="not_produced",
             error_code=error_code,
+            failure_category=failure_category,
         )
 
 
