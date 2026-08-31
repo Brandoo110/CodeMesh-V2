@@ -318,6 +318,57 @@ def test_run_exception_mapping_is_stable_and_sanitized(
     assert service.calls == 1
 
 
+@pytest.mark.parametrize(
+    ("reason_code", "expected"),
+    (
+        ("credential_missing_or_invalid", "credential_missing_or_invalid"),
+        ("github_transport", "github_transport"),
+        ("lineage_mismatch", "lineage_mismatch"),
+        ("artifact_structure_invalid", "artifact_structure_invalid"),
+        ("digest_or_size_mismatch", "digest_or_size_mismatch"),
+        ("unknown", "unknown"),
+        ("secret /private/report.zip", "unknown"),
+    ),
+)
+def test_official_reason_mapping_is_stable_and_allowlisted(
+    tmp_path, reason_code, expected
+):
+    service = _RaisingService(
+        AssuranceRunOfficialEvidenceError(reason_code=reason_code)
+    )
+    app = create_app(
+        assurance_run_dependencies=AssuranceRunWebDependencies(
+            service=service,
+            repository=_UnusedRepository(),
+        )
+    )
+    app.dependency_overrides[get_assurance_run_client] = lambda: "127.0.0.1"
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/assurance/runs",
+        headers={"Idempotency-Key": "run:reason"},
+        json={
+            "repository_path": str(tmp_path),
+            "repository_identity": "example/service",
+            "author": "author-agent",
+            "base_ref": "HEAD",
+            "task_path": "TASK.md",
+            "command_ids": ["check"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "ASSURANCE_OFFICIAL_EVIDENCE_INVALID"
+    assert response.json()["message"] == "official evidence report was not accepted"
+    assert response.json()["reason_codes"] == [
+        "OFFICIAL_EVIDENCE_INVALID",
+        expected,
+    ]
+    assert "secret" not in response.text
+    assert "/private/report.zip" not in response.text
+
+
 def test_reviewer_failure_is_a_blocked_successful_run_not_http_5xx(tmp_path):
     service, intent = _service(tmp_path, reviewer=_Reviewer(status="failure"))
     repository = AssuranceWebRepository(

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import assurance.official_evidence as official_evidence_module
 
 from assurance.artifacts import ArtifactStore
 from assurance.official_evidence import (
@@ -314,41 +315,212 @@ def test_import_reads_one_exact_run_and_binds_two_observed_receipts(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("mutator", "expected_requests"),
+    ("mutator", "expected_requests", "expected_reason"),
     (
-        (lambda run: run.update({"head_sha": "b" * 40}), 1),
-        (lambda run: run.update({"head_branch": "other"}), 5),
-        (lambda run: run.update({"event": "pull_request"}), 1),
-        (lambda run: run.update({"conclusion": "failure"}), 1),
-        (lambda run: run.update({"repository": {"full_name": "other/repo"}}), 1),
+        (lambda run: run.update({"head_sha": "b" * 40}), 1, "lineage_mismatch"),
+        (lambda run: run.update({"head_branch": "other"}), 5, "lineage_mismatch"),
+        (lambda run: run.update({"event": "pull_request"}), 1, "lineage_mismatch"),
+        (lambda run: run.update({"conclusion": "failure"}), 1, "lineage_mismatch"),
+        (
+            lambda run: run.update({"repository": {"full_name": "other/repo"}}),
+            1,
+            "lineage_mismatch",
+        ),
     ),
 )
 def test_run_provenance_mismatch_fails_closed_before_artifact_read(
-    tmp_path, mutator, expected_requests
+    tmp_path, mutator, expected_requests, expected_reason
 ):
     root, head = _repository(tmp_path)
     zip_bytes = _zip_payload(root, head)
     transport, requests = _transport(head, zip_bytes, mutate_run=mutator)
     importer = _importer(tmp_path, root, head, transport)
 
-    with pytest.raises(OfficialEvidenceError):
+    with pytest.raises(OfficialEvidenceError) as caught:
         importer.import_run(RUN_ID)
     assert len(requests) == expected_requests
+    assert caught.value.reason_code == expected_reason
+
+
+def test_run_provenance_mismatch_reports_lineage_reason(tmp_path):
+    root, head = _repository(tmp_path)
+    zip_bytes = _zip_payload(root, head)
+    transport, _requests = _transport(
+        head,
+        zip_bytes,
+        mutate_run=lambda run: run.update({"head_sha": "b" * 40}),
+    )
+    importer = _importer(tmp_path, root, head, transport)
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "lineage_mismatch"
+    assert str(caught.value) == "official evidence import failed"
+
+
+@pytest.mark.parametrize("status_code", (401, 403))
+def test_credential_response_reports_credential_reason(tmp_path, status_code):
+    root, head = _repository(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, request=request)
+
+    importer = _importer(tmp_path, root, head, httpx.MockTransport(handler))
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "credential_missing_or_invalid"
+    assert "secret" not in str(caught.value).lower()
+
+
+@pytest.mark.parametrize("status_code", (429, 500, 503))
+def test_github_http_failure_reports_transport_reason(tmp_path, status_code):
+    root, head = _repository(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, request=request)
+
+    importer = _importer(tmp_path, root, head, httpx.MockTransport(handler))
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "github_transport"
+
+
+@pytest.mark.parametrize("transport_error", ("timeout", "eof"))
+def test_github_transport_failure_reports_transport_reason(
+    tmp_path, transport_error
+):
+    root, head = _repository(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if transport_error == "timeout":
+            raise httpx.ReadTimeout("secret timeout", request=request)
+        raise httpx.RemoteProtocolError("secret EOF", request=request)
+
+    importer = _importer(tmp_path, root, head, httpx.MockTransport(handler))
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "github_transport"
+    assert str(caught.value) == "official evidence import failed"
+
+
+def test_missing_token_reports_credential_reason_without_network(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    root, head = _repository(tmp_path)
+    transport, requests = _transport(head, b"unused")
+    importer = _importer(tmp_path, root, head, transport)
+    importer._github_token = None
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "credential_missing_or_invalid"
+    assert requests == []
+
+
+def test_artifact_structure_failure_reports_structure_reason(tmp_path):
+    root, head = _repository(tmp_path)
+    valid = _zip_payload(root, head)
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(valid)) as source, zipfile.ZipFile(
+        output, "w", compression=zipfile.ZIP_DEFLATED
+    ) as target:
+        for item in source.infolist():
+            data = b"not-json" if item.filename == "dependency-audit-result.json" else source.read(item)
+            target.writestr(item.filename, data)
+        target.writestr("unexpected.txt", b"extra")
+    malformed = output.getvalue()
+    transport, _requests = _transport(
+        head, malformed, mutate_zip=lambda _zip: malformed
+    )
+    importer = _importer(tmp_path, root, head, transport)
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "artifact_structure_invalid"
+
+
+def test_artifact_digest_or_size_failure_reports_digest_reason(tmp_path):
+    root, head = _repository(tmp_path)
+    zip_bytes = _zip_payload(root, head)
+    transport, _requests = _transport(
+        head,
+        zip_bytes,
+        mutate_artifact=lambda artifact: artifact.update({"digest": _digest(b"tampered")}),
+    )
+    importer = _importer(tmp_path, root, head, transport)
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "digest_or_size_mismatch"
+
+
+def test_unexpected_import_failure_is_unknown_and_sanitized(tmp_path, monkeypatch):
+    root, head = _repository(tmp_path)
+    zip_bytes = _zip_payload(root, head)
+    transport, _requests = _transport(head, zip_bytes)
+    importer = _importer(tmp_path, root, head, transport)
+
+    def fail(_data):
+        raise RuntimeError("secret /private/report.zip")
+
+    monkeypatch.setattr(official_evidence_module, "_zip_files", fail)
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "unknown"
+    assert "secret" not in str(caught.value)
+    assert "/private/report.zip" not in str(caught.value)
+
+
+def test_first_failure_reason_wins_for_mixed_run_and_artifact_errors(tmp_path):
+    root, head = _repository(tmp_path)
+    zip_bytes = _zip_payload(root, head)
+    transport, _requests = _transport(
+        head,
+        zip_bytes,
+        mutate_run=lambda run: run.update({"head_sha": "b" * 40}),
+        mutate_artifact=lambda artifact: artifact.update({"digest": _digest(b"tampered")}),
+    )
+    importer = _importer(tmp_path, root, head, transport)
+
+    with pytest.raises(OfficialEvidenceError) as caught:
+        importer.import_run(RUN_ID)
+
+    assert caught.value.reason_code == "lineage_mismatch"
 
 
 def test_expired_or_drifted_artifact_metadata_fails_closed(tmp_path):
     root, head = _repository(tmp_path)
     zip_bytes = _zip_payload(root, head)
-    for mutate, expected_requests in (
-        (lambda artifact: artifact.update({"expired": True}), 3),
-        (lambda artifact: artifact.update({"digest": _digest(b"different")}), 4),
-        (lambda artifact: artifact.update({"workflow_run": {"id": 999}}), 3),
+    for mutate, expected_requests, expected_reason in (
+        (lambda artifact: artifact.update({"expired": True}), 3, "lineage_mismatch"),
+        (
+            lambda artifact: artifact.update({"digest": _digest(b"different")}),
+            4,
+            "digest_or_size_mismatch",
+        ),
+        (
+            lambda artifact: artifact.update({"workflow_run": {"id": 999}}),
+            3,
+            "lineage_mismatch",
+        ),
     ):
         transport, requests = _transport(head, zip_bytes, mutate_artifact=mutate)
         importer = _importer(tmp_path, root, head, transport)
-        with pytest.raises(OfficialEvidenceError):
+        with pytest.raises(OfficialEvidenceError) as caught:
             importer.import_run(RUN_ID)
         assert len(requests) == expected_requests
+        assert caught.value.reason_code == expected_reason
 
 
 def test_zip_closure_and_malformed_result_fail_closed(tmp_path):
@@ -372,9 +544,10 @@ def test_zip_closure_and_malformed_result_fail_closed(tmp_path):
     )
     importer = _importer(tmp_path, root, head, transport)
 
-    with pytest.raises(OfficialEvidenceError):
+    with pytest.raises(OfficialEvidenceError) as caught:
         importer.import_run(RUN_ID)
     assert len(requests) == 4
+    assert caught.value.reason_code == "artifact_structure_invalid"
 
 
 def test_subject_claim_is_not_allowed_to_override_runtime_subject(tmp_path):
@@ -420,9 +593,10 @@ def test_subject_claim_is_not_allowed_to_override_runtime_subject(tmp_path):
     )
     importer = _importer(tmp_path, root, head, transport)
 
-    with pytest.raises(OfficialEvidenceError):
+    with pytest.raises(OfficialEvidenceError) as caught:
         importer.import_run(RUN_ID)
     assert len(requests) == 5
+    assert caught.value.reason_code == "lineage_mismatch"
 
 
 @pytest.mark.parametrize("missing_subject", (False, True))
@@ -484,9 +658,10 @@ def test_dispatch_pr_readback_mismatch_fails_closed(tmp_path, mutator):
     transport, requests = _transport(head, zip_bytes, mutate_pr=mutator)
     importer = _importer(tmp_path, root, head, transport)
 
-    with pytest.raises(OfficialEvidenceError):
+    with pytest.raises(OfficialEvidenceError) as caught:
         importer.import_run(RUN_ID)
     assert len(requests) == 5
+    assert caught.value.reason_code == "lineage_mismatch"
 
 
 def test_workflow_dispatch_inputs_are_the_only_official_report_source():

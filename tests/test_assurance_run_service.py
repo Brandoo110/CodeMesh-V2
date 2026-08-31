@@ -790,6 +790,40 @@ def test_malformed_official_run_fails_before_reviewer_and_commit(tmp_path, monke
 
 
 @pytest.mark.parametrize(
+    ("reason_code", "expected"),
+    (
+        ("credential_missing_or_invalid", "credential_missing_or_invalid"),
+        ("github_transport", "github_transport"),
+        ("lineage_mismatch", "lineage_mismatch"),
+        ("artifact_structure_invalid", "artifact_structure_invalid"),
+        ("digest_or_size_mismatch", "digest_or_size_mismatch"),
+        ("unknown", "unknown"),
+        ("forged-secret /private/report.zip", "unknown"),
+        (None, "unknown"),
+    ),
+)
+def test_service_only_transmits_allowlisted_official_reason(
+    tmp_path, monkeypatch, reason_code, expected
+):
+    class _ReasonImporter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def import_run(self, _run_id):
+            raise OfficialEvidenceError(reason_code=reason_code)
+
+    monkeypatch.setattr(run_service_module, "OfficialEvidenceImporter", _ReasonImporter)
+    service, intent = _service(tmp_path)
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    with pytest.raises(AssuranceRunOfficialEvidenceError) as caught:
+        asyncio.run(service.run(intent, idempotency_key="reason-" + str(expected)))
+
+    assert caught.value.reason_code == expected
+    assert not any(call[0] == "commit" for call in service._committer.calls)
+
+
+@pytest.mark.parametrize(
     "repository_identity",
     (
         "/tmp/repository",

@@ -70,6 +70,7 @@ from .manifest import (
 )
 from .official_evidence import (
     OFFICIAL_EVIDENCE_KINDS,
+    OFFICIAL_EVIDENCE_REASON_CODES,
     OfficialEvidenceImport,
     OfficialEvidenceSource,
     OfficialEvidenceError,
@@ -317,6 +318,31 @@ class AssuranceRunPreconditionError(AssuranceRunError):
 
 class AssuranceRunOfficialEvidenceError(AssuranceRunPreconditionError):
     """A supplied official GitHub run was missing, invalid, or drifted."""
+
+    message = "official evidence precondition was not satisfied"
+
+    def __init__(
+        self,
+        *_args: object,
+        reason_code: object = None,
+        reason: object = None,
+    ) -> None:
+        candidate = reason_code if reason_code is not None else reason
+        if candidate is None and len(_args) == 1:
+            candidate = _args[0]
+        if type(candidate) is not str or candidate not in OFFICIAL_EVIDENCE_REASON_CODES:
+            candidate = "unknown"
+        self.reason_code = candidate
+        super().__init__()
+
+    def __str__(self) -> str:
+        return self.message
+
+    @property
+    def reason(self) -> str:
+        """Compatibility view over the single allowlisted failure reason."""
+
+        return self.reason_code
 
 
 class AssuranceRunStaleError(AssuranceRunError):
@@ -1801,7 +1827,7 @@ class AssuranceRunService:
         for imported in official_imports:
             if type(imported) is not OfficialEvidenceImport:
                 raise AssuranceRunOfficialEvidenceError(
-                    "official evidence import is not a verified typed result"
+                    reason_code="unknown"
                 )
             receipt = imported.receipt
             evidence = imported.evidence
@@ -1822,7 +1848,7 @@ class AssuranceRunService:
                 or receipt.evidence_mode != "official"
             ):
                 raise AssuranceRunOfficialEvidenceError(
-                    "official evidence import byte binding is invalid"
+                    reason_code="digest_or_size_mismatch"
                 )
             try:
                 parsed_receipt = parse_official_evidence_receipt(receipt_bytes)
@@ -1850,9 +1876,16 @@ class AssuranceRunService:
                 )
                 if not isinstance(parsed_result, (dict, list)) or parsed_result != receipt.result:
                     raise ValueError("result bytes do not bind to receipt")
+            except OfficialEvidenceError as exc:
+                reason_code = getattr(exc, "reason_code", "unknown")
+                if reason_code not in OFFICIAL_EVIDENCE_REASON_CODES:
+                    reason_code = "unknown"
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code=reason_code
+                ) from exc
             except (OSError, ValueError, TypeError, UnicodeDecodeError, zipfile.BadZipFile) as exc:
                 raise AssuranceRunOfficialEvidenceError(
-                    "official evidence artifact bytes are not bound"
+                    reason_code="artifact_structure_invalid"
                 ) from exc
             if (
                 _sha256(report_bytes) != receipt.report_digest
@@ -1861,13 +1894,13 @@ class AssuranceRunService:
                 or len(result_bytes) != receipt.result_byte_size
             ):
                 raise AssuranceRunOfficialEvidenceError(
-                    "official report or result bytes do not match receipt"
+                    reason_code="digest_or_size_mismatch"
                 )
             source_bindings = []
             for source in imported.source_bindings:
                 if type(source) is not OfficialEvidenceSource:
                     raise AssuranceRunOfficialEvidenceError(
-                        "official source binding is invalid"
+                        reason_code="artifact_structure_invalid"
                     )
                 try:
                     blob = subprocess.run(
@@ -1884,16 +1917,16 @@ class AssuranceRunService:
                     ).stdout
                 except (OSError, subprocess.SubprocessError) as exc:
                     raise AssuranceRunOfficialEvidenceError(
-                        "official source bytes cannot be read from the fenced Git revision"
+                        reason_code="artifact_structure_invalid"
                     ) from exc
                 if len(blob) != source.byte_size or _sha256(blob) != source.digest:
                     raise AssuranceRunOfficialEvidenceError(
-                        "official source bytes do not match receipt"
+                        reason_code="digest_or_size_mismatch"
                     )
                 source_bindings.append((source, blob))
             if tuple(source for source, _ in source_bindings) != receipt.source_paths:
                 raise AssuranceRunOfficialEvidenceError(
-                    "official source bindings do not match receipt"
+                    reason_code="lineage_mismatch"
                 )
             proofs.append(
                 _OfficialEvidenceCommitProof(
@@ -1945,9 +1978,19 @@ class AssuranceRunService:
                 github_token=os.getenv("GITHUB_TOKEN") or None,
             )
             imports = importer.import_run(intent.official_evidence_run_id)
-        except (OfficialEvidenceError, TypeError, ValueError) as exc:
+        except OfficialEvidenceError as exc:
+            try:
+                reason_code = getattr(exc, "reason_code", None)
+            except Exception:
+                reason_code = None
+            if type(reason_code) is not str or reason_code not in OFFICIAL_EVIDENCE_REASON_CODES:
+                reason_code = "unknown"
             raise AssuranceRunOfficialEvidenceError(
-                "official GitHub evidence import precondition was not satisfied"
+                reason_code=reason_code
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise AssuranceRunOfficialEvidenceError(
+                reason_code="unknown"
             ) from exc
         if type(imports) is not tuple or any(
             type(item) is not OfficialEvidenceImport for item in imports

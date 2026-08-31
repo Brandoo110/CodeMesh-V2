@@ -91,6 +91,21 @@ OFFICIAL_PRODUCERS = {
     "dependency_audit": "collector.dependency_audit",
     "ci_iac_validation": "collector.ci_iac_validation",
 }
+OFFICIAL_EVIDENCE_REASON_CODES = (
+    "credential_missing_or_invalid",
+    "github_transport",
+    "lineage_mismatch",
+    "artifact_structure_invalid",
+    "digest_or_size_mismatch",
+    "unknown",
+)
+_OFFICIAL_EVIDENCE_REASON_SET = frozenset(OFFICIAL_EVIDENCE_REASON_CODES)
+
+
+def _normalize_reason_code(value: object) -> str:
+    if type(value) is str and value in _OFFICIAL_EVIDENCE_REASON_SET:
+        return value
+    return "unknown"
 
 
 class OfficialEvidenceError(ValueError):
@@ -98,15 +113,30 @@ class OfficialEvidenceError(ValueError):
 
     message = "official evidence import failed"
 
-    def __init__(self, *_args: object) -> None:
+    def __init__(
+        self,
+        *_args: object,
+        reason_code: object = None,
+        reason: object = None,
+    ) -> None:
+        candidate = reason_code if reason_code is not None else reason
+        if candidate is None and len(_args) == 1:
+            candidate = _args[0]
+        self.reason_code = _normalize_reason_code(candidate)
         super().__init__()
 
     def __str__(self) -> str:
         return self.message
 
+    @property
+    def reason(self) -> str:
+        """Compatibility view over the single internal failure reason."""
 
-def _error() -> OfficialEvidenceError:
-    return OfficialEvidenceError()
+        return self.reason_code
+
+
+def _error(reason_code: object = None) -> OfficialEvidenceError:
+    return OfficialEvidenceError(reason_code=reason_code)
 
 
 def _digest_bytes(data: bytes) -> str:
@@ -590,17 +620,20 @@ def _parse_json(data: bytes, *, max_bytes: int) -> object:
 
 
 def _parse_report_bytes(data: bytes) -> OfficialEvidenceReport:
-    raw = _parse_json(data, max_bytes=_MAX_REPORT_BYTES)
+    try:
+        raw = _parse_json(data, max_bytes=_MAX_REPORT_BYTES)
+    except OfficialEvidenceError:
+        raise _error("artifact_structure_invalid") from None
     if not isinstance(raw, dict):
-        raise _error()
+        raise _error("artifact_structure_invalid")
     if isinstance(raw.get("checks"), dict):
         checks = []
         for name, status in raw["checks"].items():
             if type(name) is not str:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             if isinstance(status, dict):
                 if "name" in status:
-                    raise _error()
+                    raise _error("artifact_structure_invalid")
                 check = dict(status)
                 check["name"] = name
                 checks.append(check)
@@ -611,13 +644,16 @@ def _parse_report_bytes(data: bytes) -> OfficialEvidenceReport:
     try:
         return OfficialEvidenceReport.model_validate(raw)
     except (TypeError, ValueError, ValidationError, RecursionError):
-        raise _error() from None
+        raise _error("artifact_structure_invalid") from None
 
 
 def _parse_result_bytes(data: bytes) -> dict[str, Any] | list[Any]:
-    raw = _parse_json(data, max_bytes=_MAX_RESULT_BYTES)
+    try:
+        raw = _parse_json(data, max_bytes=_MAX_RESULT_BYTES)
+    except OfficialEvidenceError:
+        raise _error("artifact_structure_invalid") from None
     if not isinstance(raw, (dict, list)):
-        raise _error()
+        raise _error("artifact_structure_invalid")
     return raw
 
 
@@ -630,11 +666,14 @@ def parse_official_evidence_report(data: bytes) -> OfficialEvidenceReport:
 def parse_official_evidence_receipt(data: bytes) -> OfficialEvidenceReceipt:
     """Parse the subject-bound canonical Evidence artifact."""
 
-    raw = _parse_json(data, max_bytes=_MAX_REPORT_BYTES + _MAX_RESULT_BYTES)
+    try:
+        raw = _parse_json(data, max_bytes=_MAX_REPORT_BYTES + _MAX_RESULT_BYTES)
+    except OfficialEvidenceError:
+        raise _error("artifact_structure_invalid") from None
     try:
         return OfficialEvidenceReceipt.model_validate(raw)
     except (TypeError, ValueError, ValidationError, RecursionError):
-        raise _error() from None
+        raise _error("artifact_structure_invalid") from None
 
 
 def _validate_api_url(value: object) -> str:
@@ -651,11 +690,11 @@ def _validate_api_url(value: object) -> str:
 
 def _zip_files(data: bytes) -> dict[str, bytes]:
     if type(data) is not bytes or len(data) > _MAX_ZIP_BYTES:
-        raise _error()
+        raise _error("artifact_structure_invalid")
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
     except (OSError, zipfile.BadZipFile):
-        raise _error() from None
+        raise _error("artifact_structure_invalid") from None
     files: dict[str, bytes] = {}
     total_uncompressed = 0
     try:
@@ -677,18 +716,18 @@ def _zip_files(data: bytes) -> dict[str, bytes]:
                 or info.compress_size < 0
                 or total_uncompressed + info.file_size > _MAX_ZIP_UNCOMPRESSED_BYTES
             ):
-                raise _error()
+                raise _error("artifact_structure_invalid")
             content = archive.read(info)
             if len(content) != info.file_size:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             total_uncompressed += len(content)
             files[name] = content
     except (OSError, RuntimeError, ValueError, zipfile.BadZipFile):
-        raise _error() from None
+        raise _error("artifact_structure_invalid") from None
     finally:
         archive.close()
     if set(files) != _EXPECTED_ZIP_FILES:
-        raise _error()
+        raise _error("artifact_structure_invalid")
     return files
 
 
@@ -767,7 +806,10 @@ class OfficialEvidenceImporter:
         ):
             raise TypeError("collected_at must be timezone-aware")
         if github_token is not None:
-            github_token = _validate_nonblank(github_token, max_bytes=512)
+            try:
+                github_token = _validate_nonblank(github_token, max_bytes=512)
+            except (TypeError, ValueError):
+                raise _error("credential_missing_or_invalid") from None
         self._github_token = github_token
         self._github_api_url = _validate_api_url(
             github_api_url or _GITHUB_API_URL
@@ -782,10 +824,17 @@ class OfficialEvidenceImporter:
     def import_run(self, official_evidence_run_id: str) -> tuple[OfficialEvidenceImport, ...]:
         """Fetch and verify exactly one completed P-C run; never retry."""
 
-        run_id = _validate_run_id(official_evidence_run_id)
+        try:
+            run_id = _validate_run_id(official_evidence_run_id)
+        except (TypeError, ValueError):
+            raise _error("unknown") from None
         token = self._github_token or os.getenv("GITHUB_TOKEN", "")
-        if not token:
-            raise _error()
+        if type(token) is not str or not token.strip():
+            raise _error("credential_missing_or_invalid")
+        try:
+            _validate_nonblank(token, max_bytes=512)
+        except (TypeError, ValueError):
+            raise _error("credential_missing_or_invalid") from None
         owner, repo = self._repository_identity.split("/", 1)
         headers = {
             "Accept": "application/vnd.github+json",
@@ -826,29 +875,41 @@ class OfficialEvidenceImporter:
                 )
         except OfficialEvidenceError:
             raise
-        except (httpx.HTTPError, OSError, TypeError, ValueError, ValidationError):
-            raise _error() from None
+        except httpx.HTTPError:
+            raise _error("github_transport") from None
+        except (OSError, TypeError, ValueError, ValidationError, RuntimeError):
+            raise _error("unknown") from None
 
-        files = _zip_files(zip_bytes)
+        try:
+            files = _zip_files(zip_bytes)
+        except OfficialEvidenceError:
+            raise
+        except Exception:
+            raise _error("unknown") from None
         reports: dict[str, OfficialEvidenceReport] = {}
         for filename in ("dependency_audit.json", "ci_iac_validation.json"):
-            report = _parse_report_bytes(files[filename])
+            try:
+                report = _parse_report_bytes(files[filename])
+            except OfficialEvidenceError:
+                raise
+            except Exception:
+                raise _error("unknown") from None
             expected_kind = (
                 "dependency_audit"
                 if filename == "dependency_audit.json"
                 else "ci_iac_validation"
             )
             if report.kind != expected_kind:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             if report.kind in reports:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             reports[report.kind] = report
         if set(reports) != set(OFFICIAL_EVIDENCE_KINDS):
-            raise _error()
+            raise _error("artifact_structure_invalid")
 
         pull_request_numbers = {report.pull_request_number for report in reports.values()}
         if len(pull_request_numbers) != 1:
-            raise _error()
+            raise _error("lineage_mismatch")
         pull_request_number = next(iter(pull_request_numbers))
         try:
             with httpx.Client(
@@ -865,8 +926,10 @@ class OfficialEvidenceImporter:
                 )
         except OfficialEvidenceError:
             raise
-        except (httpx.HTTPError, OSError, TypeError, ValueError, ValidationError):
-            raise _error() from None
+        except httpx.HTTPError:
+            raise _error("github_transport") from None
+        except (OSError, TypeError, ValueError, ValidationError, RuntimeError):
+            raise _error("unknown") from None
         try:
             run = self._verify_pull_request(
                 pull_request_payload, artifact, pull_request_number
@@ -874,7 +937,7 @@ class OfficialEvidenceImporter:
         except OfficialEvidenceError:
             raise
         except (TypeError, ValueError, ValidationError):
-            raise _error() from None
+            raise _error("unknown") from None
         for report in reports.values():
             self._verify_report_claims(report, run, job)
             expected_result = (
@@ -883,18 +946,18 @@ class OfficialEvidenceImporter:
                 else "ci-iac-result.json"
             )
             if report.result_path != expected_result:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             result_bytes = files[report.result_path]
             if (
                 len(result_bytes) != report.result_byte_size
                 or _digest_bytes(result_bytes) != report.result_digest
             ):
-                raise _error()
+                raise _error("digest_or_size_mismatch")
             _parse_result_bytes(result_bytes)
             for source in report.source_paths:
                 source_bytes = self._git_blob(source.path)
                 if len(source_bytes) != source.byte_size or _digest_bytes(source_bytes) != source.digest:
-                    raise _error()
+                    raise _error("digest_or_size_mismatch")
 
         zip_digest = _digest_bytes(zip_bytes)
         self._store_verified_bytes(zip_bytes, zip_digest)
@@ -921,8 +984,8 @@ class OfficialEvidenceImporter:
                 )
             except OfficialEvidenceError:
                 raise
-            except (OSError, TypeError, ValueError, ValidationError, RecursionError):
-                raise _error() from None
+            except (OSError, TypeError, ValueError, ValidationError, RecursionError, RuntimeError):
+                raise _error("unknown") from None
             imports.append(imported)
         return tuple(imports)
 
@@ -930,13 +993,13 @@ class OfficialEvidenceImporter:
         """Final local fence: re-read CAS and exact Git blobs, never the network."""
 
         if type(imported) is not OfficialEvidenceImport:
-            raise _error()
+            raise _error("unknown")
         if imported.receipt.subject_digest != self._subject_digest:
-            raise _error()
+            raise _error("lineage_mismatch")
         self._verify_stored_bytes(imported.receipt_digest, imported.receipt_bytes)
         self._verify_stored_bytes(imported.remote_zip_digest, imported.remote_zip_bytes)
         if parse_official_evidence_receipt(imported.receipt_bytes) != imported.receipt:
-            raise _error()
+            raise _error("artifact_structure_invalid")
         try:
             current_head = subprocess.run(
                 ("git", "rev-parse", "--verify", "HEAD^{commit}"),
@@ -946,17 +1009,17 @@ class OfficialEvidenceImporter:
                 timeout=5.0,
             ).stdout.strip().decode("ascii")
         except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
-            raise _error() from None
+            raise _error("lineage_mismatch") from None
         if current_head != self._head_revision:
-            raise _error()
+            raise _error("lineage_mismatch")
         for source in imported.source_bindings:
             source_bytes = self._git_blob(source.path)
             if len(source_bytes) != source.byte_size or _digest_bytes(source_bytes) != source.digest:
-                raise _error()
+                raise _error("digest_or_size_mismatch")
         if imported.evidence.artifact_digest != imported.receipt_digest:
-            raise _error()
+            raise _error("digest_or_size_mismatch")
         if imported.evidence.trust_level != "observed":
-            raise _error()
+            raise _error("artifact_structure_invalid")
 
     @classmethod
     def _request_json(
@@ -968,16 +1031,23 @@ class OfficialEvidenceImporter:
     ) -> object:
         try:
             with client.stream("GET", endpoint, params=dict(params or {})) as response:
+                if response.status_code in {401, 403}:
+                    raise _error("credential_missing_or_invalid")
                 if response.status_code != 200:
-                    raise _error()
+                    raise _error("github_transport")
                 content = cls._read_bounded_response(
                     response, max_bytes=_MAX_GITHUB_JSON_BYTES
                 )
         except OfficialEvidenceError:
             raise
-        except (httpx.HTTPError, OSError, ValueError):
-            raise _error() from None
-        return _parse_json(content, max_bytes=_MAX_GITHUB_JSON_BYTES)
+        except httpx.HTTPError:
+            raise _error("github_transport") from None
+        except (OSError, ValueError):
+            raise _error("unknown") from None
+        try:
+            return _parse_json(content, max_bytes=_MAX_GITHUB_JSON_BYTES)
+        except OfficialEvidenceError:
+            raise _error("github_transport") from None
 
     @staticmethod
     def _read_bounded_response(
@@ -988,26 +1058,38 @@ class OfficialEvidenceImporter:
             try:
                 declared = int(content_length)
             except (TypeError, ValueError):
-                raise _error() from None
+                raise _error(
+                    "digest_or_size_mismatch"
+                    if exact_bytes is not None
+                    else "github_transport"
+                ) from None
             if declared < 0 or declared > max_bytes or (
                 exact_bytes is not None and declared != exact_bytes
             ):
-                raise _error()
+                raise _error(
+                    "digest_or_size_mismatch"
+                    if exact_bytes is not None
+                    else "github_transport"
+                )
         data = bytearray()
         try:
             for chunk in response.iter_bytes():
                 if type(chunk) is not bytes:
-                    raise _error()
+                    raise _error("github_transport")
                 if len(data) + len(chunk) > max_bytes:
-                    raise _error()
+                    raise _error(
+                        "digest_or_size_mismatch"
+                        if exact_bytes is not None
+                        else "github_transport"
+                    )
                 data.extend(chunk)
         except OfficialEvidenceError:
             raise
         except (OSError, RuntimeError, httpx.HTTPError):
-            raise _error() from None
+            raise _error("github_transport") from None
         content = bytes(data)
         if exact_bytes is not None and len(content) != exact_bytes:
-            raise _error()
+            raise _error("digest_or_size_mismatch")
         return content
 
     def _download_artifact(
@@ -1015,8 +1097,10 @@ class OfficialEvidenceImporter:
     ) -> bytes:
         try:
             with client.stream("GET", endpoint, follow_redirects=True) as response:
+                if response.status_code in {401, 403}:
+                    raise _error("credential_missing_or_invalid")
                 if response.status_code != 200:
-                    raise _error()
+                    raise _error("github_transport")
                 content = self._read_bounded_response(
                     response,
                     max_bytes=_MAX_ZIP_BYTES,
@@ -1025,46 +1109,46 @@ class OfficialEvidenceImporter:
         except OfficialEvidenceError:
             raise
         except (httpx.HTTPError, OSError, ValueError):
-            raise _error() from None
+            raise _error("github_transport") from None
         if _digest_bytes(content) != artifact.artifact_digest:
-            raise _error()
+            raise _error("digest_or_size_mismatch")
         return content
 
     def _store_verified_bytes(self, data: bytes, digest: str) -> None:
         try:
             if self._artifact_store.put_bytes(data) != digest:
-                raise _error()
+                raise _error("digest_or_size_mismatch")
             if self._artifact_store.verify(digest) is not True:
-                raise _error()
+                raise _error("digest_or_size_mismatch")
             if self._artifact_store.get_bytes(digest) != data:
-                raise _error()
+                raise _error("digest_or_size_mismatch")
         except OfficialEvidenceError:
             raise
         except (OSError, TypeError, ValueError):
-            raise _error() from None
+            raise _error("unknown") from None
 
     def _verify_stored_bytes(self, digest: str, expected: bytes) -> None:
         try:
             if self._artifact_store.verify(digest) is not True:
-                raise _error()
+                raise _error("digest_or_size_mismatch")
             if self._artifact_store.get_bytes(digest) != expected:
-                raise _error()
+                raise _error("digest_or_size_mismatch")
         except OfficialEvidenceError:
             raise
         except (OSError, TypeError, ValueError):
-            raise _error() from None
+            raise _error("unknown") from None
 
     def _verify_run(self, payload: object, run_id: str) -> _RemoteRun:
         if not isinstance(payload, Mapping):
-            raise _error()
+            raise _error("lineage_mismatch")
         if type(payload.get("id")) is not int or payload.get("id") != int(run_id):
-            raise _error()
+            raise _error("lineage_mismatch")
         repository = payload.get("repository")
         head_repository = payload.get("head_repository")
         if not isinstance(repository, Mapping) or repository.get("full_name") != self._repository_identity:
-            raise _error()
+            raise _error("lineage_mismatch")
         if not isinstance(head_repository, Mapping) or head_repository.get("full_name") != self._repository_identity:
-            raise _error()
+            raise _error("lineage_mismatch")
         if (
             payload.get("name") != _GITHUB_WORKFLOW_NAME
             or payload.get("path") != _GITHUB_WORKFLOW_PATH
@@ -1072,16 +1156,19 @@ class OfficialEvidenceImporter:
             or payload.get("status") != "completed"
             or payload.get("conclusion") != "success"
         ):
-            raise _error()
+            raise _error("lineage_mismatch")
         if payload.get("head_sha") != self._head_revision:
-            raise _error()
+            raise _error("lineage_mismatch")
         head_ref = payload.get("head_branch")
         if type(head_ref) is not str or not head_ref.strip():
-            raise _error()
-        _validate_nonblank(head_ref, max_bytes=_MAX_PATH_BYTES)
+            raise _error("lineage_mismatch")
+        try:
+            _validate_nonblank(head_ref, max_bytes=_MAX_PATH_BYTES)
+        except (TypeError, ValueError):
+            raise _error("lineage_mismatch") from None
         attempt = payload.get("run_attempt")
         if type(attempt) is not int or attempt <= 0:
-            raise _error()
+            raise _error("lineage_mismatch")
         return _RemoteRun(
             run_id=run_id,
             repository_identity=self._repository_identity,
@@ -1103,13 +1190,13 @@ class OfficialEvidenceImporter:
     @staticmethod
     def _verify_job(payload: object, run: _RemoteRun) -> Mapping[str, object]:
         if not isinstance(payload, Mapping) or not isinstance(payload.get("jobs"), list):
-            raise _error()
+            raise _error("lineage_mismatch")
         matches = [
             job for job in payload["jobs"]
             if isinstance(job, Mapping) and job.get("name") == _GITHUB_JOB_NAME
         ]
         if len(matches) != 1:
-            raise _error()
+            raise _error("lineage_mismatch")
         job = matches[0]
         if (
             type(job.get("id")) is not int
@@ -1117,10 +1204,10 @@ class OfficialEvidenceImporter:
             or job.get("status") != "completed"
             or job.get("conclusion") != "success"
         ):
-            raise _error()
+            raise _error("lineage_mismatch")
         job_run_id = job.get("run_id")
         if type(job_run_id) is not int or job_run_id != int(run.run_id):
-            raise _error()
+            raise _error("lineage_mismatch")
         return job
 
     def _verify_artifact_metadata(
@@ -1130,37 +1217,37 @@ class OfficialEvidenceImporter:
         job: Mapping[str, object],
     ) -> _RemoteRun:
         if not isinstance(payload, Mapping) or not isinstance(payload.get("artifacts"), list):
-            raise _error()
+            raise _error("lineage_mismatch")
         name = _OFFICIAL_ARTIFACT_PREFIX + run.run_id
         matches = [
             item for item in payload["artifacts"]
             if isinstance(item, Mapping) and item.get("name") == name
         ]
         if len(matches) != 1:
-            raise _error()
+            raise _error("lineage_mismatch")
         artifact = matches[0]
         if artifact.get("expired") is not False:
-            raise _error()
+            raise _error("lineage_mismatch")
         artifact_run = artifact.get("workflow_run")
         if (
             not isinstance(artifact_run, Mapping)
             or type(artifact_run.get("id")) is not int
             or artifact_run.get("id") != int(run.run_id)
         ):
-            raise _error()
+            raise _error("lineage_mismatch")
         artifact_id = artifact.get("id")
         size = artifact.get("size_in_bytes")
         digest = artifact.get("digest")
+        if type(artifact_id) is not int or artifact_id <= 0:
+            raise _error("lineage_mismatch")
         if (
-            type(artifact_id) is not int
-            or artifact_id <= 0
-            or type(size) is not int
+            type(size) is not int
             or size <= 0
             or size > _MAX_ZIP_BYTES
-            or type(digest) is not str
-            or _SHA256_RE.fullmatch(digest) is None
         ):
-            raise _error()
+            raise _error("digest_or_size_mismatch")
+        if type(digest) is not str or _SHA256_RE.fullmatch(digest) is None:
+            raise _error("digest_or_size_mismatch")
         return _RemoteRun(
             run_id=run.run_id,
             repository_identity=run.repository_identity,
@@ -1186,13 +1273,13 @@ class OfficialEvidenceImporter:
         pull_request_number: int,
     ) -> _RemoteRun:
         if not isinstance(payload, Mapping) or type(payload.get("number")) is not int:
-            raise _error()
+            raise _error("lineage_mismatch")
         if payload.get("number") != pull_request_number or payload.get("state") != "open":
-            raise _error()
+            raise _error("lineage_mismatch")
         base = payload.get("base")
         head = payload.get("head")
         if not isinstance(base, Mapping) or not isinstance(head, Mapping):
-            raise _error()
+            raise _error("lineage_mismatch")
         base_repo = base.get("repo")
         head_repo = head.get("repo")
         if (
@@ -1202,7 +1289,7 @@ class OfficialEvidenceImporter:
             or head_repo.get("full_name") != self._repository_identity
             or head.get("sha") != self._head_revision
         ):
-            raise _error()
+            raise _error("lineage_mismatch")
         base_ref = base.get("ref")
         base_sha = base.get("sha")
         head_ref = head.get("ref")
@@ -1213,11 +1300,14 @@ class OfficialEvidenceImporter:
             or not head_ref.strip()
             or head_ref != run.head_ref
         ):
-            raise _error()
-        _validate_nonblank(base_ref, max_bytes=_MAX_PATH_BYTES)
-        _validate_nonblank(head_ref, max_bytes=_MAX_PATH_BYTES)
+            raise _error("lineage_mismatch")
+        try:
+            _validate_nonblank(base_ref, max_bytes=_MAX_PATH_BYTES)
+            _validate_nonblank(head_ref, max_bytes=_MAX_PATH_BYTES)
+        except (TypeError, ValueError):
+            raise _error("lineage_mismatch") from None
         if type(base_sha) is not str or _REVISION_RE.fullmatch(base_sha) is None:
-            raise _error()
+            raise _error("lineage_mismatch")
         return _RemoteRun(
             run_id=run.run_id,
             repository_identity=run.repository_identity,
@@ -1260,11 +1350,16 @@ class OfficialEvidenceImporter:
             or report.status not in _SUCCESS_VALUES
             or report.conclusion != "success"
         ):
-            raise _error()
+            raise _error("lineage_mismatch")
 
     def _git_blob(self, relative_path: str) -> bytes:
-        if _validate_repo_relative_path(relative_path) != relative_path:
-            raise _error()
+        try:
+            if _validate_repo_relative_path(relative_path) != relative_path:
+                raise _error("artifact_structure_invalid")
+        except OfficialEvidenceError:
+            raise
+        except (TypeError, ValueError):
+            raise _error("artifact_structure_invalid") from None
         try:
             tree = subprocess.run(
                 ("git", "ls-tree", "-z", self._head_revision, "--", relative_path),
@@ -1275,15 +1370,15 @@ class OfficialEvidenceImporter:
             ).stdout
             entries = tree.split(b"\x00")
             if len(entries) != 2 or not entries[0]:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             header, path = entries[0].split(b"\t", 1)
             mode, object_type, object_id = header.split(b" ")
             if path.decode("utf-8", errors="strict") != relative_path:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             if object_type != b"blob" or mode not in {b"100644", b"100755"}:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             if re.fullmatch(rb"[0-9a-f]{40,64}", object_id) is None:
-                raise _error()
+                raise _error("artifact_structure_invalid")
             blob = subprocess.run(
                 ("git", "cat-file", "blob", object_id.decode("ascii")),
                 cwd=self._repository_path,
@@ -1292,10 +1387,10 @@ class OfficialEvidenceImporter:
                 timeout=5.0,
             ).stdout
             if len(blob) > _MAX_RESULT_BYTES:
-                raise _error()
+                raise _error("digest_or_size_mismatch")
             return blob
         except (OSError, subprocess.SubprocessError, UnicodeDecodeError, ValueError):
-            raise _error() from None
+            raise _error("artifact_structure_invalid") from None
 
     def _build_import(
         self,
@@ -1344,7 +1439,7 @@ class OfficialEvidenceImporter:
                 _parse_json(receipt_bytes, max_bytes=_MAX_REPORT_BYTES + _MAX_RESULT_BYTES)
             )
         except (TypeError, ValueError, ValidationError, RecursionError):
-            raise _error() from None
+            raise _error("unknown") from None
         receipt_digest = _digest_bytes(receipt_bytes)
         self._store_verified_bytes(receipt_bytes, receipt_digest)
         evidence = Evidence(
@@ -1410,6 +1505,7 @@ def import_official_evidence(
 __all__ = [
     "OFFICIAL_EVIDENCE_KINDS",
     "OFFICIAL_PRODUCERS",
+    "OFFICIAL_EVIDENCE_REASON_CODES",
     "OfficialEvidenceCheck",
     "OfficialEvidenceError",
     "OfficialEvidenceImport",
