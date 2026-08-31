@@ -307,19 +307,19 @@ def test_structured_success_maps_to_existing_invocation_response(tmp_path, monke
             _event_stream("{}", item_type="command_execution"),
             b"{}",
             "failure",
-            "REVIEWER_PROVIDER_FAILURE",
+            "REVIEWER_EVENT_STREAM_INVALID",
         ),
         (
             b'{"type":"future.event"}\n',
             b"{}",
             "failure",
-            "REVIEWER_PROVIDER_FAILURE",
+            "REVIEWER_EVENT_STREAM_INVALID",
         ),
         (
             b"not-json\n",
             b"{}",
             "failure",
-            "REVIEWER_PROVIDER_FAILURE",
+            "REVIEWER_EVENT_STREAM_INVALID",
         ),
         (
             b'{"type":"turn.completed"}\n',
@@ -377,7 +377,7 @@ def test_final_schema_drift_is_failure(tmp_path, monkeypatch, mutate):
     )
 
     assert result.status == "failure"
-    assert result.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert result.error_code == "REVIEWER_RESPONSE_SCHEMA_INVALID"
 
 
 @pytest.mark.parametrize(
@@ -441,7 +441,7 @@ def test_nonzero_process_is_deterministic_failure(tmp_path, monkeypatch):
     )
 
     assert result.status == "failure"
-    assert result.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert result.error_code == "REVIEWER_PROCESS_NONZERO_EXIT"
     assert result.raw_response is None
 
 
@@ -582,3 +582,116 @@ def test_aclose_cancels_active_invocation_and_is_idempotent(tmp_path, monkeypatc
 
     asyncio.run(scenario())
     assert process.terminate_calls == 1
+
+
+def test_process_launch_failure_exposes_only_fixed_safe_failure_code(
+    tmp_path, monkeypatch
+):
+    async def launch(*argv, **kwargs):
+        raise OSError("launch secret /private/credential --token=do-not-leak")
+
+    monkeypatch.setattr(codex_module.asyncio, "create_subprocess_exec", launch)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-launch", route=_route())
+    )
+
+    assert result.status == "failure"
+    assert result.error_code == "REVIEWER_PROCESS_LAUNCH_FAILURE"
+    assert result.raw_response is None
+    assert result.error_message is None
+    assert "credential" not in json.dumps(result.model_dump(mode="json"))
+
+
+def test_process_communication_failure_exposes_only_fixed_safe_failure_code(
+    tmp_path, monkeypatch
+):
+    class _ExplodingStream:
+        async def read(self, _size):
+            raise OSError("communication secret /tmp/raw-output")
+
+    process = _FakeProcess(stdout=b"", stderr=b"")
+    process.stdout = _ExplodingStream()
+    _install_launcher(monkeypatch, process, final=b"{}")
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-communication", route=_route())
+    )
+
+    assert result.status == "failure"
+    assert result.error_code == "REVIEWER_PROCESS_COMMUNICATION_FAILURE"
+    assert result.raw_response is None
+    assert result.error_message is None
+
+
+def test_nonzero_exit_exposes_only_fixed_safe_failure_code(tmp_path, monkeypatch):
+    prompt = _prompt()
+    process = _FakeProcess(
+        stdout=_event_stream(_valid_response(prompt)),
+        returncode=17,
+    )
+    _install_launcher(monkeypatch, process, final=_valid_response(prompt).encode())
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(prompt, run_id="run-nonzero", route=_route())
+    )
+
+    assert result.status == "failure"
+    assert result.error_code == "REVIEWER_PROCESS_NONZERO_EXIT"
+    assert result.raw_response is None
+
+
+def test_event_stream_invalid_exposes_only_fixed_safe_failure_code(
+    tmp_path, monkeypatch
+):
+    process = _FakeProcess(stdout=b'{"type":"future.event"}\n')
+    _install_launcher(monkeypatch, process, final=b"{}")
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-event-invalid", route=_route())
+    )
+
+    assert result.status == "failure"
+    assert result.error_code == "REVIEWER_EVENT_STREAM_INVALID"
+    assert result.raw_response is None
+
+
+def test_final_missing_keeps_existing_safe_missing_code(tmp_path, monkeypatch):
+    process = _FakeProcess(stdout=b'{"type":"turn.completed"}\n')
+    _install_launcher(monkeypatch, process, final=b"{}")
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-final-missing", route=_route())
+    )
+
+    assert result.status == "failure"
+    assert result.error_code == "REVIEWER_RESPONSE_MISSING"
+    assert result.raw_response is None
+
+
+def test_final_schema_invalid_exposes_only_fixed_safe_failure_code(
+    tmp_path, monkeypatch
+):
+    final = b'{"schema_version":"v1","findings":[]}'
+    process = _FakeProcess(stdout=_event_stream(final.decode()))
+    _install_launcher(monkeypatch, process, final=final)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={}
+        ).invoke(_prompt(), run_id="run-final-schema", route=_route())
+    )
+
+    assert result.status == "failure"
+    assert result.error_code == "REVIEWER_RESPONSE_SCHEMA_INVALID"
+    assert result.raw_response is None

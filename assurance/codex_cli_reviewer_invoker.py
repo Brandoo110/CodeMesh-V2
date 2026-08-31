@@ -21,7 +21,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .run_service import ReviewerInvocationResponse, ReviewerRoute
+from .run_service import (
+    ReviewerInvocationResponse,
+    ReviewerRoute,
+    _REVIEWER_FAILURE_STAGE_CODES,
+)
 from .single_reviewer import (
     SingleReviewerPrompt,
     _RESPONSE_SCHEMA_TEXT,
@@ -582,20 +586,62 @@ class CodexCliReviewerInvoker:
                         _now(),
                         status="failure",
                         error_code="REVIEWER_PROVIDER_FAILURE",
+                        failure_stage="process_communication",
                     )
                 finally:
                     await _terminate_process(process)
                     state.process = None
 
-                if type(returncode) is not int or returncode != 0:
+                if type(returncode) is not int:
                     return self._failure(
                         started,
                         _now(),
                         status="failure",
                         error_code="REVIEWER_PROVIDER_FAILURE",
+                        failure_stage="process_communication",
+                    )
+                if returncode != 0:
+                    return self._failure(
+                        started,
+                        _now(),
+                        status="failure",
+                        error_code="REVIEWER_PROVIDER_FAILURE",
+                        failure_stage="nonzero_exit",
                     )
                 try:
                     messages = _parse_event_stream(stdout)
+                except _OutputLimit:
+                    return self._failure(
+                        started,
+                        _now(),
+                        status="budget_exceeded",
+                        error_code="REVIEWER_BUDGET_EXCEEDED",
+                    )
+                except _MissingFinal:
+                    return self._failure(
+                        started,
+                        _now(),
+                        status="failure",
+                        error_code="REVIEWER_RESPONSE_MISSING",
+                        failure_stage="final_missing",
+                    )
+                except _MalformedOutput:
+                    return self._failure(
+                        started,
+                        _now(),
+                        status="failure",
+                        error_code="REVIEWER_PROVIDER_FAILURE",
+                        failure_stage="event_stream_invalid",
+                    )
+                except Exception:
+                    return self._failure(
+                        started,
+                        _now(),
+                        status="failure",
+                        error_code="REVIEWER_PROVIDER_FAILURE",
+                        failure_stage="event_stream_invalid",
+                    )
+                try:
                     final = _read_file(output_last_message, _MAX_FINAL_BYTES)
                     if not final.strip():
                         raise _MissingFinal
@@ -615,6 +661,7 @@ class CodexCliReviewerInvoker:
                         _now(),
                         status="failure",
                         error_code="REVIEWER_RESPONSE_MISSING",
+                        failure_stage="final_missing",
                     )
                 except Exception:
                     return self._failure(
@@ -622,6 +669,7 @@ class CodexCliReviewerInvoker:
                         _now(),
                         status="failure",
                         error_code="REVIEWER_PROVIDER_FAILURE",
+                        failure_stage="final_schema_invalid",
                     )
                 return ReviewerInvocationResponse(
                     status="success",
@@ -648,6 +696,7 @@ class CodexCliReviewerInvoker:
                 _now(),
                 status="failure",
                 error_code="REVIEWER_PROVIDER_FAILURE",
+                failure_stage="process_launch",
             )
         finally:
             if process is not None:
@@ -683,7 +732,10 @@ class CodexCliReviewerInvoker:
         *,
         status: str,
         error_code: str,
+        failure_stage: str | None = None,
     ) -> ReviewerInvocationResponse:
+        if failure_stage is not None:
+            error_code = _REVIEWER_FAILURE_STAGE_CODES[failure_stage]
         return ReviewerInvocationResponse(
             status=status,
             provider=PROVIDER,

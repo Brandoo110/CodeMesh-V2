@@ -18,6 +18,7 @@ import os
 import stat
 import subprocess
 import zipfile
+from types import MappingProxyType
 from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -123,6 +124,28 @@ _REVIEWER_FAILURE_CODES = {
     "cancelled": "REVIEWER_CANCELLED",
     "budget_exceeded": "REVIEWER_BUDGET_EXCEEDED",
 }
+_REVIEWER_FAILURE_STAGE_CODES = MappingProxyType(
+    {
+        "process_launch": "REVIEWER_PROCESS_LAUNCH_FAILURE",
+        "process_communication": "REVIEWER_PROCESS_COMMUNICATION_FAILURE",
+        "nonzero_exit": "REVIEWER_PROCESS_NONZERO_EXIT",
+        "event_stream_invalid": "REVIEWER_EVENT_STREAM_INVALID",
+        "final_missing": "REVIEWER_RESPONSE_MISSING",
+        "final_schema_invalid": "REVIEWER_RESPONSE_SCHEMA_INVALID",
+    }
+)
+_REVIEWER_FAILURE_CODE_FACTS = {
+    code: ("REVIEWER_PROVIDER_FAILURE", stage)
+    for stage, code in _REVIEWER_FAILURE_STAGE_CODES.items()
+}
+_REVIEWER_FAILURE_CODE_FACTS["REVIEWER_RESPONSE_MISSING"] = (
+    "REVIEWER_RESPONSE_MISSING",
+    "final_missing",
+)
+_REVIEWER_FAILURE_CODE_FACTS = MappingProxyType(_REVIEWER_FAILURE_CODE_FACTS)
+_REVIEWER_TRANSPORT_FAILURE_CODES = frozenset(
+    {"REVIEWER_PROVIDER_FAILURE", "REVIEWER_RESPONSE_MISSING"}
+).union(_REVIEWER_FAILURE_CODE_FACTS)
 _REVIEWER_ERROR_CODES = frozenset(
     {
         "REDACTION_UNSAFE",
@@ -208,6 +231,14 @@ def _latency_ms(started: datetime, completed: datetime) -> int:
         + delta.microseconds
     )
     return micros // 1000
+
+
+def _reviewer_failure_facts(
+    error_code: str | None,
+) -> tuple[str | None, str | None]:
+    """Decode only the fixed transport failure grammar into durable facts."""
+
+    return _REVIEWER_FAILURE_CODE_FACTS.get(error_code, (error_code, None))
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -762,7 +793,7 @@ class ReviewerInvocationResponse(BaseModel):
     @model_validator(mode="after")
     def _success_facts(self) -> "ReviewerInvocationResponse":
         expected_error_codes = {
-            "failure": {"REVIEWER_PROVIDER_FAILURE", "REVIEWER_RESPONSE_MISSING"},
+            "failure": _REVIEWER_TRANSPORT_FAILURE_CODES,
             "timeout": {"REVIEWER_TIMEOUT"},
             "cancelled": {"REVIEWER_CANCELLED"},
             "budget_exceeded": {"REVIEWER_BUDGET_EXCEEDED"},
@@ -2236,9 +2267,12 @@ class AssuranceRunService:
         if completed < started:
             completed = started
         if response.status != "success":
-            response_error_code = response.error_code
+            response_error_code, failure_stage = _reviewer_failure_facts(
+                response.error_code
+            )
             if response_error_code not in _REVIEWER_STATUS_ERROR_CODES[response.status]:
                 response_error_code = _REVIEWER_FAILURE_CODES[response.status]
+                failure_stage = None
             receipt = self._failure_receipt(
                 run_id=run_id,
                 subject_digest=subject.subject_digest,
@@ -2251,6 +2285,7 @@ class AssuranceRunService:
                 input_tokens=self._usage_value(response, "input_tokens") or 0,
                 output_tokens=self._usage_value(response, "output_tokens") or 0,
                 cost_usd=self._usage_value(response, "cost_usd") or 0.0,
+                fallback_reason=failure_stage,
             )
             return (
                 ReviewerRunRecord(
@@ -2290,6 +2325,7 @@ class AssuranceRunService:
                 input_tokens=self._usage_value(response, "input_tokens") or 0,
                 output_tokens=self._usage_value(response, "output_tokens") or 0,
                 cost_usd=self._usage_value(response, "cost_usd") or 0.0,
+                fallback_reason="final_missing",
             )
             return (
                 ReviewerRunRecord(
@@ -2529,7 +2565,7 @@ class AssuranceRunService:
                     provider=actual_provider or route.provider,
                     tool_grants=(),
                     routing_rule=route.routing_rule,
-                    fallback_reason=None,
+                    fallback_reason=fallback_reason,
                     token_budget=route.token_budget,
                     timeout_seconds=route.timeout_seconds,
                     result=result,

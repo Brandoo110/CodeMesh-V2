@@ -1111,6 +1111,49 @@ def test_reviewer_failure_is_a_failed_receipt_not_a_success_invocation(tmp_path,
     assert result.bundle.execution_receipt.overall_result in {"failure", "cancelled"}
     assert result.bundle.policy.decision.outcome == "BLOCKED"
     assert "REQUIRED_REVIEWER_NOT_SUCCESS" in result.bundle.policy.decision.reason_codes
+    assert all(step.fallback_reason is None for step in result.bundle.execution_receipt.steps)
+
+
+def test_new_safe_reviewer_failure_stage_is_durable_without_raw_transport_data(tmp_path):
+    class _LaunchFailureReviewer:
+        async def invoke(self, prompt, *, run_id, route):
+            return ReviewerInvocationResponse(
+                status="failure",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                error_code="REVIEWER_PROCESS_LAUNCH_FAILURE",
+            )
+
+    service, intent = _service(
+        tmp_path,
+        reviewer=_LaunchFailureReviewer(),
+        command_specs=(
+            CommandSpec(
+                command_id="check",
+                kind="test",
+                argv=("/usr/bin/true",),
+                cwd=".",
+                timeout_seconds=5.0,
+                max_output_bytes=4096,
+            ),
+        ),
+    )
+    result = asyncio.run(service.run(intent, idempotency_key="run-safe-stage"))
+
+    assert result.bundle.reviewer.status == "failure"
+    assert result.bundle.reviewer.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert result.bundle.reviewer.schema_status == "not_produced"
+    assert result.bundle.reviewer.raw_response_artifact_digest is None
+    assert result.bundle.reviewer.canonical_response_digest is None
+    assert result.bundle.reviewer.result_digest is None
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert all(
+        step.fallback_reason == "process_launch"
+        for step in result.bundle.execution_receipt.steps
+    )
+    serialized = json.dumps(result.model_dump(mode="json"), sort_keys=True)
+    for secret in ("launch secret", "/private/credential", "--token=do-not-leak"):
+        assert secret not in serialized
 
 
 @pytest.mark.parametrize("variant", ["timeout", "cancelled", "invalid_json", "blocked", "failure_valid"])
