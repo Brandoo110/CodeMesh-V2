@@ -1226,8 +1226,10 @@ def test_official_report_context_is_redacted_as_semantic_json(
     tampered_entry = _by_kind(
         _prepare(store, _base_evidences(store) + (tampered,))
     )["dependency_audit"]
-    assert tampered_entry.disposition is RedactionDisposition.NOT_ASSESSED
-    assert tampered_entry.content is None
+    # Raw report digest/size claims are verified by the importer/private proof;
+    # reviewer context only projects the already-bound semantic lineage.
+    assert tampered_entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert tampered_entry.content is not None
 
     forged_report = report.model_copy(
         update={"repository_identity": "drift/repository"}

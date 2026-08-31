@@ -1467,17 +1467,6 @@ def _official_payload(
     )
     if evidence.source_ref != expected_source_ref or evidence.trace_id != expected_trace_id:
         raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
-    report_bytes = _canonical_json(
-        receipt.report.model_dump(mode="json")
-    ).encode("utf-8")
-    if (
-        receipt.report_digest
-        != "sha256:" + hashlib.sha256(report_bytes).hexdigest()
-        or receipt.report_byte_size != len(report_bytes)
-        or type(receipt.report_byte_size) is not int
-        or receipt.report_byte_size < 0
-    ):
-        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
     _assert_path_safe(receipt.result_path)
     for source in receipt.source_paths:
         _assert_path_safe(source.path)
@@ -1557,7 +1546,14 @@ def _official_payload(
         ],
     }
     _assert_no_real_secret(_canonical_json(lineage))
-    return _structured_envelope(evidence, {}, lineage=lineage)
+    projection = _structured_envelope(evidence, {}, lineage=lineage)
+    redacted, changed = _redact_tree(projection)
+    if changed or redacted != projection:
+        raise _UnsafeContent(
+            RedactionDisposition.CONTAINS_UNREDACTED_CONTENT
+        )
+    _assert_final_safe(_canonical_json(projection))
+    return projection
 
 
 def _unsafe_entry(
