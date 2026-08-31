@@ -550,6 +550,44 @@ def test_missing_official_dependency_evidence_keeps_policy_blocked(tmp_path):
     )
 
 
+def test_provider_disabled_preflight_canonicalizes_mixed_blocked_reasons(tmp_path):
+    service, intent = _service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+
+    result = asyncio.run(service.run(intent, idempotency_key="mixed-blocked-reasons"))
+    receipt = result.bundle.execution_receipt
+    mixed_receipt = receipt.model_copy(
+        update={
+            "steps": (
+                receipt.steps[0].model_copy(
+                    update={
+                        "actual_role": "intent",
+                        "result": "failure",
+                        "schema_status": "invalid",
+                    }
+                ),
+                *receipt.steps[1:],
+            )
+        }
+    )
+    mixed_input = result.bundle.policy.input.model_copy(
+        update={"execution_receipts": (mixed_receipt,)}
+    )
+    mixed_policy = run_service_module.PolicyGate.evaluate(mixed_input)
+
+    assert mixed_policy.decision.outcome == "BLOCKED"
+    assert mixed_policy.decision.reason_codes == (
+        "REQUIRED_COLLECTOR_MISSING",
+        "REQUIRED_REVIEWER_MISSING",
+        "REQUIRED_REVIEWER_NOT_SUCCESS",
+    )
+    assert result.bundle.reviewer.status == "blocked_evidence"
+    assert result.bundle.reviewer.error_code == "OFFICIAL_EVIDENCE_MISSING"
+    assert service._reviewer_invoker.calls == 0
+
+
 def test_malformed_official_run_fails_before_reviewer_and_commit(tmp_path, monkeypatch):
     class _MalformedImporter(_FakeOfficialImporter):
         def import_run(self, _run_id):

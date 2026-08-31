@@ -479,7 +479,11 @@ def _blocked_reasons(value: PolicyEvaluationInput) -> tuple[str, ...]:
                 item.decision == "reject" for item in latest_decisions
             ):
                 reasons.append("REQUIRED_HUMAN_REJECTED")
-    return tuple(dict.fromkeys(reasons))
+    unique_reasons = tuple(dict.fromkeys(reasons))
+    reason_positions = {
+        reason: index for index, reason in enumerate(_REASON_ORDER)
+    }
+    return tuple(sorted(unique_reasons, key=reason_positions.__getitem__))
 
 
 def _current_role_decisions(
