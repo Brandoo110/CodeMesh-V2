@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 
 from assurance import cli
 from assurance.case_publication import PublicationReceipt
+from assurance.entry import AssuranceTransportError
 import assurance.case_publication as case_publication
 import assurance.integrations.github_actions as github_actions
 import cli as root_cli
@@ -179,6 +180,34 @@ def test_live_run_command_prints_case_subject_gate_freshness_and_workbench(
     assert str(tmp_path) not in result.stdout
 
 
+def test_live_run_timeout_stays_generic_and_emits_no_success_or_schema(
+    monkeypatch, tmp_path
+):
+    def timed_out(**_kwargs):
+        raise AssuranceTransportError("assurance service is unavailable")
+
+    monkeypatch.setattr(cli, "_perform_live_run", timed_out)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            "--repository",
+            str(tmp_path),
+            "--repository-identity",
+            "acme/widget",
+            "--base-ref",
+            "main",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "assurance run failed; no authoritative CaseView was accepted" in result.stderr
+    assert "schema" not in result.stdout.lower()
+    assert "run_id" not in result.stdout
+    assert "CaseView" not in result.stdout
+
+
 def test_live_run_serializes_single_official_run_id_for_http(monkeypatch, tmp_path):
     task = tmp_path / "task.md"
     task.write_text("# Task\n", encoding="utf-8")
@@ -186,6 +215,7 @@ def test_live_run_serializes_single_official_run_id_for_http(monkeypatch, tmp_pa
 
     class FakeClient:
         def __init__(self, *_args, **_kwargs):
+            captured["client_kwargs"] = _kwargs
             pass
 
         def __enter__(self):
@@ -220,6 +250,14 @@ def test_live_run_serializes_single_official_run_id_for_http(monkeypatch, tmp_pa
 
     assert captured["request"]["official_evidence_run_id"] == "123"
     assert "official_evidence" not in captured["request"]
+    assert captured["client_kwargs"] == {}
+
+
+def test_live_run_does_not_expose_run_create_timeout_option():
+    result = CliRunner().invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0
+    assert "--run-create-timeout" not in result.stdout
 
 
 def test_publish_case_command_uses_one_deep_module_and_returns_safe_receipt(monkeypatch, tmp_path):

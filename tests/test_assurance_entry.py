@@ -10,6 +10,7 @@ from assurance.entry import (
     AssuranceArtifactReadback,
     AssuranceReadbackError,
     AssuranceResponseError,
+    AssuranceTransportError,
     AssuranceHttpClient,
 )
 
@@ -106,6 +107,130 @@ def test_run_posts_with_idempotency_and_reads_authoritative_case():
     assert result.cached is False
     assert result.case_view == get_view
     assert [request.method for request in requests] == ["POST", "GET"]
+
+
+def test_run_post_uses_dedicated_default_timeout():
+    timeout_extensions: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        timeout_extensions.append(request.extensions["timeout"])
+        return httpx.Response(
+            201,
+            json={
+                "schema_version": "v1",
+                "run_id": "run-001",
+                "request_digest": "sha256:" + "2" * 64,
+                "cached": False,
+                "case_id": "case-001",
+                "case_view": {},
+            },
+        )
+
+    client = AssuranceHttpClient(
+        "http://127.0.0.1:8010",
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.run({"command_ids": ["diff-check"]}, idempotency_key="timeout-key")
+
+    assert timeout_extensions == [
+        {"connect": 240.0, "read": 240.0, "write": 240.0, "pool": 240.0}
+    ]
+
+
+def test_run_create_timeout_override_is_used_for_post_only():
+    timeout_extensions: list[tuple[str, dict[str, float]]] = []
+    post_view = _case_view(checked_at="2026-08-30T10:00:00Z")
+    get_view = _case_view(checked_at="2026-08-30T10:00:01Z")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeout_extensions.append((request.method, request.extensions["timeout"]))
+        if request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "schema_version": "v1",
+                    "run_id": "run-001",
+                    "request_digest": "sha256:" + "2" * 64,
+                    "cached": False,
+                    "case_id": "case-001",
+                    "case_view": post_view,
+                },
+            )
+        return httpx.Response(200, json=get_view)
+
+    client = AssuranceHttpClient(
+        "http://127.0.0.1:8010",
+        run_create_timeout=12.5,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.run_and_readback({"command_ids": ["diff-check"]}, idempotency_key="timeout-key")
+
+    assert timeout_extensions == [
+        (
+            "POST",
+            {"connect": 12.5, "read": 12.5, "write": 12.5, "pool": 12.5},
+        ),
+        (
+            "GET",
+            {"connect": 20.0, "read": 20.0, "write": 20.0, "pool": 20.0},
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [True, False, 0, -1, float("nan"), float("inf"), 600.0001, 601],
+)
+def test_run_create_timeout_rejects_nonfinite_or_out_of_bounds_values(invalid_timeout):
+    with pytest.raises(ValueError, match="run_create_timeout"):
+        AssuranceHttpClient(
+            "http://127.0.0.1:8010",
+            run_create_timeout=invalid_timeout,
+            transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
+        )
+
+
+def test_run_create_timeout_accepts_upper_bound():
+    client = AssuranceHttpClient(
+        "http://127.0.0.1:8010",
+        run_create_timeout=600,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                201,
+                json={
+                    "schema_version": "v1",
+                    "run_id": "run-001",
+                    "request_digest": "sha256:" + "2" * 64,
+                    "cached": False,
+                    "case_id": "case-001",
+                    "case_view": {},
+                },
+            )
+        ),
+    )
+
+    assert client.run({}, idempotency_key="timeout-key").run_id == "run-001"
+
+
+def test_run_timeout_is_fail_closed_without_readback_or_retry():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise httpx.ReadTimeout("run create timed out", request=request)
+
+    client = AssuranceHttpClient(
+        "http://127.0.0.1:8010",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(AssuranceTransportError):
+        client.run_and_readback({}, idempotency_key="timeout-key")
+
+    assert [request.method for request in requests] == ["POST"]
 
 
 def test_run_fails_closed_when_post_projection_differs_from_readback():
