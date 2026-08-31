@@ -167,6 +167,58 @@ def test_resolver_indexes_and_reads_git_top_level_bytes(tmp_path):
     assert verified.byte_size == len(payload)
 
 
+@pytest.mark.parametrize("byte_size", (262_145, 1_048_576))
+def test_resolver_allows_git_top_level_through_snapshot_cap(tmp_path, byte_size):
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"x" * byte_size
+    digest = store.put_bytes(payload)
+    evidence = _evidence("git_snapshot", digest)
+
+    resolved = EvidenceArtifactResolver.resolve(
+        evidence,
+        artifact_store=store,
+        subject_digest=SUBJECT,
+    )
+
+    assert resolved.index.artifacts[0].byte_size == byte_size
+    assert resolved.artifacts[0].data == payload
+
+
+def test_resolver_rejects_git_top_level_above_snapshot_cap(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"x" * 1_048_577
+    digest = store.put_bytes(payload)
+
+    with pytest.raises(EvidenceArtifactError):
+        EvidenceArtifactResolver.resolve(
+            _evidence("git_snapshot", digest),
+            artifact_store=store,
+            subject_digest=SUBJECT,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "byte_size"),
+    (
+        ("intake_documents", 4_718_593),
+        ("command_batch", 262_145),
+        ("future_kind", 262_145),
+    ),
+)
+def test_resolver_keeps_non_git_and_unknown_top_level_cap(
+    tmp_path, kind, byte_size
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    digest = store.put_bytes(b"x" * byte_size)
+
+    with pytest.raises(EvidenceArtifactError):
+        EvidenceArtifactResolver.index(
+            _evidence(kind, digest),
+            artifact_store=store,
+            subject_digest=SUBJECT,
+        )
+
+
 def test_resolver_indexes_and_reads_intake_and_command_child_closures(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     intake_digest, task_digest, _ = _intake_artifact(store)
@@ -296,14 +348,6 @@ def test_resolver_fails_closed_for_unsafe_cas_files(tmp_path, mutation):
 
 def test_resolver_enforces_top_level_and_read_byte_caps(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
-    oversized_git = store.put_bytes(b"x" * (262_144 + 1))
-    with pytest.raises(EvidenceArtifactError):
-        EvidenceArtifactResolver.index(
-            _evidence("git_snapshot", oversized_git),
-            artifact_store=store,
-            subject_digest=SUBJECT,
-        )
-
     oversized_unknown = store.put_bytes(b"u" * (262_144 + 1))
     with pytest.raises(EvidenceArtifactError):
         EvidenceArtifactResolver.index(
