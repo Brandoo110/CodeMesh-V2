@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import pytest
 
 import assurance.evidence_artifacts as evidence_artifacts_module
+import assurance.reviewer_context as reviewer_context_module
 from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandObservation
 from assurance.contracts import Evidence
@@ -683,6 +684,57 @@ def test_artifact_integrity_failure_is_fixed_and_path_free(tmp_path):
     assert repr(exc_info.value) == "ReviewerContextError()"
     assert missing not in str(exc_info.value)
     assert str(tmp_path) not in str(exc_info.value)
+
+
+def test_aggregate_budget_failure_exposes_safe_structured_observability(
+    tmp_path, monkeypatch
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    monkeypatch.setattr(reviewer_context_module, "_AGGREGATE_BYTES", 1)
+
+    with pytest.raises(ReviewerContextError) as exc_info:
+        _prepare(store, _base_evidences(store))
+
+    error = exc_info.value
+    assert error.stage == "aggregate_budget"
+    assert error.reason_code == "aggregate_budget_exceeded"
+    assert error.evidence_kind is None
+    assert str(error) == ReviewerContextError.message
+    assert repr(error) == "ReviewerContextError()"
+    assert error.args == ()
+    assert str(tmp_path) not in str(error)
+
+    with pytest.raises((TypeError, ValueError)):
+        ReviewerContextError(
+            stage="not-a-stage",
+            reason_code="aggregate_budget_exceeded",
+        )
+    with pytest.raises((AttributeError, TypeError)):
+        error.stage = "redaction"
+
+
+def test_artifact_preparation_failure_exposes_validated_kind_without_leaks(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    missing_digest = "sha256:" + "8" * 64
+    evidences = list(_base_evidences(store))
+    evidences[0] = _evidence("git_snapshot", "collector.git", missing_digest)
+
+    with pytest.raises(ReviewerContextError) as exc_info:
+        _prepare(store, tuple(evidences))
+
+    error = exc_info.value
+    assert error.stage == "artifact_resolution"
+    assert error.reason_code == "artifact_resolution_failed"
+    assert error.evidence_kind == "git_snapshot"
+    assert str(error) == ReviewerContextError.message
+    assert repr(error) == "ReviewerContextError()"
+    assert error.args == ()
+    rendered = " ".join((str(error), repr(error), repr(error.args)))
+    assert str(tmp_path) not in rendered
+    assert missing_digest not in rendered
+    assert "artifact" not in rendered
 
 
 @pytest.mark.parametrize(

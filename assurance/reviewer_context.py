@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 from collections.abc import Iterable
+from enum import Enum
 from typing import Any
 
 from pydantic import ValidationError
@@ -52,6 +53,7 @@ _KIND_ORDER = {
     "dependency_audit": 4,
     "ci_iac_validation": 5,
 }
+_SUPPORTED_EVIDENCE_KINDS = frozenset(_EXPECTED) | frozenset(_OFFICIAL_EXPECTED)
 _DOCUMENT_ORDER = {"task_spec": 0, "policy": 1, "adr": 2, "runbook": 3}
 _ENTRY_BYTES = 60 * 1024
 _AGGREGATE_BYTES = 180 * 1024
@@ -195,20 +197,135 @@ _SENSITIVE_KEYS = frozenset(
 )
 
 
+class ReviewerContextStage(str, Enum):
+    """The fixed preparation stages exposed by the fail-closed builder."""
+
+    INPUT_VALIDATION = "input_validation"
+    ARTIFACT_RESOLUTION = "artifact_resolution"
+    PAYLOAD_PREPARATION = "payload_preparation"
+    REDACTION = "redaction"
+    FIT = "fit"
+    FINAL_SCAN = "final_scan"
+    AGGREGATE_BUDGET = "aggregate_budget"
+    UNKNOWN = "unknown"
+
+
+class ReviewerContextReasonCode(str, Enum):
+    """The fixed, path-free reasons for a preparation failure."""
+
+    INVALID_INPUT = "invalid_input"
+    ARTIFACT_RESOLUTION_FAILED = "artifact_resolution_failed"
+    PAYLOAD_PREPARATION_FAILED = "payload_preparation_failed"
+    REDACTION_FAILED = "redaction_failed"
+    FIT_FAILED = "fit_failed"
+    FINAL_SCAN_FAILED = "final_scan_failed"
+    AGGREGATE_BUDGET_EXCEEDED = "aggregate_budget_exceeded"
+    UNKNOWN_FAILURE = "unknown_failure"
+
+
+class ReviewerContextEvidenceKind(str, Enum):
+    """The only Evidence kinds that can be attached to an error."""
+
+    GIT_SNAPSHOT = "git_snapshot"
+    INTAKE_DOCUMENTS = "intake_documents"
+    COMMAND_BATCH = "command_batch"
+    API_CONTRACT = "api_contract"
+    DEPENDENCY_AUDIT = "dependency_audit"
+    CI_IAC_VALIDATION = "ci_iac_validation"
+
+
 class ReviewerContextError(ValueError):
     """Stable, path-free error for any context preparation failure."""
 
     message = "reviewer context preparation failed"
 
-    def __init__(self, *_args: object) -> None:
+    def __init__(
+        self,
+        *,
+        stage: ReviewerContextStage | str = ReviewerContextStage.UNKNOWN,
+        evidence_kind: ReviewerContextEvidenceKind | str | None = None,
+        reason_code: ReviewerContextReasonCode | str = ReviewerContextReasonCode.UNKNOWN_FAILURE,
+    ) -> None:
+        try:
+            normalized_stage = ReviewerContextStage(stage)
+        except (TypeError, ValueError):
+            raise ValueError("stage must be a supported reviewer context stage") from None
+        try:
+            normalized_reason = ReviewerContextReasonCode(reason_code)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "reason_code must be a supported reviewer context reason"
+            ) from None
+        if evidence_kind is None:
+            normalized_kind = None
+        else:
+            try:
+                normalized_kind = ReviewerContextEvidenceKind(evidence_kind)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "evidence_kind must be a supported Evidence kind or None"
+                ) from None
+        object.__setattr__(self, "_stage", normalized_stage)
+        object.__setattr__(self, "_evidence_kind", normalized_kind)
+        object.__setattr__(self, "_reason_code", normalized_reason)
         super().__init__()
 
     def __str__(self) -> str:
         return self.message
 
+    @property
+    def __context__(self) -> BaseException | None:
+        """Keep internal failure context out of the public error surface."""
 
-def _error() -> ReviewerContextError:
-    return ReviewerContextError()
+        return None
+
+
+    @property
+    def stage(self) -> ReviewerContextStage:
+        return self._stage
+
+    @property
+    def evidence_kind(self) -> ReviewerContextEvidenceKind | None:
+        return self._evidence_kind
+
+    @property
+    def reason_code(self) -> ReviewerContextReasonCode:
+        return self._reason_code
+
+
+def _error(
+    *,
+    stage: ReviewerContextStage = ReviewerContextStage.UNKNOWN,
+    evidence_kind: ReviewerContextEvidenceKind | str | None = None,
+    reason_code: ReviewerContextReasonCode = ReviewerContextReasonCode.UNKNOWN_FAILURE,
+) -> ReviewerContextError:
+    return ReviewerContextError(
+        stage=stage,
+        evidence_kind=evidence_kind,
+        reason_code=reason_code,
+    )
+
+
+_STAGE_REASONS = {
+    ReviewerContextStage.INPUT_VALIDATION: ReviewerContextReasonCode.INVALID_INPUT,
+    ReviewerContextStage.ARTIFACT_RESOLUTION: ReviewerContextReasonCode.ARTIFACT_RESOLUTION_FAILED,
+    ReviewerContextStage.PAYLOAD_PREPARATION: ReviewerContextReasonCode.PAYLOAD_PREPARATION_FAILED,
+    ReviewerContextStage.REDACTION: ReviewerContextReasonCode.REDACTION_FAILED,
+    ReviewerContextStage.FIT: ReviewerContextReasonCode.FIT_FAILED,
+    ReviewerContextStage.FINAL_SCAN: ReviewerContextReasonCode.FINAL_SCAN_FAILED,
+    ReviewerContextStage.AGGREGATE_BUDGET: ReviewerContextReasonCode.AGGREGATE_BUDGET_EXCEEDED,
+    ReviewerContextStage.UNKNOWN: ReviewerContextReasonCode.UNKNOWN_FAILURE,
+}
+
+
+def _stage_error(
+    stage: ReviewerContextStage, evidence_kind: str | None = None
+) -> ReviewerContextError:
+    return _error(
+        stage=stage,
+        evidence_kind=evidence_kind,
+        reason_code=_STAGE_REASONS[stage],
+    )
 
 
 class _UnsafeContent(Exception):
@@ -914,19 +1031,27 @@ class SafeReviewerContextBuilder:
         subject_digest: str,
         git_snapshot: GitSnapshot | None = None,
     ) -> ReviewerContextPlan:
-        failed = False
-        result: ReviewerContextPlan | None = None
+        current_stage = ReviewerContextStage.INPUT_VALIDATION
+        current_kind: str | None = None
         try:
             if type(evidences) is not tuple or not 3 <= len(evidences) <= 7:
-                raise _error()
+                raise _stage_error(current_stage)
             if type(artifact_store) is not ArtifactStore:
-                raise _error()
-            if type(subject_digest) is not str or _SHA256_RE.fullmatch(subject_digest) is None:
-                raise _error()
+                raise _stage_error(current_stage)
+            if (
+                type(subject_digest) is not str
+                or _SHA256_RE.fullmatch(subject_digest) is None
+            ):
+                raise _stage_error(current_stage)
             normalized = tuple(_revalidate_evidence(item) for item in evidences)
             by_kind: dict[str, Evidence] = {}
             evidence_ids: set[str] = set()
             for evidence in normalized:
+                validated_kind = (
+                    evidence.kind
+                    if evidence.kind in _SUPPORTED_EVIDENCE_KINDS
+                    else None
+                )
                 expected_producer = _EXPECTED.get(evidence.kind)
                 if expected_producer is None:
                     expected_producer = _OFFICIAL_EXPECTED.get(evidence.kind)
@@ -948,42 +1073,53 @@ class SafeReviewerContextBuilder:
                         )
                     )
                 ):
-                    raise _error()
+                    raise _error(
+                        stage=current_stage,
+                        evidence_kind=validated_kind,
+                        reason_code=_STAGE_REASONS[current_stage],
+                    )
                 allowed_statuses = (
                     {"success", "truncated"}
                     if evidence.kind != "command_batch"
                     else {"success", "failure", "truncated"}
                 )
                 if evidence.status not in allowed_statuses:
-                    raise _error()
+                    raise _error(
+                        stage=current_stage,
+                        evidence_kind=validated_kind,
+                        reason_code=_STAGE_REASONS[current_stage],
+                    )
                 by_kind[evidence.kind] = evidence
                 evidence_ids.add(evidence.evidence_id)
+            current_kind = None
             if not _REQUIRED_EXPECTED.issubset(by_kind) or any(
                 kind not in _OFFICIAL_EXPECTED and kind not in _EXPECTED
                 for kind in by_kind
             ):
-                raise _error()
+                raise _stage_error(current_stage)
 
             entries: list[ReviewerContextPlanEntry] = []
             for kind in sorted(by_kind, key=_KIND_ORDER.__getitem__):
                 evidence = by_kind[kind]
+                current_kind = kind
                 if evidence.status == "truncated" and kind != "git_snapshot":
                     entries.append(
-                        _unsafe_entry(
-                            evidence, RedactionDisposition.NOT_ASSESSED
-                        )
+                        _unsafe_entry(evidence, RedactionDisposition.NOT_ASSESSED)
                     )
                     continue
                 try:
                     if kind == "git_snapshot" and evidence.status == "truncated":
+                        current_stage = ReviewerContextStage.PAYLOAD_PREPARATION
                         payload = _git_truncated_payload(git_snapshot, evidence)
                         display_truncated = False
                     else:
+                        current_stage = ReviewerContextStage.ARTIFACT_RESOLUTION
                         resolved = EvidenceArtifactResolver.resolve(
                             evidence,
                             artifact_store=artifact_store,
                             subject_digest=subject_digest,
                         )
+                        current_stage = ReviewerContextStage.PAYLOAD_PREPARATION
                         index = resolved.index
                         _require_status_binding(evidence, index)
                         if kind == "git_snapshot":
@@ -1003,14 +1139,17 @@ class SafeReviewerContextBuilder:
                             payload = _official_payload(resolved, evidence)
                             display_truncated = False
                         else:
-                            raise _error()
+                            raise _stage_error(current_stage, kind)
+                    current_stage = ReviewerContextStage.REDACTION
                     redacted, changed = _redact_tree(payload)
                     rescanned, residual_change = _redact_tree(redacted)
                     if residual_change or rescanned != redacted:
                         raise _UnsafeContent(
                             RedactionDisposition.CONTAINS_UNREDACTED_CONTENT
                         )
+                    current_stage = ReviewerContextStage.FIT
                     content, budget_truncated = _fit_payload(redacted)
+                    current_stage = ReviewerContextStage.FINAL_SCAN
                     _assert_final_safe(content)
                     disposition = (
                         RedactionDisposition.DECLARED_REDACTED
@@ -1033,17 +1172,23 @@ class SafeReviewerContextBuilder:
                     )
                 except _UnsafeContent as exc:
                     entries.append(_unsafe_entry(evidence, exc.disposition))
+
+            current_kind = None
+            current_stage = ReviewerContextStage.AGGREGATE_BUDGET
             if sum(
                 len(item.content.encode("utf-8"))
                 for item in entries
                 if item.content is not None
             ) > _AGGREGATE_BYTES:
-                raise _error()
+                raise _stage_error(current_stage)
+            current_stage = ReviewerContextStage.UNKNOWN
             result = ReviewerContextPlan(entries=tuple(entries))
+        except ReviewerContextError as exc:
+            if exc.stage is ReviewerContextStage.UNKNOWN:
+                raise _stage_error(current_stage, current_kind) from None
+            raise
         except Exception:
-            failed = True
-        if failed or result is None:
-            raise _error()
+            raise _stage_error(current_stage, current_kind) from None
         return result
 
 
