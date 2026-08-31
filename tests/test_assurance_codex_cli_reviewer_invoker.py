@@ -220,11 +220,94 @@ def test_codex_cli_transport_schema_uses_openai_supported_array_subset(
         node for node in schema_nodes(captured_schema) if node.get("type") == "array"
     ]
     assert arrays
-    supported_array_keywords = {"type", "items", "minItems", "maxItems"}
+    supported_array_keywords = {"type", "items"}
     for array in arrays:
         assert set(array).issubset(supported_array_keywords)
         assert array["type"] == "array"
         assert "items" in array
+
+
+def test_codex_cli_transport_schema_is_recursive_core_subset(
+    tmp_path, monkeypatch
+):
+    prompt = _prompt()
+    final = _valid_response(prompt).encode()
+    process = _FakeProcess(stdout=_event_stream(final.decode()))
+    captured_schema = {}
+
+    async def launch(*argv, **kwargs):
+        output_schema = Path(argv[argv.index("--output-schema") + 1])
+        captured_schema.update(json.loads(output_schema.read_text(encoding="utf-8")))
+        output_last_message = Path(
+            argv[argv.index("--output-last-message") + 1]
+        )
+        output_last_message.write_bytes(final)
+        return process
+
+    monkeypatch.setattr(codex_module.asyncio, "create_subprocess_exec", launch)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={"HOME": "/safe"}
+        ).invoke(prompt, run_id="run-transport-schema-recursive", route=_route())
+    )
+
+    assert result.status == "success"
+
+    core_keywords = {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+    }
+    core_types = {"object", "array", "string", "number"}
+
+    def assert_core_subset(node):
+        if isinstance(node, dict):
+            assert set(node).issubset(core_keywords)
+            if "type" in node:
+                assert node["type"] in core_types
+            if "enum" in node:
+                assert node.get("type") == "string"
+            if node.get("type") == "object":
+                assert isinstance(node.get("properties"), dict)
+                assert node.get("additionalProperties") is False
+                assert set(node["required"]) == set(node["properties"])
+            if node.get("type") == "array":
+                assert "items" in node
+            if "properties" in node:
+                for value in node["properties"].values():
+                    assert_core_subset(value)
+            if "items" in node:
+                assert_core_subset(node["items"])
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    assert_core_subset(value)
+
+    assert_core_subset(captured_schema)
+    root_properties = captured_schema["properties"]
+    assert root_properties["schema_version"] == {
+        "type": "string",
+        "enum": ["v1"],
+    }
+    assert root_properties["subject_digest"] == {"type": "string"}
+    assert root_properties["rubric_hash"] == {"type": "string"}
+
+    finding_properties = root_properties["findings"]["items"]["properties"]
+    assert finding_properties["reviewer_role"]["type"] == "string"
+    assert finding_properties["severity"]["type"] == "string"
+    assert finding_properties["claim"] == {"type": "string"}
+    assert finding_properties["evidence_refs"]["items"] == {"type": "string"}
+    assert finding_properties["confidence"] == {"type": "number"}
+
+    question_properties = root_properties["questions"]["items"]["properties"]
+    assert question_properties["reviewer_role"]["type"] == "string"
+    assert question_properties["reason"]["type"] == "string"
+    assert question_properties["question"] == {"type": "string"}
+    assert question_properties["evidence_refs"]["items"] == {"type": "string"}
 
 
 def _valid_response(prompt):
