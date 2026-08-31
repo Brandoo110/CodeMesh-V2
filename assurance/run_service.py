@@ -62,7 +62,11 @@ from .digests import (
     normalize_repo_path,
     normalize_repository_identity,
 )
-from .intake import IntakeResult, TaskPolicyCollector
+from .intake import (
+    IntakeResult,
+    TaskPolicyCollector,
+    _build_task_policy_adr_evidence,
+)
 from .manifest import (
     EvidenceManifestBuilder,
     EvidenceManifestInput,
@@ -118,6 +122,7 @@ _DEFAULT_ROUTING_RULE = "single_general.v0:shared_invocation"
 SUPPORTED_COLLECTOR_EVIDENCE_KINDS = (
     "git_snapshot",
     "intake_documents",
+    "task_policy_adr",
     "command_batch",
     "evidence_manifest",
     "api_contract",
@@ -1210,15 +1215,52 @@ class AssuranceRunBundle(BaseModel):
             raise ValueError("risk input intake must match bundle intake snapshot")
         if self.risk.input.manifest != self.manifest.manifest:
             raise ValueError("risk input manifest must match bundle manifest")
-        expected = (
-            self.git.evidence,
-            self.intake.evidence,
-            self.commands.evidence,
-            self.manifest.evidence,
+        dedicated_evidence = tuple(
+            item for item in self.evidence if item.kind == "task_policy_adr"
         )
-        if self.evidence[:4] != expected:
-            raise ValueError("bundle evidence must use the fixed collector order")
-        tail_evidence = self.evidence[4:]
+        if len(dedicated_evidence) > 1:
+            raise ValueError("bundle task_policy_adr Evidence must be unique")
+        if dedicated_evidence:
+            dedicated = dedicated_evidence[0]
+            expected = (
+                self.git.evidence,
+                self.intake.evidence,
+                dedicated,
+                self.commands.evidence,
+                self.manifest.evidence,
+            )
+            if self.evidence[:5] != expected:
+                raise ValueError(
+                    "bundle evidence must use the fixed collector order"
+                )
+            if (
+                dedicated.producer != "collector.task_policy_adr"
+                or dedicated.trace_id is not None
+                or dedicated.status not in {"success", "truncated"}
+                or dedicated.trust_level != "deterministic"
+                or dedicated.subject_digest != subject_digest
+                or dedicated.source_ref != f"task_policy_adr:{subject_digest}"
+                or dedicated.artifact_digest == self.intake.evidence.artifact_digest
+                or dedicated.evidence_id
+                != "ev_task_policy_adr_"
+                + hashlib.sha256(
+                    (subject_digest + dedicated.artifact_digest).encode("ascii")
+                ).hexdigest()[:32]
+            ):
+                raise ValueError("bundle task_policy_adr Evidence is invalid")
+            tail_evidence = self.evidence[5:]
+        else:
+            expected = (
+                self.git.evidence,
+                self.intake.evidence,
+                self.commands.evidence,
+                self.manifest.evidence,
+            )
+            if self.evidence[:4] != expected:
+                raise ValueError(
+                    "bundle evidence must use the fixed collector order"
+                )
+            tail_evidence = self.evidence[4:]
         api_evidence = tuple(
             item for item in tail_evidence if item.kind == "api_contract"
         )
@@ -1575,6 +1617,22 @@ class AssuranceRunService:
         if intake_result.snapshot.task_digest != task_digest:
             raise AssuranceRunStaleError("task changed between probe and intake")
         self._require_subjects(subject_digest, intake_result)
+        try:
+            task_policy_evidence = await asyncio.to_thread(
+                _build_task_policy_adr_evidence,
+                intake_result,
+                artifact_store=self._artifact_store,
+            )
+        except Exception as exc:
+            raise AssuranceRunStaleError(
+                "task/policy/ADR Evidence binding failed"
+            ) from exc
+        self._require_type(
+            task_policy_evidence,
+            Evidence,
+            "task/policy/ADR Evidence",
+        )
+        self._require_subjects(subject_digest, task_policy_evidence)
 
         command_result = await asyncio.to_thread(
             self._command_collector.collect,
@@ -1590,6 +1648,7 @@ class AssuranceRunService:
         base_evidences = (
             git_result.evidence,
             intake_result.evidence,
+            task_policy_evidence,
             command_result.evidence,
         )
         api_result: ApiContractResult | None = None
@@ -1737,6 +1796,7 @@ class AssuranceRunService:
             fence_collection_at,
             official_imports,
             api_result=api_result,
+            task_policy_evidence=task_policy_evidence,
             acceptance_scope_digest=acceptance_scope_digest,
         )
         freshness_source_binding = await asyncio.to_thread(
@@ -2320,10 +2380,11 @@ class AssuranceRunService:
         the latter remains subject to its importer-specific proof fence.
         """
 
+        by_kind = {item.kind: item for item in base_evidences}
         by_name: dict[str, Evidence] = {
-            "git_snapshot": base_evidences[0],
-            "task_policy_adr": base_evidences[1],
-            "deterministic_commands": base_evidences[2],
+            "git_snapshot": by_kind["git_snapshot"],
+            "task_policy_adr": by_kind["task_policy_adr"],
+            "deterministic_commands": by_kind["command_batch"],
             "evidence_manifest": manifest_evidence,
         }
         if api_evidence is not None:
@@ -2831,6 +2892,7 @@ class AssuranceRunService:
         collected_at: datetime,
         official_imports: tuple[OfficialEvidenceImport, ...] = (),
         api_result: ApiContractResult | None = None,
+        task_policy_evidence: Evidence | None = None,
         acceptance_scope_digest: str | None = None,
     ) -> datetime:
         try:
@@ -2882,6 +2944,22 @@ class AssuranceRunService:
             raise AssuranceRunStaleError("final fence collector returned invalid result")
         if _strip_datetimes(_jsonable(final_intake)) != _strip_datetimes(_jsonable(initial_intake)):
             raise AssuranceRunStaleError("intake documents changed during reviewer execution")
+        if task_policy_evidence is not None:
+            try:
+                final_task_policy_evidence = _build_task_policy_adr_evidence(
+                    final_intake,
+                    artifact_store=self._artifact_store,
+                )
+            except Exception as exc:
+                raise AssuranceRunStaleError(
+                    "task/policy/ADR Evidence changed during reviewer execution"
+                ) from exc
+            if _strip_datetimes(_jsonable(final_task_policy_evidence)) != _strip_datetimes(
+                _jsonable(task_policy_evidence)
+            ):
+                raise AssuranceRunStaleError(
+                    "task/policy/ADR Evidence changed during reviewer execution"
+                )
         if api_result is not None:
             try:
                 final_api = self._api_contract_collector.collect(

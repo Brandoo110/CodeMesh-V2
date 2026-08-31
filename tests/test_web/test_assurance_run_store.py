@@ -15,6 +15,8 @@ import zipfile
 
 import pytest
 import assurance.run_service as run_service_module
+import assurance.policy as policy_module
+import tests.test_assurance_remediation_reviewer as remediation_reviewer_tests
 
 from assurance.remediation import (
     PreparedRemediationHandoff,
@@ -24,9 +26,12 @@ from assurance.remediation_validation import ValidationStatus
 from assurance.remediation_reviewer import AssuranceRemediationReviewer
 from assurance.live_freshness import FreshnessStatus, LiveFreshness
 from tests.test_assurance_run_service import _Reviewer, _service
-from tests.test_assurance_run_service import _FakeOfficialImporter
+from tests.test_assurance_run_service import _FakeOfficialImporter, _add_api_contract
 from assurance.run_service import AssuranceRunResult
+from assurance.manifest import EvidenceManifestBuilder, EvidenceManifestInput
 from assurance.official_evidence import parse_official_evidence_receipt
+from assurance.policy import PolicyGate
+from assurance.risk import RiskClassifier
 from tests.test_assurance_remediation import _FakeExecutor
 from tests.test_assurance_remediation_reviewer import (
     _FindingReviewer,
@@ -42,6 +47,7 @@ from web.assurance_store import (
 from web.assurance_run_committer import (
     AssuranceRunPersistenceError,
     _json_digest,
+    _result_pointer,
     _source_binding_json,
 )
 
@@ -65,6 +71,159 @@ def _db_rows(repository: AssuranceWebRepository, query: str):
 
 def _bytes_digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _legacy_bundle(bundle, artifact_store):
+    base_legacy_evidence = tuple(
+        item
+        for item in bundle.evidence
+        if item.kind not in {"task_policy_adr", "evidence_manifest"}
+    )
+    entry_by_id = {
+        entry.evidence_id: entry for entry in bundle.manifest.manifest.entries
+    }
+    manifest = EvidenceManifestBuilder.build(
+        tuple(
+            EvidenceManifestInput(
+                evidence=item,
+                fresh_until=entry_by_id[item.evidence_id].fresh_until,
+                redaction_status=entry_by_id[item.evidence_id].redaction_status,
+            )
+            for item in base_legacy_evidence
+        ),
+        subject_digest=bundle.subject.subject_digest,
+        evaluated_at=bundle.manifest.manifest.evaluated_at,
+        artifact_store=artifact_store,
+    )
+    legacy_evidence = tuple(
+        manifest.evidence if item.kind == "evidence_manifest" else item
+        for item in bundle.evidence
+        if item.kind != "task_policy_adr"
+    )
+    risk_input = bundle.risk.input.model_copy(
+        update={"manifest": manifest.manifest}
+    )
+    risk = RiskClassifier.classify(risk_input)
+    policy_input = bundle.policy.input.model_copy(
+        update={"risk_result": risk}
+    )
+    legacy_decision = policy_module._derive_decision(
+        policy_input,
+        rules_table=policy_module._LEGACY_RULES_TABLE,
+        rules_digest=policy_module._LEGACY_RULES_DIGEST,
+    )
+    policy = policy_module.PolicyGateResult.model_validate(
+        {"input": policy_input, "decision": legacy_decision}
+    )
+    events = tuple(
+        event.model_copy(
+            update=(
+                {"policy_decision_refs": (legacy_decision.decision_id,)}
+                if event.policy_decision_refs
+                else {}
+            )
+        )
+        for event in bundle.events
+    )
+    case = bundle.case.model_copy(
+        update={
+            "policy_decision_refs": (
+                (legacy_decision.decision_id,)
+                if bundle.case.policy_decision_refs
+                else ()
+            )
+        }
+    )
+    return bundle.model_copy(
+        update={
+            "evidence": legacy_evidence,
+            "manifest": manifest,
+            "risk": risk,
+            "policy": policy,
+            "case": case,
+            "events": events,
+        }
+    )
+
+
+def _rewrite_stored_run_as_legacy(repository, bundle):
+    public_json = json.dumps(
+        bundle.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    evidence_json = json.dumps(
+        [item.model_dump(mode="json") for item in bundle.evidence],
+        ensure_ascii=False,
+    )
+    decision_json = json.dumps(
+        bundle.policy.decision.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    conn = sqlite3.connect(repository._db_path)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "UPDATE assurance_web_runs SET bundle_json = ? WHERE idempotency_key = ?",
+            (public_json, bundle.idempotency_key),
+        )
+        conn.execute(
+            "UPDATE assurance_web_idempotency SET result_json = ?"
+            " WHERE idempotency_key = ?",
+            (
+                json.dumps(
+                    _result_pointer(
+                        bundle,
+                        bundle_json=public_json,
+                        source_binding_json=_source_binding_json(
+                            bundle.freshness_source_binding
+                        ),
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                bundle.idempotency_key,
+            ),
+        )
+        conn.execute(
+            "UPDATE assurance_web_cases SET evidence_json = ? WHERE case_id = ?",
+            (evidence_json, bundle.case.case_id),
+        )
+        conn.execute(
+            "UPDATE assurance_decisions SET decision_id = ?, decision_json = ?"
+            " WHERE case_id = ? AND decision_kind = 'policy'",
+            (bundle.policy.decision.decision_id, decision_json, bundle.case.case_id),
+        )
+        rows = conn.execute(
+            "SELECT sequence, event_json FROM assurance_case_events"
+            " WHERE case_id = ? ORDER BY sequence",
+            (bundle.case.case_id,),
+        ).fetchall()
+        for sequence, event_json in rows:
+            event = json.loads(event_json)
+            if event.get("policy_decision_refs"):
+                event["policy_decision_refs"] = [bundle.policy.decision.decision_id]
+                encoded = json.dumps(
+                    event,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    "UPDATE assurance_case_events SET event_json = ?"
+                    " WHERE case_id = ? AND sequence = ?",
+                    (encoded, bundle.case.case_id, sequence),
+                )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _raw_external_official_fixture(bundle, proofs):
@@ -272,7 +431,7 @@ def test_commit_lookup_projects_run_and_keeps_local_source_private(tmp_path):
     assert stored_source["subject_identity_version"] == "v2"
 
     projection = repository.get_change(result.bundle.case.case_id)
-    assert len(projection["evidence"]) == 4
+    assert len(projection["evidence"]) == 5
     assert projection["questions"] == []
     assert [item["run_id"] for item in projection["reviewer_runs"]] == [
         result.bundle.run_id
@@ -287,6 +446,40 @@ def test_commit_lookup_projects_run_and_keeps_local_source_private(tmp_path):
     assert looked_up is not None
     assert looked_up.cached is True
     assert looked_up.bundle == result.bundle
+
+
+@pytest.mark.parametrize(
+    ("with_official", "with_api", "expected_evidence_count"),
+    ((False, False, 4), (True, False, 6), (True, True, 7)),
+)
+def test_historical_four_six_seven_evidence_runs_read_back_exactly(
+    tmp_path,
+    monkeypatch,
+    with_official,
+    with_api,
+    expected_evidence_count,
+):
+    if with_official:
+        monkeypatch.setattr(
+            run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+        )
+    service, intent, repository = _durable_service(tmp_path)
+    if with_api:
+        _add_api_contract(intent.repository_path)
+    if with_official:
+        intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    result = asyncio.run(service.run(intent, idempotency_key="run:legacy"))
+    legacy = _legacy_bundle(result.bundle, service._artifact_store)
+    assert len(legacy.evidence) == expected_evidence_count
+    _rewrite_stored_run_as_legacy(repository, legacy)
+
+    looked_up = repository.lookup_run("run:legacy", result.request_digest)
+    assert looked_up is not None
+    assert looked_up.cached is True
+    assert looked_up.bundle == legacy
+    assert looked_up.bundle.policy.decision.rules_digest == (
+        policy_module._LEGACY_RULES_DIGEST
+    )
 
 
 def test_source_binding_v1_serialization_omits_identity_version_and_v2_roundtrips(
@@ -1269,6 +1462,47 @@ def _prepared_success(tmp_path, monkeypatch):
         subject_input,
         selected_finding,
     ) = _baseline_and_changed_subject(tmp_path, monkeypatch)
+    eligible_finding = baseline.findings[0].model_copy(
+        update={"basis": "deterministic"}
+    )
+    eligible_policy_input = baseline.policy.input.model_copy(
+        update={"findings": (eligible_finding,)}
+    )
+    baseline = baseline.model_copy(
+        update={
+            "findings": (eligible_finding,),
+            "policy": PolicyGate.evaluate(eligible_policy_input),
+        }
+    )
+    baseline = baseline.model_copy(
+        update={
+            "events": tuple(
+                event.model_copy(
+                    update={
+                        "policy_decision_refs": (
+                            baseline.policy.decision.decision_id,
+                        )
+                    }
+                )
+                if event.policy_decision_refs
+                else event
+                for event in baseline.events
+            )
+        }
+    )
+    baseline = baseline.model_copy(
+        update={
+            "case": baseline.case.model_copy(
+                update={
+                    "policy_decision_refs": (
+                        baseline.policy.decision.decision_id,
+                    )
+                }
+            )
+        }
+    )
+    baseline._bind_all_results()
+    selected_finding = eligible_finding
     request, _ = _request_for_baseline(baseline)
     executor = _FakeExecutor([ValidationStatus.FAILED, ValidationStatus.PASSED])
 
@@ -1663,7 +1897,9 @@ def test_remediation_fails_closed_when_baseline_pointer_is_corrupt(
     finally:
         conn.close()
 
-    with pytest.raises(AssuranceWebError, match="pointer|idempotency"):
+    with pytest.raises(
+        AssuranceWebError, match="pointer|idempotency|BASELINE_CORRUPT|freshness"
+    ):
         repository.commit_prepared_remediation(
             request, handoff, idempotency_key="remediate:bad-baseline"
         )
@@ -1728,7 +1964,9 @@ def test_authoritative_finding_variants_fail_closed_without_writes(
         finally:
             conn.close()
 
-    with pytest.raises(AssuranceWebError, match="Finding|stored|contract"):
+    with pytest.raises(
+        AssuranceWebError, match="Finding|stored|contract|BASELINE_CORRUPT|freshness"
+    ):
         repository.commit_prepared_remediation(
             request, handoff, idempotency_key=f"remediate:finding:{tamper}"
         )

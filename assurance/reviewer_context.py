@@ -20,7 +20,7 @@ from assurance.evidence_artifacts import (
     EvidenceArtifactResolver,
     ResolvedEvidenceArtifacts,
 )
-from assurance.intake import IntakeNotice
+from assurance.intake import IntakeDocument, IntakeNotice
 from assurance.official_evidence import (
     OFFICIAL_EVIDENCE_KINDS,
     parse_official_evidence_receipt,
@@ -38,6 +38,7 @@ _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _EXPECTED = {
     "git_snapshot": "collector.git",
     "intake_documents": "collector.intake",
+    "task_policy_adr": "collector.task_policy_adr",
     "command_batch": "collector.command",
     "api_contract": "collector.api_contract",
     "evidence_manifest": "builder.evidence_manifest",
@@ -51,11 +52,12 @@ _OFFICIAL_EXPECTED = {
 _KIND_ORDER = {
     "git_snapshot": 0,
     "intake_documents": 1,
-    "command_batch": 2,
-    "evidence_manifest": 3,
-    "api_contract": 4,
-    "dependency_audit": 5,
-    "ci_iac_validation": 6,
+    "task_policy_adr": 2,
+    "command_batch": 3,
+    "evidence_manifest": 4,
+    "api_contract": 5,
+    "dependency_audit": 6,
+    "ci_iac_validation": 7,
 }
 _SUPPORTED_EVIDENCE_KINDS = frozenset(_EXPECTED) | frozenset(_OFFICIAL_EXPECTED)
 _DOCUMENT_ORDER = {"task_spec": 0, "policy": 1, "adr": 2, "runbook": 3}
@@ -229,6 +231,7 @@ class ReviewerContextEvidenceKind(str, Enum):
 
     GIT_SNAPSHOT = "git_snapshot"
     INTAKE_DOCUMENTS = "intake_documents"
+    TASK_POLICY_ADR = "task_policy_adr"
     COMMAND_BATCH = "command_batch"
     API_CONTRACT = "api_contract"
     EVIDENCE_MANIFEST = "evidence_manifest"
@@ -1365,6 +1368,276 @@ def _intake_payload(
     }
 
 
+def _task_policy_payload(
+    resolved: ResolvedEvidenceArtifacts,
+    evidence: Evidence,
+    *,
+    artifact_store: ArtifactStore,
+) -> dict[str, Any]:
+    """Project only the bounded top-level task/policy/ADR artifact.
+
+    The dedicated collector has already performed the private CAS checks.  A
+    reviewer projection must not follow the nested intake or document
+    digests; those values are validated as bounded typed metadata only.
+    """
+
+    if type(resolved) is not ResolvedEvidenceArtifacts or type(evidence) is not Evidence:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    if type(artifact_store) is not ArtifactStore:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    del artifact_store
+
+    index = resolved.index
+    top_level = tuple(
+        item for item in index.artifacts if item.role == "top_level"
+    )
+    if (
+        len(index.artifacts) != 1
+        or len(resolved.artifacts) != 1
+        or len(top_level) != 1
+        or index.evidence_id != evidence.evidence_id
+        or index.evidence_kind != evidence.kind
+        or index.subject_digest != evidence.subject_digest
+        or index.top_level_digest != evidence.artifact_digest
+        or top_level[0].digest != evidence.artifact_digest
+        or resolved.artifacts[0].digest != evidence.artifact_digest
+        or resolved.artifacts[0].byte_size != top_level[0].byte_size
+    ):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    raw = resolved.artifacts[0].data
+    if type(raw) is not bytes or len(raw) != top_level[0].byte_size:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    encoded = _decode(raw)
+    _assert_no_real_secret(encoded)
+    redacted, changed = _redact_text(encoded)
+    del redacted
+    if changed:
+        raise _UnsafeContent(RedactionDisposition.CONTAINS_UNREDACTED_CONTENT)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate object key")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(encoded, object_pairs_hook=unique_object)
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED) from None
+    required_keys = {
+        "schema_version",
+        "subject_digest",
+        "intake_evidence",
+        "intake_manifest_digest",
+        "documents",
+        "document_states",
+        "notices",
+        "task_digest",
+        "task_present",
+        "policy_count",
+        "adr_count",
+        "adr_paths",
+        "complete",
+        "limits",
+    }
+    if type(payload) is not dict or set(payload) != required_keys:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    if encoded.encode("utf-8") != _canonical_json(payload).encode("utf-8"):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    limits = payload["limits"]
+    expected_limits = {
+        "max_declared_paths": 64,
+        "max_file_bytes": 1024 * 1024,
+        "max_total_bytes": 4 * 1024 * 1024,
+        "max_frontmatter_bytes": 16 * 1024,
+        "max_frontmatter_items": 64,
+    }
+    if (
+        payload["schema_version"] != "v1"
+        or payload["subject_digest"] != evidence.subject_digest
+        or type(payload["documents"]) is not list
+        or type(payload["notices"]) is not list
+        or type(payload["document_states"]) is not dict
+        or type(payload["adr_paths"]) is not list
+        or type(payload["complete"]) is not bool
+        or type(payload["task_present"]) is not bool
+        or type(payload["policy_count"]) is not int
+        or type(payload["adr_count"]) is not int
+        or payload["policy_count"] < 0
+        or payload["adr_count"] < 0
+        or limits != expected_limits
+        or len(payload["documents"]) > limits["max_declared_paths"]
+        or len(payload["adr_paths"]) > limits["max_declared_paths"]
+        or len(payload["notices"]) > limits["max_declared_paths"]
+        or not isinstance(payload["intake_manifest_digest"], str)
+        or _SHA256_RE.fullmatch(payload["intake_manifest_digest"]) is None
+    ):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+
+    intake_binding = payload["intake_evidence"]
+    binding_keys = {
+        "evidence_id",
+        "kind",
+        "producer",
+        "subject_digest",
+        "artifact_digest",
+        "source_ref",
+        "status",
+        "trust_level",
+    }
+    if type(intake_binding) is not dict or set(intake_binding) != binding_keys:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    intake_digest = intake_binding["artifact_digest"]
+    expected_intake_id = "ev_intake_" + hashlib.sha256(
+        (evidence.subject_digest + intake_digest).encode("ascii")
+    ).hexdigest()[:32]
+    if (
+        intake_binding["evidence_id"] != expected_intake_id
+        or intake_binding["kind"] != "intake_documents"
+        or intake_binding["producer"] != "collector.intake"
+        or intake_binding["subject_digest"] != evidence.subject_digest
+        or intake_binding["source_ref"]
+        != f"intake_documents:{evidence.subject_digest}"
+        or intake_binding["status"] not in {"success", "truncated"}
+        or intake_binding["trust_level"] != "deterministic"
+        or not isinstance(intake_digest, str)
+        or _SHA256_RE.fullmatch(intake_digest) is None
+        or payload["intake_manifest_digest"] != intake_digest
+    ):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+
+    try:
+        typed_documents = tuple(
+            IntakeDocument.model_validate(item) for item in payload["documents"]
+        )
+        typed_notices = tuple(
+            IntakeNotice.model_validate(item) for item in payload["notices"]
+        )
+    except (TypeError, ValueError, ValidationError, RecursionError):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED) from None
+    document_json = tuple(
+        item.model_dump(mode="json") for item in typed_documents
+    )
+    notice_json = tuple(item.model_dump(mode="json") for item in typed_notices)
+    if (
+        tuple(payload["documents"]) != document_json
+        or tuple(payload["notices"]) != notice_json
+        or any(item.kind not in {"task_spec", "policy", "adr"} for item in typed_documents)
+        or tuple(
+            (item.kind, item.path) for item in typed_documents
+        )
+        != tuple(
+            (item.kind, item.path)
+            for item in sorted(
+                typed_documents,
+                key=lambda item: (_DOCUMENT_ORDER[item.kind], item.path),
+            )
+        )
+        or len({item.path for item in typed_documents}) != len(typed_documents)
+        or len({item.code for item in typed_notices}) != len(typed_notices)
+    ):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+
+    total_bytes = 0
+    for document in typed_documents:
+        _assert_path_safe(document.path)
+        if document.byte_size > limits["max_file_bytes"]:
+            raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+        total_bytes += document.byte_size
+        if total_bytes > limits["max_total_bytes"]:
+            raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+        _assert_no_real_secret(_canonical_json(document.model_dump(mode="json")))
+    for notice in typed_notices:
+        if notice.path is not None:
+            _assert_path_safe(notice.path)
+
+    task_documents = tuple(
+        item for item in typed_documents if item.kind == "task_spec"
+    )
+    policy_documents = tuple(
+        item for item in typed_documents if item.kind == "policy"
+    )
+    adr_documents = tuple(
+        item for item in typed_documents if item.kind == "adr"
+    )
+    task_digest = task_documents[0].artifact_digest if task_documents else None
+    adr_missing = any(item.code == "adr_not_found" for item in typed_notices)
+    intake_complete = not any(
+        item.category == "missing_evidence" for item in typed_notices
+    )
+    expected_complete = (
+        bool(task_documents)
+        and bool(policy_documents)
+        and intake_complete
+        and not adr_missing
+    )
+    if (
+        payload["task_digest"] != task_digest
+        or payload["task_present"] is not bool(task_documents)
+        or payload["policy_count"] != len(policy_documents)
+        or payload["adr_count"] != len(adr_documents)
+        or payload["adr_paths"] != [item.path for item in adr_documents]
+        or payload["complete"] is not expected_complete
+        or intake_binding["status"]
+        != ("success" if intake_complete else "truncated")
+        or evidence.status != ("success" if expected_complete else "truncated")
+    ):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+
+    expected_states = {}
+    for kind, matching in (
+        ("task_spec", task_documents),
+        ("policy", policy_documents),
+        ("adr", adr_documents),
+    ):
+        if kind == "adr" and adr_missing:
+            status, complete, empty, omissions = (
+                "missing",
+                False,
+                False,
+                [item.code for item in typed_notices if item.code == "adr_not_found"],
+            )
+        elif kind == "adr" and not matching:
+            status, complete, empty, omissions = "not_declared", False, True, []
+        elif matching:
+            status, complete, empty, omissions = "success", True, False, []
+        else:
+            status, complete, empty, omissions = (
+                "not_declared",
+                False,
+                False,
+                [f"{kind}_not_declared"],
+            )
+        expected_states[kind] = {
+            "kind": kind,
+            "status": status,
+            "complete": complete,
+            "empty": empty,
+            "omissions": omissions,
+            "subject_digest": evidence.subject_digest,
+            "items": [item.model_dump(mode="json") for item in matching],
+            "adr_paths": [item.path for item in matching] if kind == "adr" else [],
+        }
+    if payload["document_states"] != expected_states:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    return _structured_envelope(
+        evidence,
+        {
+            "intake_evidence": intake_binding,
+            "intake_manifest_digest": intake_digest,
+            "documents": [_document_metadata(item) for item in typed_documents],
+            "document_states": expected_states,
+            "notices": [item.code for item in typed_notices],
+            "adr_paths": payload["adr_paths"],
+        },
+        complete=payload["complete"],
+        truncated=evidence.status == "truncated",
+        omissions=[item.code for item in typed_notices],
+    )
+
+
 def _command_payload(
     resolved: ResolvedEvidenceArtifacts,
     evidence: Evidence,
@@ -1407,6 +1680,124 @@ def _command_payload(
         ),
         display_truncated,
     )
+
+
+def _dependency_audit_aggregate(
+    result: object,
+    audit_command: str | None,
+) -> dict[str, Any]:
+    """Reduce an official audit result to a bounded security summary."""
+
+    if audit_command != "pnpm audit --prod --audit-level=high --json":
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    if type(result) is not dict:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    encoded = _canonical_json(result)
+    if len(encoded.encode("utf-8")) > _ENTRY_BYTES:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    _assert_no_real_secret(encoded)
+    forbidden_keys = {
+        "path",
+        "paths",
+        "file",
+        "files",
+        "filename",
+        "url",
+        "urls",
+        "token",
+        "secret",
+        "password",
+        "raw",
+        "bytes",
+        "body",
+        "content",
+        "source",
+        "zip",
+    }
+
+    def reject_forbidden(value: object) -> None:
+        if type(value) is dict:
+            for key, item in value.items():
+                if type(key) is not str or key.lower() in forbidden_keys:
+                    raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+                reject_forbidden(item)
+        elif type(value) is list:
+            for item in value:
+                reject_forbidden(item)
+        elif type(value) is str:
+            _assert_no_real_secret(value)
+
+    reject_forbidden(result)
+    allowed_top = {
+        "advisories",
+        "metadata",
+        "vulnerabilities",
+        "auditReportVersion",
+    }
+    if set(result) - allowed_top:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    severities = ("critical", "high", "moderate", "low", "info")
+    counts = {name: 0 for name in severities}
+    counts["unknown"] = 0
+    count_sources = []
+    metadata = result.get("metadata")
+    if metadata is not None:
+        if type(metadata) is not dict:
+            raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+        vulnerability_counts = metadata.get("vulnerabilities")
+        if vulnerability_counts is not None:
+            if type(vulnerability_counts) is not dict:
+                raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+            if set(vulnerability_counts) - set(severities):
+                raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+            metadata_counts = {name: 0 for name in severities}
+            for name, value in vulnerability_counts.items():
+                if type(value) is not int or value < 0 or value > 1_000_000:
+                    raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+                metadata_counts[name] = value
+            count_sources.append(metadata_counts)
+        for key, value in metadata.items():
+            if key == "vulnerabilities":
+                continue
+            if key not in {
+                "dependencies",
+                "devDependencies",
+                "optionalDependencies",
+                "total",
+            }:
+                raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+            if type(value) is not int or value < 0 or value > 1_000_000:
+                raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    advisories = result.get("advisories")
+    if advisories is not None:
+        if type(advisories) is not list or len(advisories) > 100_000:
+            raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+        advisory_counts = {name: 0 for name in severities}
+        for advisory in advisories:
+            if type(advisory) is not dict or "severity" not in advisory:
+                raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+            severity = advisory["severity"]
+            if severity not in severities:
+                raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+            advisory_counts[severity] += 1
+        count_sources.append(advisory_counts)
+    vulnerability_map = result.get("vulnerabilities")
+    if vulnerability_map is not None and type(vulnerability_map) is not dict:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    if not count_sources:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    counts = dict(count_sources[0])
+    if any(source != counts for source in count_sources[1:]):
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    if counts["critical"] or counts["high"]:
+        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    counts["unknown"] = 0
+    return {
+        "tool": "pnpm",
+        "command": audit_command,
+        "status": "safe_assessed",
+        "severity_counts": counts,
+    }
 
 
 def _official_payload(
@@ -1499,6 +1890,9 @@ def _official_payload(
         }
         for source in receipt.source_paths
     ]
+    aggregate: dict[str, Any] | None = None
+    if receipt.kind == "dependency_audit":
+        aggregate = _dependency_audit_aggregate(receipt.result, report.audit_command)
     lineage = {
         "repository": receipt.repository_identity,
         "pull_request": receipt.pull_request_number,
@@ -1546,7 +1940,10 @@ def _official_payload(
         ],
     }
     _assert_no_real_secret(_canonical_json(lineage))
-    projection = _structured_envelope(evidence, {}, lineage=lineage)
+    projection_data = {} if aggregate is None else {"aggregate": aggregate}
+    projection = _structured_envelope(
+        evidence, projection_data, lineage=lineage
+    )
     redacted, changed = _redact_tree(projection)
     if changed or redacted != projection:
         raise _UnsafeContent(
@@ -1583,7 +1980,7 @@ class SafeReviewerContextBuilder:
         current_stage = ReviewerContextStage.INPUT_VALIDATION
         current_kind: str | None = None
         try:
-            if type(evidences) is not tuple or not 3 <= len(evidences) <= 7:
+            if type(evidences) is not tuple or not 3 <= len(evidences) <= 8:
                 raise _stage_error(current_stage)
             if type(artifact_store) is not ArtifactStore:
                 raise _stage_error(current_stage)
@@ -1641,7 +2038,12 @@ class SafeReviewerContextBuilder:
                 by_kind[evidence.kind] = evidence
                 evidence_ids.add(evidence.evidence_id)
             current_kind = None
-            if not _REQUIRED_EXPECTED.issubset(by_kind) or any(
+            required_expected = _REQUIRED_EXPECTED | (
+                {"task_policy_adr"}
+                if "task_policy_adr" in by_kind
+                else set()
+            )
+            if not required_expected.issubset(by_kind) or any(
                 kind not in _OFFICIAL_EXPECTED and kind not in _EXPECTED
                 for kind in by_kind
             ):
@@ -1688,6 +2090,13 @@ class SafeReviewerContextBuilder:
                             display_truncated = False
                         elif kind == "intake_documents":
                             payload = _intake_payload(resolved, evidence)
+                            display_truncated = False
+                        elif kind == "task_policy_adr":
+                            payload = _task_policy_payload(
+                                resolved,
+                                evidence,
+                                artifact_store=artifact_store,
+                            )
                             display_truncated = False
                         elif kind == "command_batch":
                             payload, display_truncated = _command_payload(

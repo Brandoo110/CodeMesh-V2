@@ -28,10 +28,12 @@ from .contracts import (
     PolicyDecision,
 )
 from .digests import normalize_repo_path
+from .intake import _task_policy_manifest_payload
 from .risk import RiskClassificationResult
 
 
-_RULES_VERSION = "gate.v0"
+_RULES_VERSION = "gate.v1"
+_LEGACY_RULES_VERSION = "gate.v0"
 
 _REASON_ORDER = (
     "SUBJECT_DIGEST_MISMATCH",
@@ -65,7 +67,7 @@ _OUTCOME_PRIORITY = (
 _COLLECTOR_MAPPING = MappingProxyType(
     {
         "git_snapshot": ("git_snapshot", "collector.git"),
-        "task_policy_adr": ("intake_documents", "collector.intake"),
+        "task_policy_adr": ("task_policy_adr", "collector.task_policy_adr"),
         "deterministic_commands": ("command_batch", "collector.command"),
         # evidence_manifest 由当前 risk_result.input.manifest 本身满足，
         # 不需要在清单条目里再出现同 kind/producer 的映射对。
@@ -98,6 +100,13 @@ _COLLECTOR_MAPPING = MappingProxyType(
     }
 )
 
+_LEGACY_COLLECTOR_MAPPING = MappingProxyType(
+    {
+        **_COLLECTOR_MAPPING,
+        "task_policy_adr": ("intake_documents", "collector.intake"),
+    }
+)
+
 _REVIEWER_SCHEMA_STATUSES = frozenset({"valid", "repaired"})
 _BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 _BLOCKING_STATUSES = frozenset({"open", "acknowledged"})
@@ -108,6 +117,18 @@ _RULES_TABLE = MappingProxyType(
         "reason_order": _REASON_ORDER,
         "outcome_priority": _OUTCOME_PRIORITY,
         "collector_mapping": _COLLECTOR_MAPPING,
+        "reviewer_schema_statuses": _REVIEWER_SCHEMA_STATUSES,
+        "blocking_severities": _BLOCKING_SEVERITIES,
+        "blocking_statuses": _BLOCKING_STATUSES,
+    }
+)
+
+_LEGACY_RULES_TABLE = MappingProxyType(
+    {
+        "rules_version": _LEGACY_RULES_VERSION,
+        "reason_order": _REASON_ORDER,
+        "outcome_priority": _OUTCOME_PRIORITY,
+        "collector_mapping": _LEGACY_COLLECTOR_MAPPING,
         "reviewer_schema_statuses": _REVIEWER_SCHEMA_STATUSES,
         "blocking_severities": _BLOCKING_SEVERITIES,
         "blocking_statuses": _BLOCKING_STATUSES,
@@ -149,7 +170,11 @@ def _evidence_id(prefix: str, subject_digest: str, artifact_digest: str) -> str:
     ).hexdigest()[:32]
 
 
-def _strict_coverage_enabled(value: "PolicyEvaluationInput") -> bool:
+def _strict_coverage_enabled(
+    value: "PolicyEvaluationInput",
+    *,
+    rules_table: MappingProxyType = _RULES_TABLE,
+) -> bool:
     """Detect a real collector projection while retaining v1 fixture shape.
 
     Older callers supplied hand-authored manifest entries with opaque IDs.  A
@@ -157,9 +182,21 @@ def _strict_coverage_enabled(value: "PolicyEvaluationInput") -> bool:
     entries opt into the stronger byte/ref binding checks below.
     """
 
+    prefixes = (
+        ("ev_git_", "ev_intake_", "ev_command_", "ev_api_contract_", "ev_official_")
+        if rules_table is _LEGACY_RULES_TABLE
+        else (
+            "ev_git_",
+            "ev_intake_",
+            "ev_task_policy_adr_",
+            "ev_command_",
+            "ev_api_contract_",
+            "ev_official_",
+        )
+    )
     return any(
         entry.evidence_id.startswith(
-            ("ev_git_", "ev_intake_", "ev_command_", "ev_api_contract_", "ev_official_")
+            prefixes
         )
         for entry in value.risk_result.input.manifest.entries
     )
@@ -206,7 +243,9 @@ def project_collector_coverage(
             "collected_at": entry.collected_at,
         }
 
-    intake_entry = first_entry("intake_documents", "collector.intake")
+    intake_entry = first_entry(
+        "task_policy_adr", "collector.task_policy_adr"
+    )
     command_entries = tuple(
         entry
         for entry in manifest.entries
@@ -262,6 +301,8 @@ def project_collector_coverage(
 
 def _expected_collector_bindings(
     value: "PolicyEvaluationInput",
+    *,
+    rules_table: MappingProxyType = _RULES_TABLE,
 ) -> dict[str, dict[str, object]]:
     """Derive real collector Evidence identity from the typed risk inputs."""
 
@@ -269,6 +310,41 @@ def _expected_collector_bindings(
     snapshot = value.risk_result.input.snapshot
     intake = value.risk_result.input.intake
     manifest = value.risk_result.input.manifest
+    if rules_table is _LEGACY_RULES_TABLE:
+        task_manifest_digest = intake.manifest_artifact_digest
+        task_policy_binding = {
+            "evidence_id": _evidence_id(
+                "ev_intake_", subject, task_manifest_digest
+            ),
+            "kind": "intake_documents",
+            "producer": "collector.intake",
+            "subject_digest": subject,
+            "artifact_digest": task_manifest_digest,
+            "source_ref": f"intake_documents:{subject}",
+            "status": "success" if intake.complete else "truncated",
+            "trust_level": "deterministic",
+            "collected_at": intake.collected_at,
+        }
+    else:
+        task_policy_payload = _task_policy_manifest_payload(intake)
+        task_policy_digest = _sha256_digest(
+            _canonical_json_bytes(task_policy_payload)
+        )
+        task_policy_binding = {
+            "evidence_id": _evidence_id(
+                "ev_task_policy_adr_", subject, task_policy_digest
+            ),
+            "kind": "task_policy_adr",
+            "producer": "collector.task_policy_adr",
+            "subject_digest": subject,
+            "artifact_digest": task_policy_digest,
+            "source_ref": f"task_policy_adr:{subject}",
+            "status": "success"
+            if task_policy_payload["complete"]
+            else "truncated",
+            "trust_level": "deterministic",
+            "collected_at": intake.collected_at,
+        }
     expected = {
         "git_snapshot": {
             "evidence_id": _evidence_id(
@@ -286,19 +362,7 @@ def _expected_collector_bindings(
             "trust_level": "deterministic",
             "collected_at": snapshot.collected_at,
         },
-        "task_policy_adr": {
-            "evidence_id": _evidence_id(
-                "ev_intake_", subject, intake.manifest_artifact_digest
-            ),
-            "kind": "intake_documents",
-            "producer": "collector.intake",
-            "subject_digest": subject,
-            "artifact_digest": intake.manifest_artifact_digest,
-            "source_ref": f"intake_documents:{subject}",
-            "status": "success" if intake.complete else "truncated",
-            "trust_level": "deterministic",
-            "collected_at": intake.collected_at,
-        },
+        "task_policy_adr": task_policy_binding,
         "deterministic_commands": {
             "kind": "command_batch",
             "producer": "collector.command",
@@ -373,6 +437,9 @@ def _entry_matches_projection(entry, expected: dict[str, object]) -> bool:
 
 _RULES_DIGEST = _sha256_digest(
     _canonical_json_bytes(_jsonable(_RULES_TABLE))
+)
+_LEGACY_RULES_DIGEST = _sha256_digest(
+    _canonical_json_bytes(_jsonable(_LEGACY_RULES_TABLE))
 )
 
 __all__ = (
@@ -601,7 +668,11 @@ def _stale_reasons(value: PolicyEvaluationInput) -> tuple[str, ...]:
     return tuple(dict.fromkeys(reasons))
 
 
-def _blocked_reasons(value: PolicyEvaluationInput) -> tuple[str, ...]:
+def _blocked_reasons(
+    value: PolicyEvaluationInput,
+    *,
+    rules_table: MappingProxyType = _RULES_TABLE,
+) -> tuple[str, ...]:
     reasons = []
     manifest = value.risk_result.input.manifest
     evaluated_at = value.evaluated_at
@@ -620,9 +691,13 @@ def _blocked_reasons(value: PolicyEvaluationInput) -> tuple[str, ...]:
     ):
         reasons.append("EVIDENCE_EXPIRED")
 
-    collector_mapping = _RULES_TABLE["collector_mapping"]
-    strict_coverage = _strict_coverage_enabled(value)
-    expected_coverage = _expected_collector_bindings(value) if strict_coverage else {}
+    collector_mapping = rules_table["collector_mapping"]
+    strict_coverage = _strict_coverage_enabled(value, rules_table=rules_table)
+    expected_coverage = (
+        _expected_collector_bindings(value, rules_table=rules_table)
+        if strict_coverage
+        else {}
+    )
     if strict_coverage and any(
         entry.kind == "evidence_manifest"
         or entry.evidence_id == expected_coverage.get("evidence_manifest", {}).get("evidence_id")
@@ -666,7 +741,7 @@ def _blocked_reasons(value: PolicyEvaluationInput) -> tuple[str, ...]:
         if not qualifying:
             reasons.append("REQUIRED_COLLECTOR_NOT_FRESH")
 
-    reviewer_schema = _RULES_TABLE["reviewer_schema_statuses"]
+    reviewer_schema = rules_table["reviewer_schema_statuses"]
     steps = [
         step
         for receipt in value.execution_receipts
@@ -811,11 +886,13 @@ def _pass_or_waiver(
 
 def _derive_outcome(
     value: PolicyEvaluationInput,
+    *,
+    rules_table: MappingProxyType = _RULES_TABLE,
 ) -> tuple[str, tuple[str, ...], str | None]:
     stale = _stale_reasons(value)
     if stale:
         return "STALE", stale, None
-    blocked = _blocked_reasons(value)
+    blocked = _blocked_reasons(value, rules_table=rules_table)
     if blocked:
         return "BLOCKED", blocked, None
     needed = _needs_human_reasons(value)
@@ -825,16 +902,23 @@ def _derive_outcome(
     return outcome, (), waiver_ref
 
 
-def _derive_decision(value: PolicyEvaluationInput) -> PolicyDecision:
+def _derive_decision(
+    value: PolicyEvaluationInput,
+    *,
+    rules_table: MappingProxyType = _RULES_TABLE,
+    rules_digest: str = _RULES_DIGEST,
+) -> PolicyDecision:
     if type(value) is not PolicyEvaluationInput:
         raise TypeError("value must be an exact PolicyEvaluationInput")
-    outcome, reason_codes, waiver_ref = _derive_outcome(value)
+    outcome, reason_codes, waiver_ref = _derive_outcome(
+        value, rules_table=rules_table
+    )
     decision_data = {
         "schema_version": "v1",
         "decision_id": "",
         "subject_digest": value.subject.subject_digest,
         "policy_version": value.subject.policy_version,
-        "rules_digest": _RULES_DIGEST,
+        "rules_digest": rules_digest,
         "outcome": outcome,
         "reason_codes": reason_codes,
         "required_collectors": (
@@ -903,7 +987,16 @@ class PolicyGateResult(BaseModel):
     @model_validator(mode="after")
     def _require_derived_decision(self) -> "PolicyGateResult":
         _validate_decision_grammar(self.decision)
-        derived = _derive_decision(self.input)
+        if self.decision.rules_digest == _RULES_DIGEST:
+            derived = _derive_decision(self.input)
+        elif self.decision.rules_digest == _LEGACY_RULES_DIGEST:
+            derived = _derive_decision(
+                self.input,
+                rules_table=_LEGACY_RULES_TABLE,
+                rules_digest=_LEGACY_RULES_DIGEST,
+            )
+        else:
+            raise ValueError("decision rules_digest is unsupported")
         if self.decision != derived:
             raise ValueError("decision must equal the derived decision")
         return self

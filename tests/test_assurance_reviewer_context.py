@@ -9,12 +9,13 @@ from datetime import datetime, timezone
 import pytest
 
 import assurance.evidence_artifacts as evidence_artifacts_module
+import assurance.intake as intake_module
 import assurance.reviewer_context as reviewer_context_module
 from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandObservation
 from assurance.contracts import Evidence
 from assurance.evidence_artifacts import EvidenceArtifactResolver
-from assurance.intake import IntakeDocument, IntakeNotice
+from assurance.intake import IntakeDocument, IntakeNotice, IntakeSnapshot
 from assurance.manifest import EvidenceManifestBuilder, EvidenceManifestInput
 from assurance.official_evidence import (
     OfficialEvidenceReceipt,
@@ -223,6 +224,54 @@ def _base_evidences(
     )
 
 
+def _task_policy_evidence(store: ArtifactStore, evidences):
+    intake_evidence = evidences[1].model_copy(
+        update={
+            "evidence_id": "ev_intake_"
+            + hashlib.sha256(
+                (SUBJECT + evidences[1].artifact_digest).encode("ascii")
+            ).hexdigest()[:32],
+            "source_ref": f"intake_documents:{SUBJECT}",
+        }
+    )
+    manifest = json.loads(store.get_bytes(intake_evidence.artifact_digest))
+    documents = tuple(
+        IntakeDocument.model_validate(item) for item in manifest["documents"]
+    )
+    notices = tuple(
+        IntakeNotice.model_validate(item) for item in manifest["notices"]
+    )
+    snapshot = IntakeSnapshot(
+        subject_digest=SUBJECT,
+        documents=documents,
+        notices=notices,
+        task_digest=manifest["task_digest"],
+        task_present=manifest["task_present"],
+        policy_count=manifest["policy_count"],
+        adr_count=manifest["adr_count"],
+        runbook_count=manifest["runbook_count"],
+        manifest_artifact_digest=intake_evidence.artifact_digest,
+        complete=manifest["complete"],
+        collected_at=NOW,
+    )
+    payload = intake_module._task_policy_manifest_payload(
+        snapshot, intake_evidence
+    )
+    digest = store.put_bytes(_json(payload))
+    return _evidence(
+        "task_policy_adr",
+        "collector.task_policy_adr",
+        digest,
+        status="success" if payload["complete"] else "truncated",
+    ).model_copy(
+        update={
+            "evidence_id": "ev_task_policy_adr_"
+            + hashlib.sha256((SUBJECT + digest).encode("ascii")).hexdigest()[:32],
+            "source_ref": f"task_policy_adr:{SUBJECT}",
+        }
+    )
+
+
 def _prepare(
     store: ArtifactStore,
     evidences: tuple[Evidence, ...],
@@ -391,6 +440,66 @@ def test_real_artifacts_build_stable_bounded_context_and_omit_forbidden_data(
         "items": [],
     }
     assert intake["payload"]["adr_paths"] == []
+
+
+def test_task_policy_projection_reads_only_bounded_top_level_artifact(
+    tmp_path, monkeypatch
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    base = _base_evidences(store)
+    evidence = _task_policy_evidence(store, base)
+    resolved = EvidenceArtifactResolver.resolve(
+        evidence, artifact_store=store, subject_digest=SUBJECT
+    )
+    original_get_bytes = ArtifactStore.get_bytes
+    calls = []
+
+    def tracked_get_bytes(instance, digest):
+        calls.append(digest)
+        return original_get_bytes(instance, digest)
+
+    monkeypatch.setattr(ArtifactStore, "get_bytes", tracked_get_bytes)
+    projection = reviewer_context_module._task_policy_payload(
+        resolved, evidence, artifact_store=store
+    )
+
+    assert calls == []
+    assert "RUNBOOK_BODY_MUST_NOT_LEAVE_CAS" not in json.dumps(projection)
+    assert projection["payload"]["adr_paths"] == []
+
+
+@pytest.mark.parametrize("tamper", ("size", "count", "path"))
+def test_task_policy_projection_rejects_nested_metadata_before_followup_read(
+    tmp_path, monkeypatch, tamper
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    base = _base_evidences(store)
+    evidence = _task_policy_evidence(store, base)
+    payload = json.loads(store.get_bytes(evidence.artifact_digest))
+    if tamper == "size":
+        payload["documents"][0]["byte_size"] = 2**31
+    elif tamper == "count":
+        payload["documents"] = payload["documents"] * 65
+    else:
+        payload["documents"][0]["path"] = "../outside.md"
+    digest = store.put_bytes(_json(payload))
+    tampered = evidence.model_copy(update={"artifact_digest": digest})
+    resolved = EvidenceArtifactResolver.resolve(
+        tampered, artifact_store=store, subject_digest=SUBJECT
+    )
+    original_get_bytes = ArtifactStore.get_bytes
+    calls = []
+
+    def tracked_get_bytes(instance, requested_digest):
+        calls.append(requested_digest)
+        return original_get_bytes(instance, requested_digest)
+
+    monkeypatch.setattr(ArtifactStore, "get_bytes", tracked_get_bytes)
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._task_policy_payload(
+            resolved, tampered, artifact_store=store
+        )
+    assert calls == []
 
 
 def test_command_failure_projection_preserves_complete_snapshot_status(tmp_path):
@@ -1166,6 +1275,19 @@ def test_official_report_context_is_redacted_as_semantic_json(
         "truncated": False,
         "omissions": [],
         "subject_digest": SUBJECT,
+    }
+    assert payload["aggregate"] == {
+        "tool": "pnpm",
+        "command": "pnpm audit --prod --audit-level=high --json",
+        "status": "safe_assessed",
+        "severity_counts": {
+            "critical": 0,
+            "high": 0,
+            "moderate": 0,
+            "low": 0,
+            "info": 0,
+            "unknown": 0,
+        },
     }
     assert payload["lineage"] == {
         "repository": "example/repository",

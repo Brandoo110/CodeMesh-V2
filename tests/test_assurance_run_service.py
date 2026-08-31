@@ -702,6 +702,7 @@ def test_official_dependency_evidence_flows_through_manifest_risk_policy_and_bun
     assert [item.kind for item in result.bundle.evidence] == [
         "git_snapshot",
         "intake_documents",
+        "task_policy_adr",
         "command_batch",
         "evidence_manifest",
         "dependency_audit",
@@ -1221,6 +1222,7 @@ def test_prepare_returns_complete_bundle_without_committer_io(tmp_path):
     assert bundle.evidence == (
         bundle.git.evidence,
         bundle.intake.evidence,
+        next(item for item in bundle.evidence if item.kind == "task_policy_adr"),
         bundle.commands.evidence,
         bundle.manifest.evidence,
     )
