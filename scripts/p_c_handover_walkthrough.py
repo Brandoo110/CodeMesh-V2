@@ -24,6 +24,7 @@ from assurance.run_service import (
     ReviewerInvocationResponse,
     ReviewerRoute,
 )
+from assurance.snapshot import GitSnapshot
 from web.assurance_store import AssuranceWebRepository, get_assurance_repository
 from web.server import create_app
 
@@ -73,8 +74,15 @@ def _make_isolated_git_repo(
 class _PCHandoverContextBuilder:
     """Deterministic safe-context adapter; the run service remains authoritative."""
 
-    def prepare(self, evidences, *, artifact_store, subject_digest):
-        del artifact_store, subject_digest
+    def prepare(
+        self,
+        evidences,
+        *,
+        artifact_store,
+        subject_digest,
+        git_snapshot: GitSnapshot | None = None,
+    ):
+        del artifact_store, subject_digest, git_snapshot
         return ReviewerContextPlan(
             entries=tuple(
                 ReviewerContextPlanEntry(
