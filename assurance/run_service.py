@@ -38,6 +38,7 @@ from pydantic import (
 )
 
 from .artifacts import ArtifactStore
+from .api_contract import ApiContractCollector, ApiContractResult
 from .commands import (
     CommandBatchResult,
     CommandSpec,
@@ -100,6 +101,16 @@ _DEFAULT_POLICY_VERSION = "gate.v0"
 _DEFAULT_RUBRIC_VERSION = "single_general.v0"
 _DEFAULT_ORCHESTRATION_VERSION = "golden.v1"
 _DEFAULT_ROUTING_RULE = "single_general.v0:shared_invocation"
+SUPPORTED_COLLECTOR_EVIDENCE_KINDS = (
+    "git_snapshot",
+    "intake_documents",
+    "command_batch",
+    "evidence_manifest",
+    "api_contract",
+    "dependency_audit",
+    "ci_iac_validation",
+)
+MAX_SUPPORTED_EVIDENCE = len(SUPPORTED_COLLECTOR_EVIDENCE_KINDS)
 _REVIEWER_ROLES = ("intent", "architecture", "operability")
 _SAFE_REDACTION = frozenset({"declared_redacted", "not_applicable"})
 _REVIEWER_FAILURE_CODES = {
@@ -154,6 +165,36 @@ _CREDENTIAL_MARKERS = (
 
 def _sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _api_evidence_id(
+    subject_digest: str,
+    head_revision: str,
+    evidence: Evidence,
+) -> str:
+    material = "|".join(
+        (
+            subject_digest,
+            head_revision,
+            "contracts/openapi.json",
+            evidence.artifact_digest,
+            evidence.status,
+        )
+    ).encode("ascii")
+    return "ev_api_contract_" + hashlib.sha256(material).hexdigest()[:32]
+
+
+def _api_contract_required(snapshot: Any) -> bool:
+    """Mirror the risk module's public-API path signal without I/O."""
+
+    for change in snapshot.changes:
+        segments = change.path.lower().split("/")
+        if (
+            any(segment in {"api", "routes", "openapi"} for segment in segments)
+            or segments[-1] in {"openapi.json", "openapi.yaml", "openapi.yml"}
+        ):
+            return True
+    return False
 
 
 def _latency_ms(started: datetime, completed: datetime) -> int:
@@ -993,7 +1034,9 @@ class AssuranceRunBundle(BaseModel):
     commands: CommandBatchResult
     manifest: EvidenceManifestResult
     risk: RiskClassificationResult
-    evidence: tuple[Evidence, ...] = Field(min_length=4, max_length=6)
+    evidence: tuple[Evidence, ...] = Field(
+        min_length=4, max_length=MAX_SUPPORTED_EVIDENCE
+    )
     findings: tuple[Finding, ...] = ()
     questions: tuple[ReviewQuestion, ...] = ()
     reviewer: ReviewerRunRecord
@@ -1061,12 +1104,31 @@ class AssuranceRunBundle(BaseModel):
         )
         if self.evidence[:4] != expected:
             raise ValueError("bundle evidence must use the fixed collector order")
-        official_evidence = self.evidence[4:]
+        tail_evidence = self.evidence[4:]
+        api_evidence = tuple(
+            item for item in tail_evidence if item.kind == "api_contract"
+        )
+        official_evidence = tuple(
+            item for item in tail_evidence if item.kind in OFFICIAL_EVIDENCE_KINDS
+        )
+        if len(api_evidence) > 1:
+            raise ValueError("bundle api_contract Evidence must be unique")
+        if any(
+            item.producer != "collector.api_contract"
+            or item.trace_id is not None
+            or item.status not in {"success", "truncated"}
+            or item.trust_level != "deterministic"
+            or item.subject_digest != subject_digest
+            or item.source_ref != "api_contract:contracts/openapi.json"
+            or item.evidence_id
+            != _api_evidence_id(subject_digest, self.git.snapshot.head_revision, item)
+            for item in api_evidence
+        ):
+            raise ValueError("bundle api_contract Evidence is invalid")
         if len(official_evidence) > len(OFFICIAL_EVIDENCE_KINDS):
             raise ValueError("bundle contains too many official Evidence items")
         if any(
-            item.kind not in OFFICIAL_EVIDENCE_KINDS
-            or item.producer != f"collector.{item.kind}"
+            item.producer != f"collector.{item.kind}"
             or item.status != "success"
             or item.trust_level != "observed"
             or item.subject_digest != subject_digest
@@ -1075,6 +1137,19 @@ class AssuranceRunBundle(BaseModel):
             raise ValueError("bundle official Evidence is invalid")
         if len({item.kind for item in official_evidence}) != len(official_evidence):
             raise ValueError("bundle official Evidence kinds must be unique")
+        if len(api_evidence) + len(official_evidence) != len(tail_evidence):
+            raise ValueError("bundle Evidence contains an unsupported collector kind")
+        expected_tail = api_evidence + official_evidence
+        if tail_evidence != expected_tail:
+            raise ValueError("bundle Evidence must use the fixed collector order")
+        bundle_evidence_ids = tuple(item.evidence_id for item in self.evidence)
+        manifest_entry_ids = tuple(
+            item.evidence_id for item in self.manifest.manifest.entries
+        )
+        if len(bundle_evidence_ids) != len(set(bundle_evidence_ids)):
+            raise ValueError("bundle Evidence evidence_id values must be unique")
+        if len(manifest_entry_ids) != len(set(manifest_entry_ids)):
+            raise ValueError("manifest Evidence evidence_id values must be unique")
         expected_manifest_evidence_ids = {
             item.evidence_id
             for item in self.evidence
@@ -1191,6 +1266,7 @@ class ReviewerContextBuilder(Protocol):
         *,
         artifact_store: ArtifactStore,
         subject_digest: str,
+        git_snapshot: Any | None = None,
     ) -> ReviewerContextPlan:
         """Assess and optionally expose redacted content for each Evidence."""
 
@@ -1226,6 +1302,7 @@ class AssuranceRunService:
         config: AssuranceRunConfig,
         git_collector: Any | None = None,
         intake_collector: Any | None = None,
+        api_contract_collector: Any | None = None,
         clock: Any | None = None,
     ) -> None:
         if type(artifact_store) is not ArtifactStore:
@@ -1245,6 +1322,9 @@ class AssuranceRunService:
         self._context_builder = context_builder
         self._git_collector = git_collector or GitSnapshotCollector()
         self._intake_collector = intake_collector or TaskPolicyCollector()
+        self._api_contract_collector = (
+            api_contract_collector or ApiContractCollector()
+        )
         self._command_collector = DeterministicCommandCollector(
             config.allowed_commands
         )
@@ -1371,10 +1451,30 @@ class AssuranceRunService:
         self._require_type(command_result, CommandBatchResult, "command collector result")
         self._require_subjects(subject_digest, command_result)
 
-        evidences = (
+        base_evidences = (
             git_result.evidence,
             intake_result.evidence,
             command_result.evidence,
+        )
+        api_result: ApiContractResult | None = None
+        if _api_contract_required(git_result.snapshot):
+            api_result = await asyncio.to_thread(
+                self._api_contract_collector.collect,
+                intent.repository_path,
+                subject_digest=subject_digest,
+                head_revision=git_result.snapshot.head_revision,
+                artifact_store=self._artifact_store,
+                collected_at=started_at,
+            )
+            self._require_type(api_result, ApiContractResult, "api contract collector result")
+            self._require_subjects(subject_digest, api_result)
+            # A missing fixed source has no Evidence to bind into the
+            # manifest.  Keep the absence explicit to the policy gate rather
+            # than fabricating a successful or truncated collector entry.
+            if api_result.snapshot.omissions == ("source_missing",):
+                api_result = None
+        collector_evidences = base_evidences + (
+            (api_result.evidence,) if api_result is not None else ()
         )
         official_imports = await asyncio.to_thread(
             self._import_official_evidence,
@@ -1385,9 +1485,12 @@ class AssuranceRunService:
             collected_at=started_at,
         )
         official_evidences = tuple(item.evidence for item in official_imports)
-        all_evidences = evidences + official_evidences
+        all_evidences = collector_evidences + official_evidences
         context_plan = await asyncio.to_thread(
-            self._prepare_context, all_evidences, subject_digest
+            self._prepare_context,
+            all_evidences,
+            subject_digest,
+            git_result.snapshot,
         )
         manifest_result = await asyncio.to_thread(
             self._build_manifest,
@@ -1434,19 +1537,37 @@ class AssuranceRunService:
         )
 
         run_id = self._run_id(request_digest, idempotency_key)
-        collected_official_kinds = {item.kind for item in official_evidences}
-        missing_official = tuple(
-            kind
-            for kind in risk_result.classification.required_collectors
-            if kind in OFFICIAL_EVIDENCE_KINDS
-            and kind not in collected_official_kinds
+        required_gaps = self._required_collector_gaps(
+            risk_result,
+            base_evidences=base_evidences,
+            manifest_evidence=manifest_result.evidence,
+            api_evidence=api_result.evidence if api_result is not None else None,
+            official_evidences=official_evidences,
         )
-        if missing_official:
+        redaction_unsafe = any(
+            item.disposition == RedactionDisposition.CONTAINS_UNREDACTED_CONTENT
+            for item in context_plan.entries
+        )
+        if redaction_unsafe:
+            reviewer_record, findings, questions, receipt = await self._review(
+                subject=subject,
+                risk_result=risk_result,
+                context_plan=context_plan,
+                run_id=run_id,
+                evaluated_at=self._now(),
+            )
+        elif required_gaps:
+            blocked_reason = (
+                "api_contract_missing"
+                if required_gaps == ("api_contract",)
+                else "official_evidence_missing"
+            )
             reviewer_record, findings, questions, receipt = (
                 self._blocked_evidence_review(
                     subject_digest=subject.subject_digest,
                     run_id=run_id,
                     evaluated_at=self._now(),
+                    fallback_reason=blocked_reason,
                 )
             )
         else:
@@ -1479,6 +1600,7 @@ class AssuranceRunService:
             manifest_result,
             fence_collection_at,
             official_imports,
+            api_result=api_result,
         )
         freshness_source_binding = await asyncio.to_thread(
             self._build_freshness_source_binding,
@@ -1490,7 +1612,12 @@ class AssuranceRunService:
         case, events = self._build_case_and_events(
             draft_case=draft_case,
             subject_digest=subject_digest,
-            evidence=evidences + (manifest_result.evidence,) + official_evidences,
+            evidence=(
+                base_evidences
+                + (manifest_result.evidence,)
+                + ((api_result.evidence,) if api_result is not None else ())
+                + official_evidences
+            ),
             findings=findings,
             questions=questions,
             receipt=receipt,
@@ -1511,7 +1638,12 @@ class AssuranceRunService:
             commands=command_result,
             manifest=manifest_result,
             risk=risk_result,
-            evidence=evidences + (manifest_result.evidence,) + official_evidences,
+            evidence=(
+                base_evidences
+                + (manifest_result.evidence,)
+                + ((api_result.evidence,) if api_result is not None else ())
+                + official_evidences
+            ),
             findings=findings,
             questions=questions,
             reviewer=reviewer_record,
@@ -1819,13 +1951,17 @@ class AssuranceRunService:
             raise AssuranceRunStaleError("collector result subject digest mismatch")
 
     def _prepare_context(
-        self, evidences: tuple[Evidence, ...], subject_digest: str
+        self,
+        evidences: tuple[Evidence, ...],
+        subject_digest: str,
+        git_snapshot: Any | None = None,
     ) -> ReviewerContextPlan:
         try:
             value = self._context_builder.prepare(
                 evidences,
                 artifact_store=self._artifact_store,
                 subject_digest=subject_digest,
+                git_snapshot=git_snapshot,
             )
         except Exception as exc:
             raise AssuranceRunRedactionError("redaction assessment failed") from exc
@@ -1947,12 +2083,45 @@ class AssuranceRunService:
             author_provenance=intent.author_provenance,
         )
 
+    @staticmethod
+    def _required_collector_gaps(
+        risk_result: RiskClassificationResult,
+        *,
+        base_evidences: tuple[Evidence, ...],
+        manifest_evidence: Evidence,
+        api_evidence: Evidence | None,
+        official_evidences: tuple[Evidence, ...],
+    ) -> tuple[str, ...]:
+        """Return required collectors that are absent or not successful.
+
+        A truncated or failed collector is never handed to the provider as a
+        successful run.  The same gate applies to local and official evidence;
+        the latter remains subject to its importer-specific proof fence.
+        """
+
+        by_name: dict[str, Evidence] = {
+            "git_snapshot": base_evidences[0],
+            "task_policy_adr": base_evidences[1],
+            "deterministic_commands": base_evidences[2],
+            "evidence_manifest": manifest_evidence,
+        }
+        if api_evidence is not None:
+            by_name["api_contract"] = api_evidence
+        by_name.update({item.kind: item for item in official_evidences})
+        gaps = []
+        for collector in risk_result.classification.required_collectors:
+            evidence = by_name.get(collector)
+            if evidence is None or evidence.status != "success":
+                gaps.append(collector)
+        return tuple(gaps)
+
     def _blocked_evidence_review(
         self,
         *,
         subject_digest: str,
         run_id: str,
         evaluated_at: datetime,
+        fallback_reason: str = "official_evidence_missing",
     ) -> tuple[
         ReviewerRunRecord,
         tuple[Finding, ...],
@@ -1971,6 +2140,7 @@ class AssuranceRunService:
             completed_at=evaluated_at,
             actual_provider=None,
             actual_model_ref=None,
+            fallback_reason=fallback_reason,
         )
         reviewer = ReviewerRunRecord(
             status="blocked_evidence",
@@ -2309,9 +2479,10 @@ class AssuranceRunService:
         input_tokens: int = 0,
         output_tokens: int = 0,
         cost_usd: float = 0.0,
+        fallback_reason: str | None = None,
     ) -> ExecutionReceipt:
         if status in {"blocked_redaction", "blocked_evidence"}:
-            fallback_reason = (
+            fallback_reason = fallback_reason or (
                 "redaction_unsafe"
                 if status == "blocked_redaction"
                 else "official_evidence_missing"
@@ -2391,6 +2562,7 @@ class AssuranceRunService:
         manifest: EvidenceManifestResult,
         collected_at: datetime,
         official_imports: tuple[OfficialEvidenceImport, ...] = (),
+        api_result: ApiContractResult | None = None,
     ) -> datetime:
         try:
             final_git = self._git_collector.collect(
@@ -2422,6 +2594,27 @@ class AssuranceRunService:
             raise AssuranceRunStaleError("Git changed during reviewer execution")
         if _strip_datetimes(_jsonable(final_intake)) != _strip_datetimes(_jsonable(initial_intake)):
             raise AssuranceRunStaleError("intake documents changed during reviewer execution")
+        if api_result is not None:
+            try:
+                final_api = self._api_contract_collector.collect(
+                    intent.repository_path,
+                    subject_digest=subject_digest,
+                    head_revision=initial_git.snapshot.head_revision,
+                    artifact_store=self._artifact_store,
+                    collected_at=collected_at,
+                )
+            except Exception as exc:
+                raise AssuranceRunStaleError(
+                    "API contract changed during reviewer execution"
+                ) from exc
+            if type(final_api) is not ApiContractResult:
+                raise AssuranceRunStaleError(
+                    "final API contract collector returned invalid result"
+                )
+            if _strip_datetimes(_jsonable(final_api)) != _strip_datetimes(_jsonable(api_result)):
+                raise AssuranceRunStaleError(
+                    "API contract changed during reviewer execution"
+                )
         if official_imports:
             try:
                 importer = OfficialEvidenceImporter(

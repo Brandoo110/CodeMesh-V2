@@ -27,6 +27,7 @@ from .contracts import (
     HumanDecision,
     PolicyDecision,
 )
+from .digests import normalize_repo_path
 from .risk import RiskClassificationResult
 
 
@@ -140,6 +141,234 @@ def _canonical_json_bytes(value) -> bytes:
 
 def _sha256_digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _evidence_id(prefix: str, subject_digest: str, artifact_digest: str) -> str:
+    return prefix + hashlib.sha256(
+        (subject_digest + artifact_digest).encode("ascii")
+    ).hexdigest()[:32]
+
+
+def _strict_coverage_enabled(value: "PolicyEvaluationInput") -> bool:
+    """Detect a real collector projection while retaining v1 fixture shape.
+
+    Older callers supplied hand-authored manifest entries with opaque IDs.  A
+    real collector result carries its derived ``ev_*`` identity; only those
+    entries opt into the stronger byte/ref binding checks below.
+    """
+
+    return any(
+        entry.evidence_id.startswith(
+            ("ev_git_", "ev_intake_", "ev_command_", "ev_api_contract_", "ev_official_")
+        )
+        for entry in value.risk_result.input.manifest.entries
+    )
+
+
+def project_collector_coverage(
+    value: "PolicyEvaluationInput",
+) -> tuple[dict[str, object], ...]:
+    """Project only typed collector facts into a deterministic coverage view.
+
+    This helper is deliberately pure.  It never reads CAS; all bytes are
+    represented by the already-bound artifact digests and the original
+    collector Evidence fields.  The manifest projection excludes its own
+    synthetic entry so the closure cannot recurse.
+    """
+
+    if type(value) is not PolicyEvaluationInput:
+        raise TypeError("value must be an exact PolicyEvaluationInput")
+    subject = value.subject.subject_digest
+    intake = value.risk_result.input.intake
+    manifest = value.risk_result.input.manifest
+
+    def first_entry(kind: str, producer: str):
+        return next(
+            (
+                entry
+                for entry in manifest.entries
+                if entry.kind == kind and entry.producer == producer
+            ),
+            None,
+        )
+
+    def evidence_projection(entry):
+        if entry is None:
+            return None
+        return {
+            "evidence_id": entry.evidence_id,
+            "kind": entry.kind,
+            "producer": entry.producer,
+            "subject_digest": entry.subject_digest,
+            "artifact_digest": entry.artifact_digest,
+            "source_ref": entry.source_ref,
+            "status": entry.status,
+            "collected_at": entry.collected_at,
+        }
+
+    intake_entry = first_entry("intake_documents", "collector.intake")
+    command_entries = tuple(
+        entry
+        for entry in manifest.entries
+        if entry.kind == "command_batch" and entry.producer == "collector.command"
+    )
+    command_entry = command_entries[0] if command_entries else None
+    manifest_id = "ev_manifest_" + hashlib.sha256(
+        (manifest.manifest_id + manifest.artifact_digest).encode("ascii")
+    ).hexdigest()[:32]
+    return (
+        {
+            "collector": "task_policy_adr",
+            "evidence": evidence_projection(intake_entry),
+            "documents": tuple(
+                {
+                    "kind": document.kind,
+                    "path": document.path,
+                    "artifact_digest": document.artifact_digest,
+                    "byte_size": document.byte_size,
+                }
+                for document in intake.documents
+                if document.kind in {"task_spec", "policy", "adr"}
+            ),
+        },
+        {
+            "collector": "deterministic_commands",
+            "evidence": evidence_projection(command_entry),
+            "observations": (),
+        },
+        {
+            "collector": "evidence_manifest",
+            "evidence": {
+                "kind": "evidence_manifest",
+                "producer": "builder.evidence_manifest",
+                "subject_digest": subject,
+                "artifact_digest": manifest.artifact_digest,
+                "status": "success"
+                if manifest.completeness_status == "complete"
+                else "truncated",
+                "source_ref": f"evidence_manifest:{manifest.manifest_id}",
+                "evidence_id": manifest_id,
+                "collected_at": manifest.evaluated_at,
+            },
+            "entries": tuple(
+                entry.model_dump(mode="json")
+                for entry in manifest.entries
+                if entry.kind != "evidence_manifest"
+                and entry.evidence_id != manifest.manifest_id
+            ),
+        },
+    )
+
+
+def _expected_collector_bindings(
+    value: "PolicyEvaluationInput",
+) -> dict[str, dict[str, object]]:
+    """Derive real collector Evidence identity from the typed risk inputs."""
+
+    subject = value.subject.subject_digest
+    snapshot = value.risk_result.input.snapshot
+    intake = value.risk_result.input.intake
+    manifest = value.risk_result.input.manifest
+    expected = {
+        "git_snapshot": {
+            "evidence_id": _evidence_id(
+                "ev_git_", subject, snapshot.diff_artifact_digest
+            ),
+            "kind": "git_snapshot",
+            "producer": "collector.git",
+            "subject_digest": subject,
+            "artifact_digest": snapshot.diff_artifact_digest,
+            "source_ref": (
+                f"git_snapshot:{snapshot.repository}:{snapshot.base_revision}:"
+                f"{snapshot.head_revision}:base_to_worktree"
+            ),
+            "status": "success" if snapshot.complete else "truncated",
+            "trust_level": "deterministic",
+            "collected_at": snapshot.collected_at,
+        },
+        "task_policy_adr": {
+            "evidence_id": _evidence_id(
+                "ev_intake_", subject, intake.manifest_artifact_digest
+            ),
+            "kind": "intake_documents",
+            "producer": "collector.intake",
+            "subject_digest": subject,
+            "artifact_digest": intake.manifest_artifact_digest,
+            "source_ref": f"intake_documents:{subject}",
+            "status": "success" if intake.complete else "truncated",
+            "trust_level": "deterministic",
+            "collected_at": intake.collected_at,
+        },
+        "deterministic_commands": {
+            "kind": "command_batch",
+            "producer": "collector.command",
+            "subject_digest": subject,
+            "source_ref": f"command_batch:{subject}",
+            "trust_level": "deterministic",
+        },
+        "evidence_manifest": {
+            "evidence_id": "ev_manifest_" + hashlib.sha256(
+                (manifest.manifest_id + manifest.artifact_digest).encode("ascii")
+            ).hexdigest()[:32],
+        },
+        "api_contract": {
+            "kind": "api_contract",
+            "producer": "collector.api_contract",
+            "subject_digest": subject,
+            "source_ref": "api_contract:contracts/openapi.json",
+            "trust_level": "deterministic",
+        },
+    }
+    command_entries = tuple(
+        entry
+        for entry in manifest.entries
+        if entry.kind == "command_batch"
+        and entry.producer == "collector.command"
+    )
+    if command_entries:
+        expected["deterministic_commands"]["status"] = command_entries[0].status
+        expected["deterministic_commands"]["artifact_digest"] = command_entries[0].artifact_digest
+        expected["deterministic_commands"]["evidence_id"] = _evidence_id(
+            "ev_command_", subject, command_entries[0].artifact_digest
+        )
+        expected["deterministic_commands"]["collected_at"] = command_entries[0].collected_at
+    for entry in manifest.entries:
+        if entry.kind != "api_contract" or entry.producer != "collector.api_contract":
+            continue
+        if entry.source_ref != "api_contract:contracts/openapi.json":
+            continue
+        expected["api_contract"]["evidence_id"] = "ev_api_contract_" + hashlib.sha256(
+            "|".join(
+                (
+                    subject,
+                    snapshot.head_revision,
+                    "contracts/openapi.json",
+                    entry.artifact_digest,
+                    entry.status,
+                )
+            ).encode("ascii")
+        ).hexdigest()[:32]
+    return expected
+
+
+def _entry_matches_projection(entry, expected: dict[str, object]) -> bool:
+    values = entry.model_dump(mode="python")
+    for key, expected_value in expected.items():
+        if key == "source_ref_prefix":
+            if not entry.source_ref.startswith(str(expected_value)):
+                return False
+            suffix = entry.source_ref[len(str(expected_value)):]
+            if suffix == "missing":
+                return False
+            try:
+                if normalize_repo_path(suffix) != suffix:
+                    return False
+            except (TypeError, ValueError):
+                return False
+            continue
+        if values.get(key, object()) != expected_value:
+            return False
+    return True
 
 
 _RULES_DIGEST = _sha256_digest(
@@ -392,6 +621,16 @@ def _blocked_reasons(value: PolicyEvaluationInput) -> tuple[str, ...]:
         reasons.append("EVIDENCE_EXPIRED")
 
     collector_mapping = _RULES_TABLE["collector_mapping"]
+    strict_coverage = _strict_coverage_enabled(value)
+    expected_coverage = _expected_collector_bindings(value) if strict_coverage else {}
+    if strict_coverage and any(
+        entry.kind == "evidence_manifest"
+        or entry.evidence_id == expected_coverage.get("evidence_manifest", {}).get("evidence_id")
+        for entry in manifest.entries
+    ):
+        # The manifest is the closed view of the other Evidence; including it
+        # as one of its own entries would make coverage recursive.
+        reasons.append("REQUIRED_COLLECTOR_NOT_SUCCESS")
     for collector_name in value.risk_result.classification.required_collectors:
         mapping = collector_mapping[collector_name]
         if mapping is None:
@@ -411,6 +650,13 @@ def _blocked_reasons(value: PolicyEvaluationInput) -> tuple[str, ...]:
         if not successes:
             reasons.append("REQUIRED_COLLECTOR_NOT_SUCCESS")
             continue
+        if strict_coverage:
+            expected = expected_coverage.get(collector_name)
+            if expected is not None and not _entry_matches_projection(
+                successes[0], expected
+            ):
+                reasons.append("REQUIRED_COLLECTOR_NOT_SUCCESS")
+                continue
         qualifying = [
             entry
             for entry in successes
@@ -426,7 +672,14 @@ def _blocked_reasons(value: PolicyEvaluationInput) -> tuple[str, ...]:
         for receipt in value.execution_receipts
         for step in receipt.steps
     ]
+    api_contract_preflight_blocked = any(
+        step.result == "blocked"
+        and step.fallback_reason == "api_contract_missing"
+        for step in steps
+    )
     for role in value.risk_result.classification.required_reviewers:
+        if api_contract_preflight_blocked:
+            continue
         role_steps = [step for step in steps if step.actual_role == role]
         if not role_steps:
             reasons.append("REQUIRED_REVIEWER_MISSING")

@@ -23,6 +23,7 @@ from assurance.fixed_reviewer_invoker import (
     FixedOpenAICompatibleReviewerInvoker,
     FixedReviewerEndpoint,
 )
+from assurance.manifest import EvidenceManifest
 from assurance.run_service import (
     AssuranceRunBundle,
     AssuranceRunConfig,
@@ -90,12 +91,27 @@ def _repository(tmp_path: Path) -> Path:
     return root
 
 
+def _add_api_contract(root: Path) -> None:
+    contract = root / "contracts" / "openapi.json"
+    contract.parent.mkdir()
+    contract.write_text(
+        '{"openapi":"3.0.0","paths":{}}\n', encoding="utf-8"
+    )
+    _git(root, "add", "contracts/openapi.json")
+    _git(root, "commit", "-qm", "add api contract")
+    api = root / "api"
+    api.mkdir()
+    (api / "routes.py").write_text("def route(): pass\n", encoding="utf-8")
+
+
 class _ContextBuilder:
     def __init__(self, disposition=RedactionDisposition.NOT_APPLICABLE):
         self.disposition = disposition
         self.calls = 0
 
-    def prepare(self, evidences, *, artifact_store, subject_digest):
+    def prepare(
+        self, evidences, *, artifact_store, subject_digest, git_snapshot=None
+    ):
         self.calls += 1
         return ReviewerContextPlan(
             entries=tuple(
@@ -774,6 +790,83 @@ def test_bundle_validator_binds_subject_facts_to_collected_results(
         bad_bundle._bind_all_results()
 
 
+def test_bundle_rejects_api_evidence_trace_id_bypass(tmp_path):
+    service, intent = _service(tmp_path)
+    _add_api_contract(intent.repository_path)
+
+    result = asyncio.run(service.run(intent, idempotency_key="api-trace-bypass"))
+    api = next(item for item in result.bundle.evidence if item.kind == "api_contract")
+    forged_api = api.model_copy(update={"trace_id": "forged:trace"})
+    forged_evidence = tuple(
+        forged_api if item.evidence_id == api.evidence_id else item
+        for item in result.bundle.evidence
+    )
+    forged_bundle = result.bundle.model_copy(update={"evidence": forged_evidence})
+
+    with pytest.raises(ValueError, match="api_contract Evidence is invalid"):
+        forged_bundle._bind_all_results()
+
+
+def test_bundle_rejects_cross_kind_duplicate_evidence_id_before_manifest_set_compare(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent = _service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    bundle = asyncio.run(
+        service.run(intent, idempotency_key="cross-kind-duplicate")
+    ).bundle
+
+    duplicate_id = bundle.git.evidence.evidence_id
+    official = next(
+        item for item in bundle.evidence if item.kind == "dependency_audit"
+    )
+    forged_official = official.model_copy(update={"evidence_id": duplicate_id})
+    forged_evidence = tuple(
+        forged_official if item.evidence_id == official.evidence_id else item
+        for item in bundle.evidence
+    )
+
+    manifest_entries = tuple(
+        entry.model_copy(update={"evidence_id": duplicate_id})
+        if entry.evidence_id == official.evidence_id
+        else entry
+        for entry in bundle.manifest.manifest.entries
+    )
+    manifest_data = bundle.manifest.manifest.model_dump(mode="python")
+    manifest_data["entries"] = manifest_entries
+    forged_manifest = EvidenceManifest.model_construct(**manifest_data)
+    forged_manifest_result = bundle.manifest.model_copy(
+        update={"manifest": forged_manifest}
+    )
+    forged_risk_input = bundle.risk.input.model_copy(
+        update={"manifest": forged_manifest}
+    )
+    forged_risk = bundle.risk.model_copy(update={"input": forged_risk_input})
+    forged_policy_input = bundle.policy.input.model_copy(
+        update={"risk_result": forged_risk}
+    )
+    forged_policy = bundle.policy.model_copy(update={"input": forged_policy_input})
+    forged_bundle = bundle.model_copy(
+        update={
+            "evidence": forged_evidence,
+            "manifest": forged_manifest_result,
+            "risk": forged_risk,
+            "policy": forged_policy,
+        }
+    )
+
+    with pytest.raises(ValueError, match="evidence_id"):
+        forged_bundle._bind_all_results()
+
+
 @pytest.mark.parametrize("field_name", ["snapshot", "intake", "manifest"])
 def test_bundle_validator_binds_risk_input_to_exact_collected_results(
     tmp_path, field_name
@@ -968,7 +1061,14 @@ def test_unsafe_redaction_blocks_reviewer_and_commit(tmp_path):
 
 def test_redaction_adapter_error_fails_without_commit(tmp_path):
     class _ErrorContext(_ContextBuilder):
-        def prepare(self, evidences, *, artifact_store, subject_digest):
+        def prepare(
+            self,
+            evidences,
+            *,
+            artifact_store,
+            subject_digest,
+            git_snapshot=None,
+        ):
             self.calls += 1
             raise RuntimeError("redaction adapter unavailable")
 

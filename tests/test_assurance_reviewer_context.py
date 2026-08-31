@@ -23,6 +23,7 @@ from assurance.reviewer_context import (
     SafeReviewerContextBuilder,
 )
 from assurance.run_service import RedactionDisposition, ReviewerContextPlan
+from assurance.snapshot import GitChange, GitSnapshot
 from assurance.single_reviewer import ReviewerEvidenceContext
 
 
@@ -219,9 +220,17 @@ def _base_evidences(
     )
 
 
-def _prepare(store: ArtifactStore, evidences: tuple[Evidence, ...]):
+def _prepare(
+    store: ArtifactStore,
+    evidences: tuple[Evidence, ...],
+    *,
+    git_snapshot: GitSnapshot | None = None,
+):
     return SafeReviewerContextBuilder().prepare(
-        evidences, artifact_store=store, subject_digest=SUBJECT
+        evidences,
+        artifact_store=store,
+        subject_digest=SUBJECT,
+        git_snapshot=git_snapshot,
     )
 
 
@@ -371,6 +380,103 @@ def test_truncated_evidence_is_not_assessed_without_reading_missing_artifact(tmp
     assert entry.disposition is RedactionDisposition.NOT_ASSESSED
     assert entry.content is None
     assert entry.truncated is True
+
+
+def test_truncated_git_uses_bounded_structured_projection(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    evidences = list(_base_evidences(store))
+    digest = "sha256:" + "f" * 64
+    evidences[0] = _evidence(
+        "git_snapshot",
+        "collector.git",
+        digest,
+        status="truncated",
+    )
+    snapshot = GitSnapshot(
+        subject_digest=SUBJECT,
+        repository="example/service",
+        base_revision="a" * 40,
+        head_revision="b" * 40,
+        worktree_dirty=True,
+        changes=(
+            GitChange(
+                path="a.py",
+                status="modified",
+                current_size=12,
+                current_digest="sha256:" + "2" * 64,
+            ),
+        ),
+        changed_files_total=1,
+        diff_artifact_digest=digest,
+        diff_bytes=123,
+        diff_truncated=True,
+        files_truncated=False,
+        ignored_files_lower_bound=0,
+        ignored_scan_truncated=False,
+        omissions=("diff_truncated",),
+        complete=False,
+        collected_at=NOW,
+    )
+
+    original_raw_read = evidence_artifacts_module._read_cas_bytes
+
+    def fail_on_raw_read(_store, requested_digest, max_bytes):
+        if requested_digest == digest:
+            raise AssertionError("truncated Git projection read raw CAS bytes")
+        return original_raw_read(_store, requested_digest, max_bytes)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        evidence_artifacts_module, "_read_cas_bytes", fail_on_raw_read
+    )
+    try:
+        entry = _by_kind(
+            _prepare(store, tuple(evidences), git_snapshot=snapshot)
+        )["git_snapshot"]
+    finally:
+        monkeypatch.undo()
+
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert entry.content is not None
+    assert entry.truncated is True
+    payload = json.loads(entry.content)
+    assert payload["payload"]["truncated"] is True
+    assert payload["payload"]["artifact"]["digest"] == digest
+    assert payload["payload"]["artifact"]["size"] == 123
+    assert payload["payload"]["source"]["digest"] == digest
+    assert "unified_diff" not in payload["payload"]
+    assert payload["payload"]["changed_files"] == [
+        {
+            "old_path": None,
+            "path": "a.py",
+            "status": "modified",
+            "current_size": 12,
+            "current_digest": "sha256:" + "2" * 64,
+            "binary": False,
+            "large_file": False,
+            "submodule": False,
+        }
+    ]
+    assert payload["payload"]["omissions"] == ["diff_truncated"]
+
+
+def test_api_contract_is_bounded_and_redacted_before_reviewer_context(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    evidences = _base_evidences(store)
+    contract = b'{"openapi":"3.0.0","paths":{}}\n'
+    api_digest = store.put_bytes(contract)
+    api = _evidence(
+        "api_contract",
+        "collector.api_contract",
+        api_digest,
+        evidence_id="ev-api-contract",
+    )
+
+    entry = _by_kind(_prepare(store, evidences + (api,)))["api_contract"]
+
+    assert entry.disposition is RedactionDisposition.NOT_APPLICABLE
+    assert entry.content is not None
+    assert json.loads(entry.content)["payload"]["contract"] == contract.decode()
 
 
 @pytest.mark.parametrize(
