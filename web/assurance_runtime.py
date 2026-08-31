@@ -26,7 +26,12 @@ from assurance.artifacts import ArtifactStore
 from assurance.codex_cli_reviewer_invoker import CodexCliReviewerInvoker
 from assurance.commands import CommandSpec
 from assurance.contracts import Finding
-from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    SubjectDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+)
 from assurance.fixed_reviewer_invoker import (
     FixedOpenAICompatibleReviewerInvoker,
     FixedReviewerEndpoint,
@@ -548,6 +553,19 @@ def _revalidate_remediation_root(path: object, configured_root: Path) -> Path:
     return resolved
 
 
+def _scope_kwargs_for_subject_identity_version(
+    subject_identity_version: object,
+    acceptance_scope_digest: str,
+) -> dict[str, str]:
+    """Return only the scope argument allowed by a persisted identity version."""
+
+    if subject_identity_version == "v1":
+        return {}
+    if subject_identity_version == "v2":
+        return {"acceptance_scope_digest": acceptance_scope_digest}
+    raise ValueError("unsupported subject identity version")
+
+
 def _scoped_run_config(
     config: AssuranceRuntimeConfig,
     root: Path,
@@ -662,6 +680,18 @@ def _build_remediation_service(
             raise ValueError("remediation request is not bound to its context")
 
         requested_subject_input: SubjectDigestInput | None = None
+        acceptance_scope_digest = compute_acceptance_scope_digest(
+            AcceptanceScopeDigestInput(
+                task_path=source_binding.task_path,
+                policy_paths=source_binding.policy_paths,
+                adr_paths=source_binding.adr_paths,
+                runbook_paths=source_binding.runbook_paths,
+            )
+        )
+        scope_kwargs = _scope_kwargs_for_subject_identity_version(
+            source_binding.subject_identity_version,
+            acceptance_scope_digest,
+        )
 
         def subject_builder(
             _patch_digest: str, *, workspace: IsolatedWorkspace
@@ -692,6 +722,7 @@ def _build_remediation_service(
                     rubric_version=source_binding.rubric_version,
                     artifact_store=scratch_store,
                     attachment_digests=source_binding.attachment_digests,
+                    **scope_kwargs,
                 )
                 if type(git_result) is not GitSnapshotResult:
                     raise TypeError("Git collector returned an invalid result")
@@ -701,6 +732,7 @@ def _build_remediation_service(
                     policy_version=source_binding.policy_version,
                     rubric_version=source_binding.rubric_version,
                     attachment_digests=source_binding.attachment_digests,
+                    **scope_kwargs,
                 )
             requested_subject_input = subject_input
             return subject_input, compute_subject_digest(subject_input)

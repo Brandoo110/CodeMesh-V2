@@ -35,6 +35,7 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -53,7 +54,14 @@ from .contracts import (
     ExecutionStep,
     Finding,
 )
-from .digests import normalize_repo_path, normalize_repository_identity
+from .digests import (
+    AcceptanceScopeDigestInput,
+    SubjectDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+    normalize_repo_path,
+    normalize_repository_identity,
+)
 from .intake import IntakeResult, TaskPolicyCollector
 from .manifest import (
     EvidenceManifestBuilder,
@@ -398,6 +406,7 @@ class FreshnessSourceBinding(BaseModel):
     subject: ChangeSubject
     author: str = Field(min_length=1)
     author_provenance: Literal["caller_declared"] = "caller_declared"
+    subject_identity_version: Literal["v1", "v2"] = "v1"
 
     @field_validator("repository_path")
     @classmethod
@@ -487,6 +496,13 @@ class FreshnessSourceBinding(BaseModel):
         if self.subject.policy_version != self.policy_version:
             raise ValueError("source policy version must match subject")
         return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_versioned(self, handler) -> dict[str, object]:
+        payload = handler(self)
+        if self.subject_identity_version == "v1":
+            payload.pop("subject_identity_version", None)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1440,20 +1456,42 @@ class AssuranceRunService:
         if type(task_digest) is not str or not task_digest.startswith("sha256:"):
             raise AssuranceRunValidationError("probe did not return a sha256 task digest")
 
-        git_result = await asyncio.to_thread(
-            self._git_collector.collect,
-            intent.repository_path,
-            repository_identity=intent.repository_identity,
-            base_ref=intent.base_ref,
+        acceptance_scope_digest = compute_acceptance_scope_digest(
+            AcceptanceScopeDigestInput(
+                task_path=intent.task_path,
+                policy_paths=intent.policy_paths,
+                adr_paths=intent.adr_paths,
+                runbook_paths=intent.runbook_paths,
+            )
+        )
+
+        try:
+            git_result = await asyncio.to_thread(
+                self._git_collector.collect,
+                intent.repository_path,
+                repository_identity=intent.repository_identity,
+                base_ref=intent.base_ref,
+                task_digest=task_digest,
+                policy_version=self._config.policy_version,
+                rubric_version=self._config.rubric_version,
+                artifact_store=self._artifact_store,
+                attachment_digests=(),
+                acceptance_scope_digest=acceptance_scope_digest,
+                collected_at=started_at,
+            )
+        except TypeError as exc:
+            raise AssuranceRunStaleError(
+                "initial Git collector cannot bind acceptance scope"
+            ) from exc
+        subject_digest = self._verify_scoped_git_result(
+            git_result,
             task_digest=task_digest,
             policy_version=self._config.policy_version,
             rubric_version=self._config.rubric_version,
-            artifact_store=self._artifact_store,
             attachment_digests=(),
-            collected_at=started_at,
+            acceptance_scope_digest=acceptance_scope_digest,
+            phase="initial",
         )
-        self._require_type(git_result, GitSnapshotResult, "git collector result")
-        subject_digest = git_result.snapshot.subject_digest
         if git_result.snapshot.repository != normalize_repository_identity(
             intent.repository_identity
         ):
@@ -1636,12 +1674,14 @@ class AssuranceRunService:
             fence_collection_at,
             official_imports,
             api_result=api_result,
+            acceptance_scope_digest=acceptance_scope_digest,
         )
         freshness_source_binding = await asyncio.to_thread(
             self._build_freshness_source_binding,
             intent,
             git_result,
             subject,
+            subject_identity_version="v2",
         )
 
         case, events = self._build_case_and_events(
@@ -1975,6 +2015,69 @@ class AssuranceRunService:
         if type(value) is not expected:
             raise AssuranceRunError(f"{label} must be an exact {expected.__name__}")
 
+    def _verify_scoped_git_result(
+        self,
+        git_result: Any,
+        *,
+        task_digest: str,
+        policy_version: str,
+        rubric_version: str,
+        attachment_digests: tuple[str, ...],
+        acceptance_scope_digest: str,
+        phase: str,
+    ) -> str:
+        """Rebuild the canonical v2 subject before accepting a Git result."""
+
+        if type(git_result) is not GitSnapshotResult:
+            raise AssuranceRunStaleError(
+                f"{phase} Git collector returned an invalid result"
+            )
+        build_subject_input = getattr(self._git_collector, "build_subject_input", None)
+        if not callable(build_subject_input):
+            try:
+                canonical_collector = GitSnapshotCollector(
+                    max_diff_bytes=self._git_collector.max_diff_bytes,
+                    max_files=self._git_collector.max_files,
+                    max_file_bytes=self._git_collector.max_file_bytes,
+                    command_timeout_seconds=self._git_collector.command_timeout_seconds,
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise AssuranceRunStaleError(
+                    f"{phase} Git collector cannot rebuild acceptance scope; "
+                    "collector profile unavailable"
+                ) from exc
+            build_subject_input = canonical_collector.build_subject_input
+        try:
+            subject_input = build_subject_input(
+                git_result.snapshot,
+                task_digest=task_digest,
+                policy_version=policy_version,
+                rubric_version=rubric_version,
+                attachment_digests=attachment_digests,
+                acceptance_scope_digest=acceptance_scope_digest,
+            )
+        except Exception as exc:
+            raise AssuranceRunStaleError(
+                f"{phase} Git collector did not bind acceptance scope"
+            ) from exc
+        if (
+            type(subject_input) is not SubjectDigestInput
+            or subject_input.schema_version != "v2"
+            or subject_input.acceptance_scope_digest != acceptance_scope_digest
+        ):
+            raise AssuranceRunStaleError(
+                f"{phase} Git collector did not produce a v2 scoped subject"
+            )
+        subject_digest = compute_subject_digest(subject_input)
+        if (
+            subject_digest != git_result.snapshot.subject_digest
+            or git_result.evidence.subject_digest != subject_digest
+        ):
+            raise AssuranceRunStaleError(
+                f"{phase} Git result subject is not bound to acceptance scope"
+            )
+        return subject_digest
+
     @staticmethod
     def _require_subjects(subject_digest: str, value: Any) -> None:
         nested = []
@@ -2069,6 +2172,8 @@ class AssuranceRunService:
         intent: AssuranceRunIntent,
         git_result: GitSnapshotResult,
         subject: ChangeSubject,
+        *,
+        subject_identity_version: Literal["v1", "v2"] = "v1",
     ) -> FreshnessSourceBinding:
         """Capture final-fence local source facts without exposing them publicly."""
 
@@ -2116,6 +2221,7 @@ class AssuranceRunService:
             subject=subject,
             author=intent.author,
             author_provenance=intent.author_provenance,
+            subject_identity_version=subject_identity_version,
         )
 
     @staticmethod
@@ -2603,6 +2709,7 @@ class AssuranceRunService:
         collected_at: datetime,
         official_imports: tuple[OfficialEvidenceImport, ...] = (),
         api_result: ApiContractResult | None = None,
+        acceptance_scope_digest: str | None = None,
     ) -> datetime:
         try:
             final_git = self._git_collector.collect(
@@ -2614,8 +2721,14 @@ class AssuranceRunService:
                 rubric_version=self._config.rubric_version,
                 artifact_store=self._artifact_store,
                 attachment_digests=(),
+                acceptance_scope_digest=acceptance_scope_digest,
                 collected_at=collected_at,
             )
+        except TypeError as exc:
+            raise AssuranceRunStaleError(
+                "final Git collector cannot bind acceptance scope"
+            ) from exc
+        try:
             final_intake = self._intake_collector.collect(
                 intent.repository_path,
                 subject_digest=subject_digest,
@@ -2628,7 +2741,16 @@ class AssuranceRunService:
             )
         except Exception as exc:
             raise AssuranceRunStaleError("final source freshness fence failed") from exc
-        if type(final_git) is not GitSnapshotResult or type(final_intake) is not IntakeResult:
+        self._verify_scoped_git_result(
+            final_git,
+            task_digest=task_digest,
+            policy_version=self._config.policy_version,
+            rubric_version=self._config.rubric_version,
+            attachment_digests=(),
+            acceptance_scope_digest=acceptance_scope_digest,
+            phase="final",
+        )
+        if type(final_intake) is not IntakeResult:
             raise AssuranceRunStaleError("final fence collector returned invalid result")
         if _strip_datetimes(_jsonable(final_git)) != _strip_datetimes(_jsonable(initial_git)):
             raise AssuranceRunStaleError("Git changed during reviewer execution")

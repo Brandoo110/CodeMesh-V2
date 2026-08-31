@@ -27,7 +27,9 @@ from assurance import (
 from assurance import snapshot as snapshot_module
 from assurance.contracts import Evidence
 from assurance.digests import (
+    AcceptanceScopeDigestInput,
     SubjectDigestInput,
+    compute_acceptance_scope_digest,
     compute_subject_digest,
 )
 
@@ -1901,3 +1903,27 @@ def test_collector_can_rebuild_the_exact_subject_input_from_snapshot(tmp_path):
         result.snapshot, collector
     )
     assert compute_subject_digest(subject_input) == result.snapshot.subject_digest
+
+
+def test_scope_digest_is_bound_when_rebuilding_subject_input(tmp_path):
+    repo = _init_repo(tmp_path, {"a.txt": b"one\n"})
+    store = ArtifactStore(tmp_path / "artifact-store")
+    scope = compute_acceptance_scope_digest(
+        AcceptanceScopeDigestInput(
+            task_path="TASK.md",
+            policy_paths=("POLICY.md",),
+            adr_paths=(),
+            runbook_paths=(),
+        )
+    )
+    result = _collect(repo, store, acceptance_scope_digest=scope)
+    rebuilt = GitSnapshotCollector().build_subject_input(
+        result.snapshot,
+        task_digest=TASK,
+        policy_version=POLICY,
+        rubric_version=RUBRIC,
+        acceptance_scope_digest=scope,
+    )
+    assert rebuilt.schema_version == "v2"
+    assert rebuilt.acceptance_scope_digest == scope
+    assert compute_subject_digest(rebuilt) == result.snapshot.subject_digest

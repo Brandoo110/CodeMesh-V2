@@ -19,6 +19,10 @@ from pydantic import SecretStr
 from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandSpec
 from assurance.contracts import Evidence
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    compute_acceptance_scope_digest,
+)
 from assurance.fixed_reviewer_invoker import (
     FixedOpenAICompatibleReviewerInvoker,
     FixedReviewerEndpoint,
@@ -236,6 +240,73 @@ class _OfficialProofCapturingCommitter:
         )
 
 
+class _ScopeIgnoringGitCollector:
+    def __init__(self):
+        self._collector = run_service_module.GitSnapshotCollector()
+        self.calls = []
+
+    def __getattr__(self, name):
+        return getattr(self._collector, name)
+
+    def collect(self, *args, **kwargs):
+        self.calls.append(kwargs.get("acceptance_scope_digest"))
+        kwargs.pop("acceptance_scope_digest", None)
+        return self._collector.collect(*args, **kwargs)
+
+
+class _LegacySignatureGitCollector:
+    def __init__(self):
+        self._collector = run_service_module.GitSnapshotCollector()
+
+    def __getattr__(self, name):
+        return getattr(self._collector, name)
+
+    def collect(
+        self,
+        repository_path,
+        *,
+        repository_identity,
+        base_ref,
+        task_digest,
+        policy_version,
+        rubric_version,
+        artifact_store,
+        attachment_digests=(),
+        collected_at=None,
+    ):
+        return self._collector.collect(
+            repository_path,
+            repository_identity=repository_identity,
+            base_ref=base_ref,
+            task_digest=task_digest,
+            policy_version=policy_version,
+            rubric_version=rubric_version,
+            artifact_store=artifact_store,
+            attachment_digests=attachment_digests,
+            collected_at=collected_at,
+        )
+
+
+class _RecordingScopedGitCollector:
+    def __init__(self):
+        self._collector = run_service_module.GitSnapshotCollector()
+        self.scope_digests = []
+
+    def __getattr__(self, name):
+        return getattr(self._collector, name)
+
+    def collect(self, *args, **kwargs):
+        self.scope_digests.append(kwargs.get("acceptance_scope_digest"))
+        return self._collector.collect(*args, **kwargs)
+
+
+class _ScopeIgnoringFinalGitCollector(_RecordingScopedGitCollector):
+    def collect(self, *args, **kwargs):
+        if self.scope_digests:
+            kwargs.pop("acceptance_scope_digest", None)
+        return super().collect(*args, **kwargs)
+
+
 def _service(
     tmp_path,
     *,
@@ -306,6 +377,92 @@ def test_intent_rejects_duplicate_or_empty_command_ids_before_io(tmp_path):
             task_path="TASK.md",
             command_ids=("check", "check"),
         )
+
+
+def test_acceptance_scope_changes_subject_and_case_identity(tmp_path):
+    service, intent = _service(tmp_path)
+    empty_scope = intent.model_copy(update={"policy_paths": ()})
+    declared_scope = intent
+
+    empty_result = asyncio.run(
+        service.run(empty_scope, idempotency_key="scope-empty")
+    )
+    service._committer.cached = None
+    declared_result = asyncio.run(
+        service.run(declared_scope, idempotency_key="scope-declared")
+    )
+
+    assert empty_result.bundle.subject.subject_digest != declared_result.bundle.subject.subject_digest
+    assert empty_result.bundle.case.case_id != declared_result.bundle.case.case_id
+    assert empty_result.bundle.binding.subject_digest != declared_result.bundle.binding.subject_digest
+
+
+def test_changed_scope_payload_under_old_idempotency_key_conflicts(tmp_path):
+    service, intent = _service(tmp_path)
+    first = asyncio.run(
+        service.run(
+            intent.model_copy(update={"policy_paths": ()}),
+            idempotency_key="scope-replay",
+        )
+    )
+    assert first.cached is False
+    with pytest.raises(run_service_module.IdempotencyConflictError):
+        asyncio.run(service.run(intent, idempotency_key="scope-replay"))
+
+
+def test_same_scope_new_run_keeps_subject_and_case_but_changes_run_id(tmp_path):
+    service, intent = _service(tmp_path)
+    first = asyncio.run(service.run(intent, idempotency_key="scope-run-1"))
+    service._committer.cached = None
+    second = asyncio.run(service.run(intent, idempotency_key="scope-run-2"))
+    assert second.cached is False
+    assert second.bundle.subject.subject_digest == first.bundle.subject.subject_digest
+    assert second.bundle.case.case_id == first.bundle.case.case_id
+    assert second.bundle.run_id != first.bundle.run_id
+
+
+def test_initial_fence_rejects_collector_that_ignores_scope(tmp_path):
+    service, intent = _service(tmp_path)
+    service._git_collector = _ScopeIgnoringGitCollector()
+
+    with pytest.raises(AssuranceRunStaleError, match="acceptance scope"):
+        asyncio.run(service.prepare(intent, idempotency_key="scope-ignored"))
+
+
+def test_initial_fence_rejects_legacy_collector_signature(tmp_path):
+    service, intent = _service(tmp_path)
+    service._git_collector = _LegacySignatureGitCollector()
+
+    with pytest.raises(AssuranceRunStaleError, match="acceptance scope"):
+        asyncio.run(service.prepare(intent, idempotency_key="scope-legacy"))
+
+
+def test_initial_and_final_fences_receive_and_bind_the_same_scope(tmp_path):
+    collector = _RecordingScopedGitCollector()
+    service, intent = _service(tmp_path)
+    service._git_collector = collector
+
+    bundle = asyncio.run(service.prepare(intent, idempotency_key="scope-recorded"))
+
+    expected_scope = compute_acceptance_scope_digest(
+        AcceptanceScopeDigestInput(
+            task_path=intent.task_path,
+            policy_paths=intent.policy_paths,
+            adr_paths=intent.adr_paths,
+            runbook_paths=intent.runbook_paths,
+        )
+    )
+    assert collector.scope_digests == [expected_scope, expected_scope]
+    assert bundle.freshness_source_binding.subject_identity_version == "v2"
+
+
+def test_final_fence_rejects_collector_that_ignores_scope(tmp_path):
+    collector = _ScopeIgnoringFinalGitCollector()
+    service, intent = _service(tmp_path)
+    service._git_collector = collector
+
+    with pytest.raises(AssuranceRunStaleError, match="acceptance scope"):
+        asyncio.run(service.prepare(intent, idempotency_key="scope-final-ignored"))
 
 
 def _fake_official_import(

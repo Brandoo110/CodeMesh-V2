@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .artifacts import ArtifactStore
+from .digests import (
+    AcceptanceScopeDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+)
 from .intake import (
     IntakeChangedError,
     IntakeCollectionError,
@@ -139,6 +144,17 @@ class LiveFreshnessChecker:
         """Check one persisted run without writing public evidence or state."""
 
         checked_at = self._checked_at()
+        if type(binding) is not FreshnessSourceBinding:
+            return self._unavailable("BASELINE_CORRUPT", checked_at)
+        if binding.subject_identity_version not in {"v1", "v2"}:
+            return self._unavailable("BASELINE_CORRUPT", checked_at)
+        if binding.subject_identity_version == "v2":
+            if not self._v2_scope_matches_subject(binding, baseline_git, baseline_intake):
+                return self._stale(
+                    "ACCEPTANCE_SCOPE_MISMATCH",
+                    checked_at,
+                    getattr(baseline_git, "subject_digest", None),
+                )
         expected_subject = self._expected_subject(binding, baseline_git, baseline_intake)
         if expected_subject is None:
             return self._unavailable("BASELINE_CORRUPT", checked_at)
@@ -167,16 +183,21 @@ class LiveFreshnessChecker:
             task_digest = self._probe_task_digest(paths.repository_root, binding)
             git_collector = self._git_collector(binding)
             self._assert_exact_git_root(git_collector, paths.repository_root)
+            collect_kwargs = {
+                "repository_identity": binding.repository_identity,
+                "base_ref": binding.requested_base_ref,
+                "task_digest": task_digest,
+                "policy_version": binding.policy_version,
+                "rubric_version": binding.rubric_version,
+                "artifact_store": scratch_store,
+                "attachment_digests": binding.attachment_digests,
+                "collected_at": checked_at,
+            }
+            if binding.subject_identity_version == "v2":
+                collect_kwargs["acceptance_scope_digest"] = self._scope_digest(binding)
             git_result = git_collector.collect(
                 paths.repository_root,
-                repository_identity=binding.repository_identity,
-                base_ref=binding.requested_base_ref,
-                task_digest=task_digest,
-                policy_version=binding.policy_version,
-                rubric_version=binding.rubric_version,
-                artifact_store=scratch_store,
-                attachment_digests=binding.attachment_digests,
-                collected_at=checked_at,
+                **collect_kwargs,
             )
             observed_git = git_result.snapshot
             if not observed_git.complete:
@@ -295,6 +316,55 @@ class LiveFreshnessChecker:
         except (AttributeError, TypeError, ValueError):
             return None
         return baseline_git, baseline_intake
+
+    @staticmethod
+    def _scope_digest(binding: FreshnessSourceBinding) -> str:
+        return compute_acceptance_scope_digest(
+            AcceptanceScopeDigestInput(
+                task_path=binding.task_path,
+                policy_paths=binding.policy_paths,
+                adr_paths=binding.adr_paths,
+                runbook_paths=binding.runbook_paths,
+            )
+        )
+
+    @classmethod
+    def _v2_scope_matches_subject(
+        cls,
+        binding: FreshnessSourceBinding,
+        baseline_git: GitSnapshot,
+        baseline_intake: IntakeSnapshot,
+    ) -> bool:
+        try:
+            profile = binding.git_collector_profile
+            collector = GitSnapshotCollector(
+                **profile.model_dump(exclude={"schema_version"})
+            )
+            task_digest = baseline_intake.task_digest
+            if task_digest is None:
+                return False
+            subject_input = collector.build_subject_input(
+                baseline_git,
+                task_digest=task_digest,
+                policy_version=binding.policy_version,
+                rubric_version=binding.rubric_version,
+                attachment_digests=binding.attachment_digests,
+                acceptance_scope_digest=cls._scope_digest(binding),
+            )
+            return (
+                subject_input.schema_version == "v2"
+                and subject_input.acceptance_scope_digest is not None
+                and subject_input.repository == binding.subject.repository
+                and subject_input.base_revision == binding.subject.base_revision
+                and subject_input.head_revision == binding.subject.head_revision
+                and subject_input.task_digest == binding.subject.task_digest
+                and subject_input.policy_version == binding.subject.policy_version
+                and subject_input.rubric_version == binding.rubric_version
+                and compute_subject_digest(subject_input)
+                == binding.subject.subject_digest
+            )
+        except Exception:
+            return False
 
     def _validate_paths(self, binding: FreshnessSourceBinding) -> _SourcePaths:
         workspace = self._validate_real_directory(self._workspace_root)

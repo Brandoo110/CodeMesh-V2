@@ -269,6 +269,7 @@ def test_commit_lookup_projects_run_and_keeps_local_source_private(tmp_path):
     assert stored_source["repository_path"] == str(expected_source_path)
     assert stored_source["author"] == "author-agent"
     assert stored_source["author_provenance"] == "caller_declared"
+    assert stored_source["subject_identity_version"] == "v2"
 
     projection = repository.get_change(result.bundle.case.case_id)
     assert len(projection["evidence"]) == 4
@@ -286,6 +287,22 @@ def test_commit_lookup_projects_run_and_keeps_local_source_private(tmp_path):
     assert looked_up is not None
     assert looked_up.cached is True
     assert looked_up.bundle == result.bundle
+
+
+def test_source_binding_v1_serialization_omits_identity_version_and_v2_roundtrips(
+    tmp_path,
+):
+    service, intent, _ = _durable_service(tmp_path)
+    result = asyncio.run(service.prepare(intent, idempotency_key="run:binding"))
+    v1 = result.freshness_source_binding.model_copy(
+        update={"subject_identity_version": "v1"}
+    )
+    v2 = result.freshness_source_binding
+    v1_json = _source_binding_json(v1)
+    v2_json = _source_binding_json(v2)
+    assert "subject_identity_version" not in json.loads(v1_json)
+    assert json.loads(v2_json)["subject_identity_version"] == "v2"
+    assert type(v2).model_validate_json(v2_json) == v2
 
 
 def test_lookup_requires_initialized_additive_schema_without_migrating(tmp_path):

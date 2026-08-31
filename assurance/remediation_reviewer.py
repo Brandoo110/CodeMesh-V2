@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from assurance.contracts import ExecutionReceipt, Finding
-from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    SubjectDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+)
 from assurance.remediation_workspace import IsolatedWorkspace
 from assurance.run_service import (
     AssuranceRunBundle,
@@ -26,6 +31,7 @@ from assurance.run_service import (
     FreshnessSourceBinding,
     ReviewerRunRecord,
 )
+from assurance.snapshot import GitSnapshotCollector
 
 if TYPE_CHECKING:
     from assurance.remediation import RemediationRequest
@@ -189,6 +195,14 @@ class AssuranceRemediationReviewer:
                 request, selected_finding, reviewer_role
             ):
                 return None
+            if baseline.freshness_source_binding.subject_identity_version != "v2":
+                # Legacy v1 runs remain readable, but cannot safely derive a
+                # scope-bound remediation subject.
+                return None
+            if not self._scope_matches_bundle(
+                baseline.freshness_source_binding, baseline
+            ):
+                return None
             if compute_subject_digest(subject_input) != subject_digest:
                 return None
             intent = self._intent_for_workspace(workspace.root)
@@ -320,6 +334,24 @@ class AssuranceRemediationReviewer:
     def _subject_matches_baseline(self, subject_input: SubjectDigestInput) -> bool:
         source = self._baseline.freshness_source_binding
         subject = self._baseline.subject
+        if subject_input.schema_version != source.subject_identity_version:
+            return False
+        if source.subject_identity_version == "v2":
+            try:
+                scope_digest = compute_acceptance_scope_digest(
+                    AcceptanceScopeDigestInput(
+                        task_path=source.task_path,
+                        policy_paths=source.policy_paths,
+                        adr_paths=source.adr_paths,
+                        runbook_paths=source.runbook_paths,
+                    )
+                )
+            except (TypeError, ValueError):
+                return False
+            if subject_input.acceptance_scope_digest != scope_digest:
+                return False
+        elif subject_input.acceptance_scope_digest is not None:
+            return False
         return (
             not subject_input.attachment_digests
             and subject_input.repository == source.repository_identity == subject.repository
@@ -335,6 +367,39 @@ class AssuranceRemediationReviewer:
             == self._baseline.binding.rubric_version
             == self._baseline.reviewer.rubric_version
         )
+
+    @staticmethod
+    def _scope_matches_bundle(
+        source: FreshnessSourceBinding, bundle: AssuranceRunBundle
+    ) -> bool:
+        if source.subject_identity_version != "v2":
+            return source.subject_identity_version == "v1"
+        try:
+            task_digest = bundle.intake.snapshot.task_digest
+            if task_digest is None:
+                return False
+            collector = GitSnapshotCollector(
+                **source.git_collector_profile.model_dump(exclude={"schema_version"})
+            )
+            scope_digest = compute_acceptance_scope_digest(
+                AcceptanceScopeDigestInput(
+                    task_path=source.task_path,
+                    policy_paths=source.policy_paths,
+                    adr_paths=source.adr_paths,
+                    runbook_paths=source.runbook_paths,
+                )
+            )
+            subject_input = collector.build_subject_input(
+                bundle.git.snapshot,
+                task_digest=task_digest,
+                policy_version=source.policy_version,
+                rubric_version=source.rubric_version,
+                attachment_digests=source.attachment_digests,
+                acceptance_scope_digest=scope_digest,
+            )
+            return compute_subject_digest(subject_input) == bundle.subject.subject_digest
+        except (TypeError, ValueError):
+            return False
 
     @staticmethod
     def _service_is_scoped(service: AssuranceRunService, root: Path) -> bool:
@@ -381,6 +446,28 @@ class AssuranceRemediationReviewer:
         baseline_source = self._baseline.freshness_source_binding
         baseline_subject = self._baseline.subject
         baseline_declarations = self._baseline.risk.input.declarations
+        if source.subject_identity_version != baseline_source.subject_identity_version:
+            return None
+        if subject_input.schema_version != source.subject_identity_version:
+            return None
+        if source.subject_identity_version == "v2":
+            try:
+                expected_scope_digest = compute_acceptance_scope_digest(
+                    AcceptanceScopeDigestInput(
+                        task_path=source.task_path,
+                        policy_paths=source.policy_paths,
+                        adr_paths=source.adr_paths,
+                        runbook_paths=source.runbook_paths,
+                    )
+                )
+            except (TypeError, ValueError):
+                return None
+            if subject_input.acceptance_scope_digest != expected_scope_digest:
+                return None
+        elif subject_input.acceptance_scope_digest is not None:
+            return None
+        if not self._scope_matches_bundle(source, bundle):
+            return None
         if (
             subject.subject_digest != subject_digest
             or subject.repository != subject_input.repository

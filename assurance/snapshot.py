@@ -434,6 +434,7 @@ class GitSnapshotCollector:
         rubric_version: str,
         artifact_store: ArtifactStore,
         attachment_digests: tuple[str, ...] = (),
+        acceptance_scope_digest: str | None = None,
         collected_at: datetime | None = None,
     ) -> GitSnapshotResult:
         if not isinstance(repository_path, Path):
@@ -452,6 +453,13 @@ class GitSnapshotCollector:
             raise TypeError("artifact_store must be an exact ArtifactStore")
         if type(attachment_digests) is not tuple:
             raise TypeError("attachment_digests must be a tuple")
+        if acceptance_scope_digest is not None:
+            if not isinstance(acceptance_scope_digest, str):
+                raise TypeError("acceptance_scope_digest must be a str")
+            if _SHA256_DIGEST_RE.fullmatch(acceptance_scope_digest) is None:
+                raise ValueError(
+                    "acceptance_scope_digest must be a lowercase sha256 digest"
+                )
         if collected_at is None:
             collected_at = datetime.now(timezone.utc)
         elif not isinstance(collected_at, datetime):
@@ -761,6 +769,7 @@ class GitSnapshotCollector:
         manifest_digest = self._manifest_digest_from_payload(manifest)
         subject_digest = compute_subject_digest(
             SubjectDigestInput(
+                schema_version=("v2" if acceptance_scope_digest is not None else "v1"),
                 repository=repository,
                 base_revision=base_revision,
                 head_revision=head_revision,
@@ -769,6 +778,7 @@ class GitSnapshotCollector:
                 policy_version=policy_version,
                 rubric_version=rubric_version,
                 attachment_digests=attachment_digests,
+                acceptance_scope_digest=acceptance_scope_digest,
             )
         )
         evidence_id = (
@@ -830,6 +840,7 @@ class GitSnapshotCollector:
         policy_version: str,
         rubric_version: str,
         attachment_digests: tuple[str, ...] = (),
+        acceptance_scope_digest: str | None = None,
     ) -> SubjectDigestInput:
         """Rebuild the exact subject input represented by one Git snapshot.
 
@@ -842,6 +853,7 @@ class GitSnapshotCollector:
             raise TypeError("snapshot must be an exact GitSnapshot")
         manifest_digest = self._manifest_digest(snapshot)
         subject_input = SubjectDigestInput(
+            schema_version=("v2" if acceptance_scope_digest is not None else "v1"),
             repository=snapshot.repository,
             base_revision=snapshot.base_revision,
             head_revision=snapshot.head_revision,
@@ -850,6 +862,7 @@ class GitSnapshotCollector:
             policy_version=policy_version,
             rubric_version=rubric_version,
             attachment_digests=attachment_digests,
+            acceptance_scope_digest=acceptance_scope_digest,
         )
         if compute_subject_digest(subject_input) != snapshot.subject_digest:
             raise GitSnapshotError(

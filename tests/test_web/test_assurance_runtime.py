@@ -12,7 +12,12 @@ import web.assurance_runtime as runtime_module
 import orchestration.adapters.deepseek as deepseek_module
 from assurance.artifacts import ArtifactStore
 from assurance.codex_cli_reviewer_invoker import CodexCliReviewerInvoker
-from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    SubjectDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+)
 from assurance.fixed_reviewer_invoker import FixedOpenAICompatibleReviewerInvoker
 from assurance.reviewer_context import SafeReviewerContextBuilder
 from assurance.run_service import AssuranceRunService
@@ -583,6 +588,60 @@ def test_remediation_git_collector_rejects_synthetic_subject_digest(tmp_path):
             policy_version="gate.v0",
             rubric_version="single_general.v0",
             artifact_store=ArtifactStore(tmp_path / "scoped-artifacts"),
+        )
+
+
+def test_remediation_git_collector_preserves_v2_scope_identity(tmp_path):
+    repository_path = _repository(tmp_path)
+    collector = GitSnapshotCollector()
+    task_digest = "sha256:" + "2" * 64
+    scope_digest = compute_acceptance_scope_digest(
+        AcceptanceScopeDigestInput(
+            task_path="TASK.md",
+            policy_paths=("POLICY.md",),
+            adr_paths=(),
+            runbook_paths=(),
+        )
+    )
+    collected = collector.collect(
+        repository_path,
+        repository_identity="example/service",
+        base_ref="HEAD",
+        task_digest=task_digest,
+        policy_version="gate.v0",
+        rubric_version="single_general.v0",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        acceptance_scope_digest=scope_digest,
+    )
+    subject = collector.build_subject_input(
+        collected.snapshot,
+        task_digest=task_digest,
+        policy_version="gate.v0",
+        rubric_version="single_general.v0",
+        acceptance_scope_digest=scope_digest,
+    )
+    scoped = runtime_module._RemediationGitCollector(
+        collector, lambda: subject
+    )
+    result = scoped.collect(
+        repository_path,
+        repository_identity="example/service",
+        base_ref="HEAD",
+        task_digest=task_digest,
+        policy_version="gate.v0",
+        rubric_version="single_general.v0",
+        artifact_store=ArtifactStore(tmp_path / "scoped-artifacts"),
+        acceptance_scope_digest=scope_digest,
+    )
+    assert result.snapshot.subject_digest == compute_subject_digest(subject)
+
+
+@pytest.mark.parametrize("version", ("", "v3", None))
+def test_remediation_scope_identity_unknown_version_fails_closed(version):
+    with pytest.raises(ValueError, match="subject identity version"):
+        runtime_module._scope_kwargs_for_subject_identity_version(
+            version,
+            "sha256:" + "a" * 64,
         )
 
 

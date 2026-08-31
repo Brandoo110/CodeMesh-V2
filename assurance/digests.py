@@ -7,7 +7,13 @@ import unicodedata
 from collections.abc import Sequence
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 _SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -101,7 +107,7 @@ class SubjectDigestInput(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["v1"] = "v1"
+    schema_version: Literal["v1", "v2"] = "v1"
     repository: str
     base_revision: str
     head_revision: str
@@ -110,6 +116,7 @@ class SubjectDigestInput(BaseModel):
     policy_version: str
     rubric_version: str
     attachment_digests: tuple[str, ...] = ()
+    acceptance_scope_digest: str | None = None
 
     @field_validator("repository", mode="before")
     @classmethod
@@ -161,6 +168,103 @@ class SubjectDigestInput(BaseModel):
             seen.add(item)
             result.append(item)
         return tuple(sorted(result))
+
+    @field_validator("acceptance_scope_digest", mode="before")
+    @classmethod
+    def _validate_acceptance_scope_digest(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("acceptance_scope_digest must be a str")
+        if _SHA256_DIGEST_RE.fullmatch(value) is None:
+            raise ValueError("must be a lowercase sha256:<64 hex> digest")
+        return value
+
+    @model_validator(mode="after")
+    def _require_scope_for_v2(self) -> "SubjectDigestInput":
+        if self.schema_version == "v2" and self.acceptance_scope_digest is None:
+            raise ValueError("v2 subject identity requires acceptance_scope_digest")
+        if self.schema_version == "v1" and self.acceptance_scope_digest is not None:
+            raise ValueError("v1 subject identity must not carry acceptance scope")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_versioned(
+        self, handler
+    ) -> dict[str, object]:
+        payload = handler(self)
+        if self.schema_version == "v1":
+            payload.pop("acceptance_scope_digest", None)
+        return payload
+
+
+class AcceptanceScopeDigestInput(BaseModel):
+    """The canonical, repository-relative declarations in an acceptance scope."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["v1"] = "v1"
+    task_path: str
+    policy_paths: tuple[str, ...] = ()
+    adr_paths: tuple[str, ...] = ()
+    runbook_paths: tuple[str, ...] = ()
+
+    @field_validator("task_path", mode="before")
+    @classmethod
+    def _task_path(cls, value: object) -> str:
+        if type(value) is not str:
+            raise ValueError("task_path must be a string")
+        normalized = normalize_repo_path(value)
+        if normalized != value or not value.endswith(".md"):
+            raise ValueError("task_path must be a canonical .md path")
+        return value
+
+    @field_validator("policy_paths", "adr_paths", "runbook_paths", mode="before")
+    @classmethod
+    def _declared_paths(cls, value: object, info) -> tuple[str, ...]:
+        if type(value) not in (tuple, list):
+            raise ValueError(f"{info.field_name} must be a tuple or list")
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if type(item) is not str:
+                raise ValueError(f"{info.field_name} must contain strings")
+            normalized = normalize_repo_path(item)
+            if normalized != item or not item.endswith(".md"):
+                raise ValueError(
+                    f"{info.field_name} must contain canonical .md paths"
+                )
+            if item in seen:
+                raise ValueError(f"{info.field_name} must be unique")
+            seen.add(item)
+            result.append(item)
+        return tuple(result)
+
+
+def canonical_acceptance_scope_payload(
+    value: AcceptanceScopeDigestInput,
+) -> bytes:
+    """Return the four-field canonical payload for one acceptance scope."""
+
+    if not isinstance(value, AcceptanceScopeDigestInput):
+        raise TypeError("value must be an AcceptanceScopeDigestInput")
+    payload = {
+        "task_path": value.task_path,
+        "policy_paths": list(value.policy_paths),
+        "adr_paths": list(value.adr_paths),
+        "runbook_paths": list(value.runbook_paths),
+    }
+    return json.dumps(payload, **_JSON_KWARGS).encode("utf-8")
+
+
+def compute_acceptance_scope_digest(
+    value: AcceptanceScopeDigestInput,
+) -> str:
+    """Compute the stable SHA-256 digest of an acceptance scope."""
+
+    return "sha256:" + hashlib.sha256(
+        canonical_acceptance_scope_payload(value)
+    ).hexdigest()
 
 
 def canonical_subject_payload(value: SubjectDigestInput) -> bytes:
