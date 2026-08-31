@@ -197,6 +197,42 @@ def _expected_manifest_digest(snap, collector):
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _expected_subject_identity_digest(snap, collector):
+    payload = {
+        "schema_version": "v1",
+        "repository": snap.repository,
+        "base_revision": snap.base_revision,
+        "head_revision": snap.head_revision,
+        "scope": snap.scope,
+        "worktree_dirty": snap.worktree_dirty,
+        "changes": [change.model_dump(mode="json") for change in snap.changes],
+        "changed_files_total": snap.changed_files_total,
+        "diff_artifact_digest": snap.diff_artifact_digest,
+        "diff_bytes": snap.diff_bytes,
+        "diff_truncated": snap.diff_truncated,
+        "files_truncated": snap.files_truncated,
+        "ignored_scan_truncated": snap.ignored_scan_truncated,
+        "large_file_paths": list(snap.large_file_paths),
+        "submodule_paths": list(snap.submodule_paths),
+        "omissions": list(snap.omissions),
+        "complete": snap.complete,
+        "limits": {
+            "max_diff_bytes": collector.max_diff_bytes,
+            "max_files": collector.max_files,
+            "max_file_bytes": collector.max_file_bytes,
+        },
+        "subject_identity_version": "v2",
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def _change(**overrides):
     values = {
         "schema_version": "v1",
@@ -731,7 +767,7 @@ def test_clean_repo_base_head_success_and_exact_bindings(tmp_path):
     )
     assert str(repo) not in evidence.source_ref
 
-    manifest_digest = _expected_manifest_digest(snap, collector)
+    manifest_digest = _expected_subject_identity_digest(snap, collector)
     expected_subject = compute_subject_digest(
         SubjectDigestInput(
             repository=IDENTITY,
@@ -750,6 +786,45 @@ def test_clean_repo_base_head_success_and_exact_bindings(tmp_path):
         (snap.subject_digest + snap.diff_artifact_digest).encode("ascii")
     ).hexdigest()[:32]
     assert evidence.evidence_id == expected_evidence_id
+
+
+def test_subject_digest_uses_versioned_projection_without_legacy_manifest_count(
+    tmp_path,
+):
+    repo = _init_repo(tmp_path, {"a.txt": b"one\n"})
+    store = ArtifactStore(tmp_path / "artifact-store")
+    collector = GitSnapshotCollector()
+    result = _collect(repo, store, collector=collector)
+    snap = result.snapshot
+
+    legacy_manifest_digest = _expected_manifest_digest(snap, collector)
+    legacy_subject_digest = compute_subject_digest(
+        SubjectDigestInput(
+            repository=IDENTITY,
+            base_revision=snap.base_revision,
+            head_revision=snap.head_revision,
+            normalized_diff_digest=legacy_manifest_digest,
+            task_digest=TASK,
+            policy_version=POLICY,
+            rubric_version=RUBRIC,
+        )
+    )
+
+    assert snap.subject_digest != legacy_subject_digest
+
+
+def test_ignored_count_only_change_keeps_subject_identity(tmp_path):
+    repo = _init_repo(tmp_path, {".gitignore": b"*.log\n", "a.txt": b"one\n"})
+    store = ArtifactStore(tmp_path / "artifact-store")
+    first = _collect(repo, store)
+
+    (repo / "ignored.log").write_text("ignored\n", encoding="utf-8")
+    second = _collect(repo, store)
+
+    assert first.snapshot.ignored_files_lower_bound == 0
+    assert second.snapshot.ignored_files_lower_bound == 1
+    assert first.snapshot.subject_digest == second.snapshot.subject_digest
+    assert first.evidence.subject_digest == second.evidence.subject_digest
 
 
 def test_tracked_modified_and_untracked_patches(tmp_path):
@@ -1899,10 +1974,89 @@ def test_collector_can_rebuild_the_exact_subject_input_from_snapshot(tmp_path):
         rubric_version=RUBRIC,
     )
 
-    assert subject_input.normalized_diff_digest == _expected_manifest_digest(
+    assert subject_input.normalized_diff_digest == _expected_subject_identity_digest(
         result.snapshot, collector
     )
     assert compute_subject_digest(subject_input) == result.snapshot.subject_digest
+
+
+def test_collector_reads_exact_legacy_manifest_subject_once_without_upgrade(tmp_path):
+    repo = _init_repo(tmp_path, {"a.txt": b"one\n"})
+    (repo / "a.txt").write_bytes(b"two\n")
+    store = ArtifactStore(tmp_path / "artifact-store")
+    collector = GitSnapshotCollector(max_diff_bytes=1024, max_files=8, max_file_bytes=1024)
+    result = _collect(repo, store, collector=collector)
+    snap = result.snapshot
+    legacy_manifest_digest = _expected_manifest_digest(snap, collector)
+    legacy_subject_digest = compute_subject_digest(
+        SubjectDigestInput(
+            repository=IDENTITY,
+            base_revision=snap.base_revision,
+            head_revision=snap.head_revision,
+            normalized_diff_digest=legacy_manifest_digest,
+            task_digest=TASK,
+            policy_version=POLICY,
+            rubric_version=RUBRIC,
+        )
+    )
+    legacy_snapshot = snap.model_copy(update={"subject_digest": legacy_subject_digest})
+
+    rebuilt = collector.build_subject_input(
+        legacy_snapshot,
+        task_digest=TASK,
+        policy_version=POLICY,
+        rubric_version=RUBRIC,
+    )
+
+    assert rebuilt.normalized_diff_digest == legacy_manifest_digest
+    assert compute_subject_digest(rebuilt) == legacy_subject_digest
+    tampered = legacy_snapshot.model_copy(
+        update={"ignored_files_lower_bound": snap.ignored_files_lower_bound + 1}
+    )
+    with pytest.raises(GitSnapshotError, match="subject digest"):
+        collector.build_subject_input(
+            tampered,
+            task_digest=TASK,
+            policy_version=POLICY,
+            rubric_version=RUBRIC,
+        )
+
+
+def test_subject_identity_keeps_ignored_scan_truncation_fail_closed(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path, {"tracked.txt": b"one\n"})
+    (repo / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    ignored = repo / "ignored"
+    ignored.mkdir()
+    (ignored / "one.txt").write_text("ignored\n", encoding="utf-8")
+    monkeypatch.setattr(snapshot_module, "_MAX_IGNORED_OUTPUT_BYTES", 4)
+    store = ArtifactStore(tmp_path / "artifact-store")
+    collector = GitSnapshotCollector()
+    result = _collect(repo, store, collector=collector)
+
+    assert result.snapshot.ignored_scan_truncated is True
+    assert result.snapshot.complete is False
+    rebuilt = collector.build_subject_input(
+        result.snapshot,
+        task_digest=TASK,
+        policy_version=POLICY,
+        rubric_version=RUBRIC,
+    )
+    assert compute_subject_digest(rebuilt) == result.snapshot.subject_digest
+
+    tampered = result.snapshot.model_copy(
+        update={
+            "ignored_scan_truncated": False,
+            "omissions": (),
+            "complete": True,
+        }
+    )
+    with pytest.raises(GitSnapshotError, match="subject digest"):
+        collector.build_subject_input(
+            tampered,
+            task_digest=TASK,
+            policy_version=POLICY,
+            rubric_version=RUBRIC,
+        )
 
 
 def test_scope_digest_is_bound_when_rebuilding_subject_input(tmp_path):

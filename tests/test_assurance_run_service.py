@@ -469,6 +469,37 @@ def test_initial_and_final_fences_receive_and_bind_the_same_scope(tmp_path):
     assert bundle.freshness_source_binding.subject_identity_version == "v2"
 
 
+def test_final_fence_allows_ignored_count_only_subject_stability(tmp_path):
+    class _CountOnlyFinalGitCollector:
+        def __init__(self):
+            self._collector = run_service_module.GitSnapshotCollector()
+            self.calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._collector, name)
+
+        def collect(self, *args, **kwargs):
+            result = self._collector.collect(*args, **kwargs)
+            self.calls += 1
+            if self.calls == 2:
+                snapshot = result.snapshot.model_copy(
+                    update={
+                        "ignored_files_lower_bound": (
+                            result.snapshot.ignored_files_lower_bound + 1
+                        )
+                    }
+                )
+                return result.model_copy(update={"snapshot": snapshot})
+            return result
+
+    service, intent = _service(tmp_path)
+    service._git_collector = _CountOnlyFinalGitCollector()
+
+    bundle = asyncio.run(service.prepare(intent, idempotency_key="count-only-final"))
+
+    assert bundle.git.snapshot.ignored_files_lower_bound == 0
+
+
 def test_final_fence_rejects_collector_that_ignores_scope(tmp_path):
     collector = _ScopeIgnoringFinalGitCollector()
     service, intent = _service(tmp_path)

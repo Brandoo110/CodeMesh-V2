@@ -2863,7 +2863,7 @@ class AssuranceRunService:
             )
         except Exception as exc:
             raise AssuranceRunStaleError("final source freshness fence failed") from exc
-        self._verify_scoped_git_result(
+        final_subject_digest = self._verify_scoped_git_result(
             final_git,
             task_digest=task_digest,
             policy_version=self._config.policy_version,
@@ -2872,10 +2872,14 @@ class AssuranceRunService:
             acceptance_scope_digest=acceptance_scope_digest,
             phase="final",
         )
+        if (
+            not initial_git.snapshot.complete
+            or not final_git.snapshot.complete
+            or final_subject_digest != subject_digest
+        ):
+            raise AssuranceRunStaleError("Git changed during reviewer execution")
         if type(final_intake) is not IntakeResult:
             raise AssuranceRunStaleError("final fence collector returned invalid result")
-        if _strip_datetimes(_jsonable(final_git)) != _strip_datetimes(_jsonable(initial_git)):
-            raise AssuranceRunStaleError("Git changed during reviewer execution")
         if _strip_datetimes(_jsonable(final_intake)) != _strip_datetimes(_jsonable(initial_intake)):
             raise AssuranceRunStaleError("intake documents changed during reviewer execution")
         if api_result is not None:

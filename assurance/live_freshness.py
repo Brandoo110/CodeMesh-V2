@@ -32,7 +32,12 @@ from .intake import (
     TaskPolicyCollector,
 )
 from .run_service import FreshnessSourceBinding
-from .snapshot import GitSnapshot, GitSnapshotCollector, GitSnapshotError
+from .snapshot import (
+    GitSnapshot,
+    GitSnapshotCollector,
+    GitSnapshotError,
+    GitSnapshotResult,
+)
 
 
 class FreshnessStatus(str, Enum):
@@ -148,22 +153,10 @@ class LiveFreshnessChecker:
             return self._unavailable("BASELINE_CORRUPT", checked_at)
         if binding.subject_identity_version not in {"v1", "v2"}:
             return self._unavailable("BASELINE_CORRUPT", checked_at)
-        if binding.subject_identity_version == "v2":
-            if not self._v2_scope_matches_subject(binding, baseline_git, baseline_intake):
-                return self._stale(
-                    "ACCEPTANCE_SCOPE_MISMATCH",
-                    checked_at,
-                    getattr(baseline_git, "subject_digest", None),
-                )
         expected_subject = self._expected_subject(binding, baseline_git, baseline_intake)
         if expected_subject is None:
             return self._unavailable("BASELINE_CORRUPT", checked_at)
         expected_git, expected_intake = expected_subject
-        try:
-            paths = self._validate_paths(binding)
-        except Exception:
-            return self._unavailable("REPOSITORY_PATH_INVALID", checked_at, expected_git.subject_digest)
-
         if not expected_git.complete:
             return self._unavailable(
                 "BASELINE_GIT_TRUNCATED", checked_at, expected_git.subject_digest
@@ -172,6 +165,17 @@ class LiveFreshnessChecker:
             return self._unavailable(
                 "BASELINE_INTAKE_INCOMPLETE", checked_at, expected_git.subject_digest
             )
+        if binding.subject_identity_version == "v2":
+            if not self._v2_scope_matches_subject(binding, baseline_git, baseline_intake):
+                return self._stale(
+                    "ACCEPTANCE_SCOPE_MISMATCH",
+                    checked_at,
+                    getattr(baseline_git, "subject_digest", None),
+                )
+        try:
+            paths = self._validate_paths(binding)
+        except Exception:
+            return self._unavailable("REPOSITORY_PATH_INVALID", checked_at, expected_git.subject_digest)
 
         scratch_path: str | None = None
         try:
@@ -199,6 +203,12 @@ class LiveFreshnessChecker:
                 paths.repository_root,
                 **collect_kwargs,
             )
+            if type(git_result) is not GitSnapshotResult:
+                return self._unavailable(
+                    "LIVE_COLLECTION_FAILED",
+                    checked_at,
+                    expected_git.subject_digest,
+                )
             observed_git = git_result.snapshot
             if not observed_git.complete:
                 return self._unavailable(
@@ -207,10 +217,29 @@ class LiveFreshnessChecker:
                     expected_git.subject_digest,
                     observed_git.subject_digest,
                 )
+            try:
+                observed_subject_input = self._verified_subject_input(
+                    git_collector,
+                    observed_git,
+                    binding,
+                    task_digest,
+                )
+                observed_subject_digest = compute_subject_digest(
+                    observed_subject_input
+                )
+                if git_result.evidence.subject_digest != observed_subject_digest:
+                    raise ValueError("Git evidence subject identity mismatch")
+            except Exception:
+                return self._unavailable(
+                    "LIVE_COLLECTION_FAILED",
+                    checked_at,
+                    expected_git.subject_digest,
+                    observed_git.subject_digest,
+                )
 
             intake_result = self._intake_collector.collect(
                 paths.repository_root,
-                subject_digest=observed_git.subject_digest,
+                subject_digest=observed_subject_digest,
                 artifact_store=scratch_store,
                 task_path=binding.task_path,
                 policy_paths=binding.policy_paths,
@@ -228,8 +257,7 @@ class LiveFreshnessChecker:
                 )
 
             if (
-                self._semantic_dump(expected_git)
-                != self._semantic_dump(observed_git)
+                observed_subject_digest != expected_git.subject_digest
                 or self._semantic_dump(expected_intake)
                 != self._semantic_dump(observed_intake)
             ):
@@ -244,7 +272,7 @@ class LiveFreshnessChecker:
                 reason_code="FRESHNESS_MATCH",
                 checked_at=checked_at,
                 expected_subject_digest=expected_git.subject_digest,
-                observed_subject_digest=observed_git.subject_digest,
+                observed_subject_digest=observed_subject_digest,
             )
         except _KnownStale:
             return self._stale(
@@ -343,28 +371,55 @@ class LiveFreshnessChecker:
             task_digest = baseline_intake.task_digest
             if task_digest is None:
                 return False
-            subject_input = collector.build_subject_input(
+            subject_input = cls._verified_subject_input(
+                collector,
                 baseline_git,
-                task_digest=task_digest,
-                policy_version=binding.policy_version,
-                rubric_version=binding.rubric_version,
-                attachment_digests=binding.attachment_digests,
-                acceptance_scope_digest=cls._scope_digest(binding),
+                binding,
+                task_digest,
             )
-            return (
-                subject_input.schema_version == "v2"
-                and subject_input.acceptance_scope_digest is not None
-                and subject_input.repository == binding.subject.repository
-                and subject_input.base_revision == binding.subject.base_revision
-                and subject_input.head_revision == binding.subject.head_revision
-                and subject_input.task_digest == binding.subject.task_digest
-                and subject_input.policy_version == binding.subject.policy_version
-                and subject_input.rubric_version == binding.rubric_version
-                and compute_subject_digest(subject_input)
-                == binding.subject.subject_digest
-            )
+            return compute_subject_digest(subject_input) == binding.subject.subject_digest
         except Exception:
             return False
+
+    @classmethod
+    def _verified_subject_input(
+        cls,
+        collector: object,
+        snapshot: GitSnapshot,
+        binding: FreshnessSourceBinding,
+        task_digest: str,
+    ) -> Any:
+        build_subject_input = getattr(collector, "build_subject_input", None)
+        if not callable(build_subject_input):
+            raise TypeError("Git collector cannot verify subject identity")
+        acceptance_scope_digest = (
+            cls._scope_digest(binding)
+            if binding.subject_identity_version == "v2"
+            else None
+        )
+        subject_input = build_subject_input(
+            snapshot,
+            task_digest=task_digest,
+            policy_version=binding.policy_version,
+            rubric_version=binding.rubric_version,
+            attachment_digests=binding.attachment_digests,
+            acceptance_scope_digest=acceptance_scope_digest,
+        )
+        if subject_input.schema_version != binding.subject_identity_version:
+            raise ValueError("Git subject identity version mismatch")
+        if (
+            binding.subject_identity_version == "v2"
+            and subject_input.acceptance_scope_digest != acceptance_scope_digest
+        ):
+            raise ValueError("Git subject identity scope mismatch")
+        if (
+            binding.subject_identity_version == "v1"
+            and subject_input.acceptance_scope_digest is not None
+        ):
+            raise ValueError("legacy Git subject identity must not carry scope")
+        if compute_subject_digest(subject_input) != snapshot.subject_digest:
+            raise ValueError("Git subject identity digest mismatch")
+        return subject_input
 
     def _validate_paths(self, binding: FreshnessSourceBinding) -> _SourcePaths:
         workspace = self._validate_real_directory(self._workspace_root)
