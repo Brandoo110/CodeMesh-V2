@@ -180,6 +180,53 @@ def test_codex_cli_invoker_uses_fixed_safe_command_and_filtered_environment(
     }
 
 
+def test_codex_cli_transport_schema_uses_openai_supported_array_subset(
+    tmp_path, monkeypatch
+):
+    prompt = _prompt()
+    final = _valid_response(prompt).encode()
+    process = _FakeProcess(stdout=_event_stream(final.decode()))
+    captured_schema = {}
+
+    async def launch(*argv, **kwargs):
+        output_schema = Path(argv[argv.index("--output-schema") + 1])
+        captured_schema.update(json.loads(output_schema.read_text(encoding="utf-8")))
+        output_last_message = Path(
+            argv[argv.index("--output-last-message") + 1]
+        )
+        output_last_message.write_bytes(final)
+        return process
+
+    monkeypatch.setattr(codex_module.asyncio, "create_subprocess_exec", launch)
+
+    result = asyncio.run(
+        CodexCliReviewerInvoker(
+            _fake_binary(tmp_path), temp_root=tmp_path, environ={"HOME": "/safe"}
+        ).invoke(prompt, run_id="run-transport-schema", route=_route())
+    )
+
+    assert result.status == "success"
+
+    def schema_nodes(value):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from schema_nodes(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from schema_nodes(child)
+
+    arrays = [
+        node for node in schema_nodes(captured_schema) if node.get("type") == "array"
+    ]
+    assert arrays
+    supported_array_keywords = {"type", "items", "minItems", "maxItems"}
+    for array in arrays:
+        assert set(array).issubset(supported_array_keywords)
+        assert array["type"] == "array"
+        assert "items" in array
+
+
 def _valid_response(prompt):
     return json.dumps(
         {

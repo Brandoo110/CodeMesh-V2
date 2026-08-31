@@ -679,7 +679,7 @@ _RESPONSE_SCHEMA_TEXT = """{
         "properties": {
           "reviewer_role": {"enum": ["intent", "architecture", "operability"]},
           "claim": {"type": "string", "minLength": 1},
-          "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+          "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
           "severity": {"enum": ["info", "low", "medium", "high", "critical"]},
           "confidence": {"type": "number", "minimum": 0, "maximum": 1}
         }
@@ -695,7 +695,7 @@ _RESPONSE_SCHEMA_TEXT = """{
           "reviewer_role": {"enum": ["intent", "architecture", "operability"]},
           "question": {"type": "string", "minLength": 1},
           "reason": {"enum": ["model_question", "truncated_context"]},
-          "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+          "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}}
         }
       }
     }
