@@ -680,7 +680,7 @@ def test_collector_constructor_strict_positive_finite_validation():
         collector.max_files,
         collector.max_file_bytes,
         collector.command_timeout_seconds,
-    ) == (262144, 500, 5_000_000, 10.0)
+    ) == (1_048_576, 500, 5_000_000, 10.0)
     bad_values = {
         "max_diff_bytes": [True, "10", 0, -1],
         "max_files": [True, "10", 0, -1, 10.0],
@@ -1087,6 +1087,43 @@ def test_files_and_diff_truncation_flags(tmp_path):
     artifact = store.get_bytes(diff_snap.diff_artifact_digest)
     assert artifact.endswith(b"TRUNCATED ===\n")
     assert diff_result.evidence.status == "truncated"
+
+
+def test_default_collector_keeps_real_diff_below_one_mib_complete(tmp_path):
+    repo = _init_repo(tmp_path, {"a.txt": b"base\n"})
+    payload = b"x" * (300 * 1024) + b"\n"
+    (repo / "a.txt").write_bytes(payload)
+    store = ArtifactStore(tmp_path / "artifact-store")
+
+    result = _collect(repo, store)
+
+    snap = result.snapshot
+    artifact = store.get_bytes(snap.diff_artifact_digest)
+    assert 256 * 1024 < len(artifact) < 1024 * 1024
+    assert b"+" + payload in artifact
+    assert snap.diff_truncated is False
+    assert snap.omissions == ()
+    assert snap.complete is True
+    assert result.evidence.status == "success"
+
+
+def test_default_collector_truncates_real_diff_over_one_mib(tmp_path):
+    repo = _init_repo(tmp_path, {"a.txt": b"base\n"})
+    payload = b"x" * (1024 * 1024) + b"\n"
+    (repo / "a.txt").write_bytes(payload)
+    store = ArtifactStore(tmp_path / "artifact-store")
+
+    result = _collect(repo, store)
+
+    snap = result.snapshot
+    artifact = store.get_bytes(snap.diff_artifact_digest)
+    assert len(artifact) == 1_048_576
+    assert b"+" + payload not in artifact
+    assert snap.diff_truncated is True
+    assert snap.omissions == ("diff_truncated",)
+    assert snap.complete is False
+    assert artifact.endswith(snapshot_module._DIFF_TRUNCATION_MARKER)
+    assert result.evidence.status == "truncated"
 
 
 @pytest.mark.parametrize("max_diff_bytes", [1, 8, 32, 46, 64, 128])

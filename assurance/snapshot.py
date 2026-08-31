@@ -38,6 +38,7 @@ _READ_CHUNK_SIZE = 64 * 1024
 _MAX_METADATA_OUTPUT_BYTES = 4 * 1024 * 1024
 _MAX_IGNORED_OUTPUT_BYTES = 4 * 1024 * 1024
 _MAX_STDERR_BYTES = 4096
+_DEFAULT_MAX_DIFF_BYTES = 1_048_576
 _GIT_PREFIX = (
     "-c",
     "core.hooksPath=/dev/null",
@@ -406,7 +407,7 @@ class GitSnapshotCollector:
 
     def __init__(
         self,
-        max_diff_bytes: int = 262144,
+        max_diff_bytes: int = _DEFAULT_MAX_DIFF_BYTES,
         max_files: int = 500,
         max_file_bytes: int = 5_000_000,
         command_timeout_seconds: float = 10.0,

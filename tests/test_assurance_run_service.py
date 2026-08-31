@@ -997,6 +997,16 @@ def test_prepare_returns_complete_bundle_without_committer_io(tmp_path):
     assert committer.calls == []
 
 
+def test_default_run_service_git_collector_profile_is_one_mib(tmp_path):
+    service, _ = _service(tmp_path)
+
+    assert service._git_collector.max_diff_bytes == 1_048_576
+    assert (
+        run_service_module._DEFAULT_GIT_COLLECTOR_PROFILE["max_diff_bytes"]
+        == 1_048_576
+    )
+
+
 def test_run_cache_hit_skips_prepare_and_miss_prepares_once_then_commits_once(
     tmp_path, monkeypatch
 ):

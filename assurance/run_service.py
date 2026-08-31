@@ -86,7 +86,11 @@ from .single_reviewer import (
     SingleReviewerResult,
     SingleStrongReviewer,
 )
-from .snapshot import GitSnapshotCollector, GitSnapshotResult
+from .snapshot import (
+    GitSnapshotCollector,
+    GitSnapshotResult,
+    _DEFAULT_MAX_DIFF_BYTES,
+)
 from .state_machine import (
     AcceptanceBinding,
     AcceptanceEvent,
@@ -141,7 +145,7 @@ _REVIEWER_STATUS_ERROR_CODES = {
     "invalid_json": frozenset({"REVIEWER_INVALID_JSON"}),
 }
 _DEFAULT_GIT_COLLECTOR_PROFILE = {
-    "max_diff_bytes": 262144,
+    "max_diff_bytes": _DEFAULT_MAX_DIFF_BYTES,
     "max_files": 500,
     "max_file_bytes": 5_000_000,
     "command_timeout_seconds": 10.0,
