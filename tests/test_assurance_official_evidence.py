@@ -91,6 +91,9 @@ def _report(
     status: str = "success",
     conclusion: str = "success",
 ) -> tuple[bytes, bytes]:
+    workflow_definition = _source(
+        root, head, ".github/workflows/p-c-handover.yml"
+    )
     if kind == "dependency_audit":
         source_paths = [
             _source(root, head, "frontend/package.json"),
@@ -100,7 +103,6 @@ def _report(
         audit_command: str | None = "pnpm audit --prod --audit-level=high --json"
     else:
         source_paths = [
-            _source(root, head, ".github/workflows/p-c-handover.yml"),
             _source(root, head, "frontend/package.json"),
             _source(root, head, "frontend/pnpm-lock.yaml"),
         ]
@@ -123,6 +125,7 @@ def _report(
         "subject_digest": subject_digest,
         "producer": "collector." + kind,
         "source_paths": source_paths,
+        "workflow_definition": workflow_definition,
         "workflow_name": "P-C Handover Experience",
         "workflow_path": ".github/workflows/p-c-handover.yml",
         "event": "workflow_dispatch",
@@ -312,6 +315,29 @@ def test_import_reads_one_exact_run_and_binds_two_observed_receipts(tmp_path):
         assert importer._artifact_store.get_bytes(imported.receipt_digest) == imported.receipt_bytes
         assert importer._artifact_store.get_bytes(imported.remote_zip_digest) == zip_bytes
         importer.verify_import(imported)
+
+
+def test_import_requires_exact_workflow_definition_binding(tmp_path):
+    root, head = _repository(tmp_path)
+    original_zip = _zip_payload(root, head)
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(original_zip)) as source_archive:
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for info in source_archive.infolist():
+                data = source_archive.read(info.filename)
+                if info.filename in {"dependency_audit.json", "ci_iac_validation.json"}:
+                    report = json.loads(data)
+                    report.pop("workflow_definition", None)
+                    data = json.dumps(
+                        report, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                archive.writestr(info.filename, data)
+    zip_bytes = output.getvalue()
+    transport, _requests = _transport(head, zip_bytes)
+    importer = _importer(tmp_path, root, head, transport)
+
+    with pytest.raises(OfficialEvidenceError):
+        importer.import_run(RUN_ID)
 
 
 @pytest.mark.parametrize(

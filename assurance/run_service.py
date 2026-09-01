@@ -575,6 +575,7 @@ class _OfficialEvidenceCommitProof:
     result_byte_size: int
     result_bytes: bytes
     source_bindings: tuple[tuple[OfficialEvidenceSource, bytes], ...]
+    workflow_definition: tuple[OfficialEvidenceSource, bytes]
 
 
 class ReviewerRoute(BaseModel):
@@ -1988,6 +1989,45 @@ class AssuranceRunService:
                 raise AssuranceRunOfficialEvidenceError(
                     reason_code="lineage_mismatch"
                 )
+            workflow_binding = imported.workflow_definition
+            if (
+                type(workflow_binding) is not tuple
+                or len(workflow_binding) != 2
+                or type(workflow_binding[0]) is not OfficialEvidenceSource
+                or type(workflow_binding[1]) is not bytes
+                or workflow_binding[0] != receipt.workflow_definition
+                or len(workflow_binding[1]) != workflow_binding[0].byte_size
+                or _sha256(workflow_binding[1]) != workflow_binding[0].digest
+            ):
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="digest_or_size_mismatch"
+                )
+            workflow_source = workflow_binding[0]
+            try:
+                workflow_blob = subprocess.run(
+                    (
+                        "git",
+                        "cat-file",
+                        "blob",
+                        f"{head_revision}:{workflow_source.path}",
+                    ),
+                    cwd=repository_path,
+                    check=True,
+                    capture_output=True,
+                    timeout=5.0,
+                ).stdout
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="artifact_structure_invalid"
+                ) from exc
+            if (
+                workflow_blob != workflow_binding[1]
+                or len(workflow_blob) != workflow_source.byte_size
+                or _sha256(workflow_blob) != workflow_source.digest
+            ):
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="digest_or_size_mismatch"
+                )
             proofs.append(
                 _OfficialEvidenceCommitProof(
                     evidence_id=evidence.evidence_id,
@@ -2011,6 +2051,7 @@ class AssuranceRunService:
                     result_byte_size=receipt.result_byte_size,
                     result_bytes=result_bytes,
                     source_bindings=tuple(source_bindings),
+                    workflow_definition=(workflow_source, workflow_blob),
                 )
             )
         return tuple(proofs)

@@ -1186,7 +1186,7 @@ def test_regex_backslash_and_escaped_newline_are_safe_after_json_encoding(tmp_pa
     assert git.decode() not in entry.content
 
 
-def test_official_report_context_is_redacted_as_semantic_json(
+def test_official_report_context_uses_dedicated_workflow_definition(
     tmp_path, monkeypatch
 ):
     store = ArtifactStore(tmp_path / "artifacts")
@@ -1205,7 +1205,8 @@ def test_official_report_context_is_redacted_as_semantic_json(
         head_revision="a" * 40,
         subject_digest=SUBJECT,
         producer="collector.dependency_audit",
-        source_paths=(source, workflow_source),
+        source_paths=(source,),
+        workflow_definition=workflow_source,
         workflow_name="P-C Handover Experience",
         workflow_path=".github/workflows/p-c-handover.yml",
         event="workflow_dispatch",
@@ -1227,7 +1228,8 @@ def test_official_report_context_is_redacted_as_semantic_json(
         repository_identity="example/repository",
         head_revision="a" * 40,
         producer="collector.dependency_audit",
-        source_paths=(source, workflow_source),
+        source_paths=(source,),
+        workflow_definition=workflow_source,
         workflow_name=report.workflow_name,
         workflow_path=report.workflow_path,
         event="workflow_dispatch",
@@ -1319,20 +1321,19 @@ def test_official_report_context_is_redacted_as_semantic_json(
             "digest": _digest(result),
             "size": len(result),
         },
-        "sources": [
-            {
-                "path": "package.json",
-                "digest": "sha256:" + "2" * 64,
-                "size": 1,
-            },
-            {
-                "path": ".github/workflows/p-c-handover.yml",
-                "digest": "sha256:" + "4" * 64,
-                "size": 2,
-            },
-        ],
+            "sources": [
+                {
+                    "path": "package.json",
+                    "digest": "sha256:" + "2" * 64,
+                    "size": 1,
+                },
+            ],
         "checks": [],
     }
+    assert all(
+        source["path"] != ".github/workflows/p-c-handover.yml"
+        for source in payload["lineage"]["sources"]
+    )
     assert "advisories" not in entry.content
 
     tampered_receipt = receipt.model_copy(

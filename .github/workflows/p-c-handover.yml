@@ -175,6 +175,7 @@ jobs:
           import hashlib
           import json
           import os
+          import subprocess
           from pathlib import Path
           import re
 
@@ -185,6 +186,8 @@ jobs:
           workflow = os.environ.get("GITHUB_WORKFLOW", "P-C Handover Experience")
           workflow_path = ".github/workflows/p-c-handover.yml"
           event = os.environ["CODEMESH_EVENT"]
+          if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", target) is None:
+              raise SystemExit("workflow target SHA is invalid")
           pull_request_number = int(os.environ["CODEMESH_PR_NUMBER"])
           subject_digest = os.environ["CODEMESH_SUBJECT_DIGEST"]
           if re.fullmatch(r"sha256:[0-9a-f]{64}", subject_digest) is None:
@@ -211,15 +214,39 @@ jobs:
           if any(value != "success" for value in step_status.values()):
               raise SystemExit("official validation step did not succeed")
 
-          def file_facts(relative):
-              path = root / relative
-              data = path.read_bytes()
+          def git_blob_facts(relative):
+              listing = subprocess.run(
+                  ("git", "ls-tree", "-z", target, "--", relative),
+                  cwd=root,
+                  check=True,
+                  capture_output=True,
+              ).stdout
+              entries = listing.split(b"\x00")
+              if len(entries) != 2 or not entries[0]:
+                  raise SystemExit("target Git blob is missing")
+              header, path = entries[0].split(b"\t", 1)
+              mode, object_type, object_id = header.split(b" ")
+              if (
+                  path.decode("utf-8", errors="strict") != relative
+                  or object_type != b"blob"
+                  or mode not in {b"100644", b"100755"}
+                  or re.fullmatch(rb"[0-9a-f]{40,64}", object_id) is None
+              ):
+                  raise SystemExit("target Git object is not a regular blob")
+              data = subprocess.run(
+                  ("git", "cat-file", "blob", object_id.decode("ascii")),
+                  cwd=root,
+                  check=True,
+                  capture_output=True,
+              ).stdout
               return {
                   "schema_version": "v1",
                   "path": relative,
                   "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
                   "byte_size": len(data),
               }
+
+          workflow_definition = git_blob_facts(workflow_path)
 
           def write_report(
               kind,
@@ -239,7 +266,7 @@ jobs:
                   "head_revision": target,
                   "subject_digest": subject_digest,
                   "producer": "collector." + kind,
-                  "source_paths": [file_facts(item) for item in sources],
+                  "source_paths": [git_blob_facts(item) for item in sources],
                   "workflow_name": workflow,
                   "workflow_path": workflow_path,
                   "event": event,
@@ -254,6 +281,7 @@ jobs:
                   "result_digest": "sha256:" + hashlib.sha256(result.read_bytes()).hexdigest(),
                   "result_byte_size": result.stat().st_size,
                   "checks": list(checks),
+                  "workflow_definition": workflow_definition,
                   "evidence_mode": "official",
               }
               if audit_command is not None:
@@ -288,7 +316,7 @@ jobs:
           write_report(
               "ci_iac_validation",
               "ci-iac-result.json",
-              (".github/workflows/p-c-handover.yml", "frontend/package.json", "frontend/pnpm-lock.yaml"),
+              ("frontend/package.json", "frontend/pnpm-lock.yaml"),
               report_status=step_status["browser_walkthrough"],
               report_conclusion=step_status["browser_walkthrough"],
               checks=(

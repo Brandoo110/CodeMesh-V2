@@ -2417,19 +2417,29 @@ class AssuranceWebRepository:
         proof: _OfficialEvidenceCommitProof,
     ) -> str:
         return _canonical_json(
-            [
-                {
-                    **source.model_dump(mode="json"),
-                    "bytes": base64.b64encode(data).decode("ascii"),
-                }
-                for source, data in proof.source_bindings
-            ]
+            {
+                "sources": [
+                    {
+                        **source.model_dump(mode="json"),
+                        "bytes": base64.b64encode(data).decode("ascii"),
+                    }
+                    for source, data in proof.source_bindings
+                ],
+                "workflow_definition": {
+                    **proof.workflow_definition[0].model_dump(mode="json"),
+                    "bytes": base64.b64encode(proof.workflow_definition[1]).decode(
+                        "ascii"
+                    ),
+                },
+            }
         )
 
     def _validate_official_commit_proofs(
         self,
         bundle: AssuranceRunBundle,
         official_proofs: tuple[_OfficialEvidenceCommitProof, ...],
+        *,
+        historical_readback: bool = False,
     ) -> tuple[tuple, ...]:
         """Re-hash and re-bind verified official bytes before any write."""
 
@@ -2489,6 +2499,19 @@ class AssuranceWebRepository:
                 raise AssuranceRunPersistenceError(
                     "official proof identity is invalid"
                 )
+            workflow_binding = proof.workflow_definition
+            if (
+                type(workflow_binding) is not tuple
+                or len(workflow_binding) != 2
+                or type(workflow_binding[0]) is not OfficialEvidenceSource
+                or type(workflow_binding[1]) is not bytes
+                or len(workflow_binding[1]) != workflow_binding[0].byte_size
+                or len(workflow_binding[1]) > _OFFICIAL_PROOF_MAX_SOURCE_BYTES
+                or _proof_digest(workflow_binding[1]) != workflow_binding[0].digest
+            ):
+                raise AssuranceRunPersistenceError(
+                    "official workflow definition bytes do not match their binding"
+                )
             groups.add(
                 (
                     proof.workflow_run_id,
@@ -2497,6 +2520,9 @@ class AssuranceWebRepository:
                     proof.artifact_id,
                     proof.artifact_digest,
                     proof.artifact_byte_size,
+                    workflow_binding[0].path,
+                    workflow_binding[0].digest,
+                    workflow_binding[0].byte_size,
                 )
             )
             byte_fields = (
@@ -2519,8 +2545,12 @@ class AssuranceWebRepository:
                         f"official {label} bytes do not match their digest or size"
                     )
             try:
-                receipt = parse_official_evidence_receipt(proof.receipt_bytes)
-                report = parse_official_evidence_report(proof.report_bytes)
+                receipt = parse_official_evidence_receipt(
+                    proof.receipt_bytes, allow_legacy=historical_readback
+                )
+                report = parse_official_evidence_report(
+                    proof.report_bytes, allow_legacy=historical_readback
+                )
                 result = _parse_proof_json(proof.result_bytes, "result bytes")
             except (TypeError, ValueError, UnicodeDecodeError) as exc:
                 raise AssuranceRunPersistenceError(
@@ -2541,7 +2571,7 @@ class AssuranceWebRepository:
             # The trusted internal receipt remains canonical.  Report/result
             # members are provider-owned raw JSON; typed equality and the ZIP
             # member check below retain their semantic and byte binding.
-            if proof.receipt_bytes != canonical_receipt:
+            if not historical_readback and proof.receipt_bytes != canonical_receipt:
                 raise AssuranceRunPersistenceError(
                     "official proof bytes are not canonical"
                 )
@@ -2568,6 +2598,8 @@ class AssuranceWebRepository:
                 or receipt.report_byte_size != proof.report_byte_size
                 or receipt.result_digest != proof.result_digest
                 or receipt.result_byte_size != proof.result_byte_size
+                or receipt.workflow_definition != workflow_binding[0]
+                or report.workflow_definition != receipt.workflow_definition
                 or report != receipt.report
                 or result != receipt.result
                 or proof.receipt_digest != evidence.artifact_digest
@@ -2687,16 +2719,32 @@ class AssuranceWebRepository:
             (bundle.run_id,),
         ).fetchall()
         proofs = []
+        legacy_shapes = set()
         for row in rows:
             try:
                 source_data = _parse_canonical_json(
                     row["source_bindings_json"],
                     "official proof source bindings",
                 )
-                if not isinstance(source_data, list):
-                    raise ValueError("source bindings must be a list")
-                source_bindings = []
-                for item in source_data:
+                legacy_source_shape = isinstance(source_data, list)
+                legacy_shapes.add(legacy_source_shape)
+                if legacy_source_shape:
+                    source_items = source_data
+                    workflow_item = None
+                elif isinstance(source_data, dict) and set(source_data) == {
+                    "sources",
+                    "workflow_definition",
+                }:
+                    source_items = source_data["sources"]
+                    workflow_item = source_data["workflow_definition"]
+                    if not isinstance(source_items, list) or not isinstance(
+                        workflow_item, dict
+                    ):
+                        raise ValueError("official proof source shape is invalid")
+                else:
+                    raise ValueError("official proof source shape is invalid")
+
+                def decode_binding(item: object) -> tuple[OfficialEvidenceSource, bytes]:
                     if not isinstance(item, dict) or set(item) != {
                         "schema_version",
                         "path",
@@ -2705,12 +2753,35 @@ class AssuranceWebRepository:
                         "bytes",
                     }:
                         raise ValueError("source binding shape is invalid")
-                    encoded = item.pop("bytes")
+                    encoded = item["bytes"]
                     if type(encoded) is not str:
                         raise ValueError("source bytes are not base64")
                     data = base64.b64decode(encoded, validate=True)
-                    source = OfficialEvidenceSource.model_validate(item)
-                    source_bindings.append((source, data))
+                    source = OfficialEvidenceSource.model_validate(
+                        {key: item[key] for key in item if key != "bytes"}
+                    )
+                    return source, data
+
+                source_bindings = [decode_binding(item) for item in source_items]
+                if legacy_source_shape:
+                    receipt = parse_official_evidence_receipt(
+                        row["receipt_bytes"], allow_legacy=True
+                    )
+                    workflow_matches = [
+                        binding
+                        for binding in source_bindings
+                        if binding[0].path == receipt.workflow_definition.path
+                    ]
+                    if len(workflow_matches) != 1:
+                        raise ValueError("legacy workflow definition binding is invalid")
+                    workflow_definition = workflow_matches[0]
+                    source_bindings = [
+                        binding
+                        for binding in source_bindings
+                        if binding is not workflow_definition
+                    ]
+                else:
+                    workflow_definition = decode_binding(workflow_item)
                 proofs.append(
                     _OfficialEvidenceCommitProof(
                         evidence_id=row["evidence_id"],
@@ -2734,13 +2805,22 @@ class AssuranceWebRepository:
                         result_byte_size=row["result_byte_size"],
                         result_bytes=row["result_bytes"],
                         source_bindings=tuple(source_bindings),
+                        workflow_definition=workflow_definition,
                     )
                 )
             except (TypeError, ValueError, KeyError, binascii.Error) as exc:
                 raise AssuranceRunPersistenceError(
                     "stored official proof is invalid"
                 ) from exc
-        self._validate_official_commit_proofs(bundle, tuple(proofs))
+        if len(legacy_shapes) > 1:
+            raise AssuranceRunPersistenceError(
+                "stored official proof shapes must not be mixed"
+            )
+        self._validate_official_commit_proofs(
+            bundle,
+            tuple(proofs),
+            historical_readback=bool(legacy_shapes and True in legacy_shapes),
+        )
         return tuple(proofs)
 
     def _live_freshness_result(self, live_baseline) -> LiveFreshness:

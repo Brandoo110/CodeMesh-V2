@@ -529,13 +529,20 @@ def _fake_official_import(
         source_path = (
             "TASK.md"
             if report_kind == "dependency_audit"
-            else ".github/workflows/p-c-handover.yml"
+            else "POLICY.md"
         )
         source_bytes = (repository_path / source_path).read_bytes()
         source = OfficialEvidenceSource(
             path=source_path,
             digest="sha256:" + hashlib.sha256(source_bytes).hexdigest(),
             byte_size=len(source_bytes),
+        )
+        workflow_path = ".github/workflows/p-c-handover.yml"
+        workflow_bytes = (repository_path / workflow_path).read_bytes()
+        workflow_source = OfficialEvidenceSource(
+            path=workflow_path,
+            digest="sha256:" + hashlib.sha256(workflow_bytes).hexdigest(),
+            byte_size=len(workflow_bytes),
         )
         checks = ()
         audit_command = "pnpm audit --prod --audit-level=high --json"
@@ -562,6 +569,7 @@ def _fake_official_import(
             subject_digest=subject_digest,
             producer="collector." + report_kind,
             source_paths=(source,),
+            workflow_definition=workflow_source,
             workflow_name="P-C Handover Experience",
             workflow_path=".github/workflows/p-c-handover.yml",
             event="workflow_dispatch",
@@ -600,6 +608,8 @@ def _fake_official_import(
     remote_zip = remote_buffer.getvalue()
     report, report_bytes, result_bytes = reports[kind]
     source = report.source_paths[0]
+    workflow_source = report.workflow_definition
+    workflow_bytes = (repository_path / workflow_source.path).read_bytes()
     result_digest = report.result_digest
     remote_zip_digest = "sha256:" + hashlib.sha256(remote_zip).hexdigest()
     receipt = OfficialEvidenceReceipt(
@@ -609,6 +619,7 @@ def _fake_official_import(
         head_revision=head_revision,
         producer=report.producer,
         source_paths=(source,),
+        workflow_definition=workflow_source,
         workflow_name=report.workflow_name,
         workflow_path=report.workflow_path,
         event=report.event,
@@ -656,6 +667,7 @@ def _fake_official_import(
         remote_zip_digest=remote_zip_digest,
         remote_zip_byte_size=len(remote_zip),
         source_bindings=(source,),
+        workflow_definition=(workflow_source, workflow_bytes),
     )
 
 
@@ -719,7 +731,7 @@ def test_official_dependency_evidence_flows_through_manifest_risk_policy_and_bun
     assert _FakeOfficialImporter.verified == 2
 
 
-def test_service_passes_verified_official_commit_proofs_to_committer(
+def test_official_commit_proof_carries_workflow_definition_bytes(
     tmp_path, monkeypatch
 ):
     _FakeOfficialImporter.calls = 0
@@ -743,6 +755,11 @@ def test_service_passes_verified_official_commit_proofs_to_committer(
         "ci_iac_validation",
     }
     assert all(proof.evidence_id in {item.evidence_id for item in result.bundle.evidence} for proof in committer.proofs)
+    assert all(
+        proof.workflow_definition[1]
+        == (intent.repository_path / ".github/workflows/p-c-handover.yml").read_bytes()
+        for proof in committer.proofs
+    )
 
 
 def test_missing_official_dependency_evidence_keeps_policy_blocked(tmp_path):

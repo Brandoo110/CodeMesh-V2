@@ -327,6 +327,7 @@ class OfficialEvidenceReport(BaseModel):
     source_paths: tuple[OfficialEvidenceSource, ...] = Field(
         min_length=1, max_length=_MAX_SOURCE_FILES
     )
+    workflow_definition: OfficialEvidenceSource
     workflow_name: str
     workflow_path: str
     event: Literal["workflow_dispatch"]
@@ -423,6 +424,10 @@ class OfficialEvidenceReport(BaseModel):
         source_paths = [item.path for item in self.source_paths]
         if len(source_paths) != len(set(source_paths)):
             raise ValueError("official source paths must be unique")
+        if self.workflow_definition.path != self.workflow_path:
+            raise ValueError("workflow definition path does not match P-C")
+        if self.workflow_definition.path in source_paths:
+            raise ValueError("workflow definition must be distinct from source paths")
         if self.result_path in source_paths:
             raise ValueError("result path must be distinct from source paths")
         if self.kind == "dependency_audit":
@@ -435,8 +440,6 @@ class OfficialEvidenceReport(BaseModel):
         else:
             if self.audit_command is not None:
                 raise ValueError("CI report must not contain an audit command")
-            if _GITHUB_WORKFLOW_PATH not in source_paths:
-                raise ValueError("CI report must bind the P-C workflow source")
             if self.result_path != "ci-iac-result.json":
                 raise ValueError("CI result path is invalid")
             names = {item.name.strip().lower().replace("_", "-") for item in self.checks}
@@ -463,6 +466,7 @@ class OfficialEvidenceReceipt(BaseModel):
     head_revision: str
     producer: str
     source_paths: tuple[OfficialEvidenceSource, ...]
+    workflow_definition: OfficialEvidenceSource
     workflow_name: str
     workflow_path: str
     event: Literal["workflow_dispatch"]
@@ -539,6 +543,7 @@ class OfficialEvidenceReceipt(BaseModel):
             or report.head_revision != self.head_revision
             or report.producer != self.producer
             or report.source_paths != self.source_paths
+            or report.workflow_definition != self.workflow_definition
             or report.workflow_name != self.workflow_name
             or report.workflow_path != self.workflow_path
             or report.event != self.event
@@ -561,6 +566,10 @@ class OfficialEvidenceReceipt(BaseModel):
             raise ValueError("receipt provenance does not match P-C")
         if self.artifact_name != _OFFICIAL_ARTIFACT_PREFIX + self.workflow_run_id:
             raise ValueError("receipt artifact name does not match run")
+        if self.workflow_definition.path != self.workflow_path:
+            raise ValueError("receipt workflow definition path is invalid")
+        if self.workflow_definition.path in {item.path for item in self.source_paths}:
+            raise ValueError("receipt workflow definition overlaps source")
         if self.result_path in {item.path for item in self.source_paths}:
             raise ValueError("receipt result path overlaps source")
         return self
@@ -579,6 +588,7 @@ class OfficialEvidenceImport:
     remote_zip_digest: str
     remote_zip_byte_size: int
     source_bindings: tuple[OfficialEvidenceSource, ...]
+    workflow_definition: tuple[OfficialEvidenceSource, bytes]
 
     @property
     def report(self) -> OfficialEvidenceReport:
@@ -619,13 +629,41 @@ def _parse_json(data: bytes, *, max_bytes: int) -> object:
         raise _error() from None
 
 
-def _parse_report_bytes(data: bytes) -> OfficialEvidenceReport:
+def _upgrade_legacy_workflow_definition(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict):
+        raise _error("artifact_structure_invalid")
+    if "workflow_definition" in raw:
+        return raw
+    source_paths = raw.get("source_paths")
+    workflow_path = raw.get("workflow_path")
+    if not isinstance(source_paths, list) or type(workflow_path) is not str:
+        raise _error("artifact_structure_invalid")
+    workflow_sources = [
+        item
+        for item in source_paths
+        if isinstance(item, dict) and item.get("path") == workflow_path
+    ]
+    if len(workflow_sources) != 1:
+        raise _error("artifact_structure_invalid")
+    upgraded = dict(raw)
+    upgraded["workflow_definition"] = workflow_sources[0]
+    upgraded["source_paths"] = [
+        item for item in source_paths if item is not workflow_sources[0]
+    ]
+    return upgraded
+
+
+def _parse_report_bytes(
+    data: bytes, *, allow_legacy: bool = False
+) -> OfficialEvidenceReport:
     try:
         raw = _parse_json(data, max_bytes=_MAX_REPORT_BYTES)
     except OfficialEvidenceError:
         raise _error("artifact_structure_invalid") from None
     if not isinstance(raw, dict):
         raise _error("artifact_structure_invalid")
+    if allow_legacy:
+        raw = _upgrade_legacy_workflow_definition(raw)
     if isinstance(raw.get("checks"), dict):
         checks = []
         for name, status in raw["checks"].items():
@@ -657,13 +695,17 @@ def _parse_result_bytes(data: bytes) -> dict[str, Any] | list[Any]:
     return raw
 
 
-def parse_official_evidence_report(data: bytes) -> OfficialEvidenceReport:
+def parse_official_evidence_report(
+    data: bytes, *, allow_legacy: bool = False
+) -> OfficialEvidenceReport:
     """Parse a report from a trusted receipt/artifact byte string."""
 
-    return _parse_report_bytes(data)
+    return _parse_report_bytes(data, allow_legacy=allow_legacy)
 
 
-def parse_official_evidence_receipt(data: bytes) -> OfficialEvidenceReceipt:
+def parse_official_evidence_receipt(
+    data: bytes, *, allow_legacy: bool = False
+) -> OfficialEvidenceReceipt:
     """Parse the subject-bound canonical Evidence artifact."""
 
     try:
@@ -671,6 +713,11 @@ def parse_official_evidence_receipt(data: bytes) -> OfficialEvidenceReceipt:
     except OfficialEvidenceError:
         raise _error("artifact_structure_invalid") from None
     try:
+        if allow_legacy:
+            raw = _upgrade_legacy_workflow_definition(raw)
+            if isinstance(raw.get("report"), dict):
+                raw = dict(raw)
+                raw["report"] = _upgrade_legacy_workflow_definition(raw["report"])
         return OfficialEvidenceReceipt.model_validate(raw)
     except (TypeError, ValueError, ValidationError, RecursionError):
         raise _error("artifact_structure_invalid") from None
@@ -938,6 +985,7 @@ class OfficialEvidenceImporter:
             raise
         except (TypeError, ValueError, ValidationError):
             raise _error("unknown") from None
+        workflow_definition_bytes: dict[str, bytes] = {}
         for report in reports.values():
             self._verify_report_claims(report, run, job)
             expected_result = (
@@ -958,6 +1006,25 @@ class OfficialEvidenceImporter:
                 source_bytes = self._git_blob(source.path)
                 if len(source_bytes) != source.byte_size or _digest_bytes(source_bytes) != source.digest:
                     raise _error("digest_or_size_mismatch")
+            workflow_source = report.workflow_definition
+            workflow_bytes = self._git_blob(workflow_source.path)
+            if (
+                len(workflow_bytes) != workflow_source.byte_size
+                or _digest_bytes(workflow_bytes) != workflow_source.digest
+            ):
+                raise _error("digest_or_size_mismatch")
+            workflow_definition_bytes[report.kind] = workflow_bytes
+
+        workflow_bindings = {
+            (
+                report.workflow_definition.path,
+                report.workflow_definition.digest,
+                report.workflow_definition.byte_size,
+            )
+            for report in reports.values()
+        }
+        if len(workflow_bindings) != 1:
+            raise _error("lineage_mismatch")
 
         zip_digest = _digest_bytes(zip_bytes)
         self._store_verified_bytes(zip_bytes, zip_digest)
@@ -981,6 +1048,7 @@ class OfficialEvidenceImporter:
                     zip_digest=zip_digest,
                     zip_byte_size=len(zip_bytes),
                     zip_bytes=zip_bytes,
+                    workflow_definition_bytes=workflow_definition_bytes[kind],
                 )
             except OfficialEvidenceError:
                 raise
@@ -996,6 +1064,19 @@ class OfficialEvidenceImporter:
             raise _error("unknown")
         if imported.receipt.subject_digest != self._subject_digest:
             raise _error("lineage_mismatch")
+        if (
+            type(imported.source_bindings) is not tuple
+            or type(imported.workflow_definition) is not tuple
+            or len(imported.workflow_definition) != 2
+            or type(imported.workflow_definition[0]) is not OfficialEvidenceSource
+            or type(imported.workflow_definition[1]) is not bytes
+            or imported.workflow_definition[0] != imported.receipt.workflow_definition
+            or len(imported.workflow_definition[1])
+            != imported.workflow_definition[0].byte_size
+            or _digest_bytes(imported.workflow_definition[1])
+            != imported.workflow_definition[0].digest
+        ):
+            raise _error("digest_or_size_mismatch")
         self._verify_stored_bytes(imported.receipt_digest, imported.receipt_bytes)
         self._verify_stored_bytes(imported.remote_zip_digest, imported.remote_zip_bytes)
         if parse_official_evidence_receipt(imported.receipt_bytes) != imported.receipt:
@@ -1016,6 +1097,14 @@ class OfficialEvidenceImporter:
             source_bytes = self._git_blob(source.path)
             if len(source_bytes) != source.byte_size or _digest_bytes(source_bytes) != source.digest:
                 raise _error("digest_or_size_mismatch")
+        workflow_source, _workflow_bytes = imported.workflow_definition
+        current_workflow_bytes = self._git_blob(workflow_source.path)
+        if (
+            len(current_workflow_bytes) != workflow_source.byte_size
+            or _digest_bytes(current_workflow_bytes) != workflow_source.digest
+            or current_workflow_bytes != imported.workflow_definition[1]
+        ):
+            raise _error("digest_or_size_mismatch")
         if imported.evidence.artifact_digest != imported.receipt_digest:
             raise _error("digest_or_size_mismatch")
         if imported.evidence.trust_level != "observed":
@@ -1402,6 +1491,7 @@ class OfficialEvidenceImporter:
         zip_digest: str,
         zip_byte_size: int,
         zip_bytes: bytes,
+        workflow_definition_bytes: bytes,
     ) -> OfficialEvidenceImport:
         receipt_payload = {
             "schema_version": "v1",
@@ -1411,6 +1501,7 @@ class OfficialEvidenceImporter:
             "head_revision": run.head_revision,
             "producer": report.producer,
             "source_paths": [item.model_dump(mode="json") for item in report.source_paths],
+            "workflow_definition": report.workflow_definition.model_dump(mode="json"),
             "workflow_name": run.workflow_name,
             "workflow_path": run.workflow_path,
             "event": run.event,
@@ -1468,6 +1559,7 @@ class OfficialEvidenceImporter:
             remote_zip_digest=zip_digest,
             remote_zip_byte_size=zip_byte_size,
             source_bindings=report.source_paths,
+            workflow_definition=(report.workflow_definition, workflow_definition_bytes),
         )
 
 

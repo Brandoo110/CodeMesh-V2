@@ -1817,6 +1817,7 @@ def _official_payload(
         or report.head_revision != receipt.head_revision
         or report.producer != receipt.producer
         or report.source_paths != receipt.source_paths
+        or report.workflow_definition != receipt.workflow_definition
         or report.workflow_name != receipt.workflow_name
         or report.workflow_path != receipt.workflow_path
         or report.event != receipt.event
@@ -1861,14 +1862,7 @@ def _official_payload(
     _assert_path_safe(receipt.result_path)
     for source in receipt.source_paths:
         _assert_path_safe(source.path)
-    workflow_sources = tuple(
-        source
-        for source in receipt.source_paths
-        if source.path == receipt.workflow_path
-    )
-    if len(workflow_sources) != 1:
-        raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
-    workflow_source = workflow_sources[0]
+    workflow_source = receipt.workflow_definition
     if (
         _SHA256_RE.fullmatch(workflow_source.digest) is None
         or type(workflow_source.byte_size) is not int

@@ -1289,7 +1289,10 @@ def test_continuation_requires_run_policy_to_be_referenced_by_its_events(
     )[0]["count"] == len(preflight.bundle.events)
 
 
-@pytest.mark.parametrize("tamper", ("receipt", "report", "result", "source", "missing"))
+@pytest.mark.parametrize(
+    "tamper",
+    ("receipt", "report", "result", "source", "workflow_definition", "missing"),
+)
 def test_historical_official_proof_readback_fails_closed_on_byte_or_row_tamper(
     tmp_path, monkeypatch, tamper
 ):
@@ -1335,9 +1338,21 @@ def test_historical_official_proof_readback_fails_closed_on_byte_or_row_tamper(
                 " WHERE run_id = ? AND evidence_id = ?",
                 (row[4] + b"x", row[0], row[1]),
             )
+        elif tamper == "workflow_definition":
+            sources = json.loads(row[5])
+            sources["workflow_definition"]["bytes"] = base64.b64encode(
+                b"forged-workflow"
+            ).decode("ascii")
+            conn.execute(
+                "UPDATE assurance_official_evidence_proofs SET source_bindings_json = ?"
+                " WHERE run_id = ? AND evidence_id = ?",
+                (json.dumps(sources, sort_keys=True, separators=(",", ":")), row[0], row[1]),
+            )
         else:
             sources = json.loads(row[5])
-            sources[0]["bytes"] = base64.b64encode(b"forged-source").decode("ascii")
+            sources["sources"][0]["bytes"] = base64.b64encode(
+                b"forged-source"
+            ).decode("ascii")
             conn.execute(
                 "UPDATE assurance_official_evidence_proofs SET source_bindings_json = ?"
                 " WHERE run_id = ? AND evidence_id = ?",
@@ -1349,6 +1364,71 @@ def test_historical_official_proof_readback_fails_closed_on_byte_or_row_tamper(
 
     with pytest.raises(AssuranceWebError, match="proof|official|receipt|source|history"):
         repository.lookup_run("run:proof-history", result.request_digest)
+
+
+def test_historical_official_legacy_list_readback_is_supported(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    result = asyncio.run(service.run(intent, idempotency_key="run:legacy-list-history"))
+
+    rows = _db_rows(
+        repository,
+        "SELECT evidence_id, source_bindings_json FROM assurance_official_evidence_proofs"
+        " WHERE run_id = '" + result.bundle.run_id + "'",
+    )
+    conn = sqlite3.connect(repository._db_path)
+    try:
+        for row in rows:
+            source_data = json.loads(row["source_bindings_json"])
+            legacy_source_data = source_data["sources"] + [
+                source_data["workflow_definition"]
+            ]
+            conn.execute(
+                "UPDATE assurance_official_evidence_proofs SET source_bindings_json = ?"
+                " WHERE run_id = ? AND evidence_id = ?",
+                (
+                    json.dumps(
+                        legacy_source_data, sort_keys=True, separators=(",", ":")
+                    ),
+                    result.bundle.run_id,
+                    row["evidence_id"],
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert repository.lookup_run("run:legacy-list-history", result.request_digest)
+
+
+def test_historical_official_workflow_definition_readback_is_strict(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent, repository = _durable_service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    result = asyncio.run(service.run(intent, idempotency_key="run:workflow-history"))
+
+    row = _db_rows(
+        repository,
+        "SELECT source_bindings_json FROM assurance_official_evidence_proofs"
+        " WHERE run_id = '" + result.bundle.run_id + "' LIMIT 1",
+    )[0]
+    source_bindings = json.loads(row["source_bindings_json"])
+    assert set(source_bindings) == {"sources", "workflow_definition"}
 
 
 def test_official_proof_rows_are_immutable_unique_and_foreign_key_bound(
