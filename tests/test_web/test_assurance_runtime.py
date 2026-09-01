@@ -11,7 +11,13 @@ from fastapi.testclient import TestClient
 import web.assurance_runtime as runtime_module
 import orchestration.adapters.deepseek as deepseek_module
 from assurance.artifacts import ArtifactStore
-from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.codex_cli_reviewer_invoker import CodexCliReviewerInvoker
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    SubjectDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+)
 from assurance.fixed_reviewer_invoker import FixedOpenAICompatibleReviewerInvoker
 from assurance.reviewer_context import SafeReviewerContextBuilder
 from assurance.run_service import AssuranceRunService
@@ -287,6 +293,91 @@ def test_v2_without_remediation_secret_starts_core_without_remediation_service(
     assert factory_calls == []
 
 
+def test_codex_reviewer_composes_without_reviewer_api_key_and_does_not_receive_one(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path)
+    config["reviewer"] = {
+        "provider": "openai-codex-desktop",
+        "model_ref": "gpt-5.6-luna",
+        "timeout_seconds": 5,
+        "token_budget": 4096,
+        "routing_rule": "single_general.v0:fixed",
+    }
+    config_path = _write_config(tmp_path, config)
+    calls = []
+
+    class _FakeCodexInvoker:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(runtime_module, "CodexCliReviewerInvoker", _FakeCodexInvoker)
+    environment = {
+        "CODEMESH_ASSURANCE_CONFIG": str(config_path),
+        "CODEMESH_ASSURANCE_REVIEWER_API_KEY": "must-not-be-used",
+    }
+
+    runtime = load_assurance_runtime_from_environment(environment)
+    assert isinstance(runtime, AssuranceRuntime)
+    assert isinstance(runtime.reviewer_invoker, _FakeCodexInvoker)
+    assert calls == [((), {})]
+    assert not isinstance(runtime.reviewer_invoker, CodexCliReviewerInvoker)
+    asyncio.run(runtime.aclose())
+
+
+def test_deepseek_reviewer_without_api_key_stays_disabled(tmp_path, monkeypatch):
+    config_path = _write_config(tmp_path, _config(tmp_path))
+    environment = {"CODEMESH_ASSURANCE_CONFIG": str(config_path)}
+    calls = []
+
+    class _Forbidden:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("missing DeepSeek key must disable before construction")
+
+    monkeypatch.setattr(runtime_module, "AssuranceWebRepository", _Forbidden)
+    monkeypatch.setattr(runtime_module, "FixedOpenAICompatibleReviewerInvoker", _Forbidden)
+
+    assert load_assurance_runtime_from_environment(environment) is None
+    assert calls == []
+
+
+def test_codex_reviewer_without_remediation_key_keeps_remediation_disabled(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path, schema_version="v2")
+    config["reviewer"] = {
+        "provider": "openai-codex-desktop",
+        "model_ref": "gpt-5.6-luna",
+        "timeout_seconds": 5,
+        "token_budget": 4096,
+        "routing_rule": "single_general.v0:fixed",
+    }
+    config["remediation"] = _remediation_config()
+    config_path = _write_config(tmp_path, config)
+    calls = []
+
+    class _FakeCodexInvoker:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(runtime_module, "CodexCliReviewerInvoker", _FakeCodexInvoker)
+    runtime = load_assurance_runtime_from_environment(
+        {"CODEMESH_ASSURANCE_CONFIG": str(config_path)}
+    )
+
+    assert isinstance(runtime, AssuranceRuntime)
+    assert runtime.remediation_service is None
+    assert calls == [((), {})]
+    asyncio.run(runtime.aclose())
+
+
 @pytest.mark.parametrize("provider", ["qwen", "deepseek"])
 def test_v2_explicit_remediation_provider_uses_dedicated_secret_and_closes_once(
     tmp_path, provider
@@ -497,6 +588,60 @@ def test_remediation_git_collector_rejects_synthetic_subject_digest(tmp_path):
             policy_version="gate.v0",
             rubric_version="single_general.v0",
             artifact_store=ArtifactStore(tmp_path / "scoped-artifacts"),
+        )
+
+
+def test_remediation_git_collector_preserves_v2_scope_identity(tmp_path):
+    repository_path = _repository(tmp_path)
+    collector = GitSnapshotCollector()
+    task_digest = "sha256:" + "2" * 64
+    scope_digest = compute_acceptance_scope_digest(
+        AcceptanceScopeDigestInput(
+            task_path="TASK.md",
+            policy_paths=("POLICY.md",),
+            adr_paths=(),
+            runbook_paths=(),
+        )
+    )
+    collected = collector.collect(
+        repository_path,
+        repository_identity="example/service",
+        base_ref="HEAD",
+        task_digest=task_digest,
+        policy_version="gate.v0",
+        rubric_version="single_general.v0",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        acceptance_scope_digest=scope_digest,
+    )
+    subject = collector.build_subject_input(
+        collected.snapshot,
+        task_digest=task_digest,
+        policy_version="gate.v0",
+        rubric_version="single_general.v0",
+        acceptance_scope_digest=scope_digest,
+    )
+    scoped = runtime_module._RemediationGitCollector(
+        collector, lambda: subject
+    )
+    result = scoped.collect(
+        repository_path,
+        repository_identity="example/service",
+        base_ref="HEAD",
+        task_digest=task_digest,
+        policy_version="gate.v0",
+        rubric_version="single_general.v0",
+        artifact_store=ArtifactStore(tmp_path / "scoped-artifacts"),
+        acceptance_scope_digest=scope_digest,
+    )
+    assert result.snapshot.subject_digest == compute_subject_digest(subject)
+
+
+@pytest.mark.parametrize("version", ("", "v3", None))
+def test_remediation_scope_identity_unknown_version_fails_closed(version):
+    with pytest.raises(ValueError, match="subject identity version"):
+        runtime_module._scope_kwargs_for_subject_identity_version(
+            version,
+            "sha256:" + "a" * 64,
         )
 
 

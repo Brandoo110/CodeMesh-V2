@@ -38,6 +38,7 @@ _READ_CHUNK_SIZE = 64 * 1024
 _MAX_METADATA_OUTPUT_BYTES = 4 * 1024 * 1024
 _MAX_IGNORED_OUTPUT_BYTES = 4 * 1024 * 1024
 _MAX_STDERR_BYTES = 4096
+_DEFAULT_MAX_DIFF_BYTES = 1_048_576
 _GIT_PREFIX = (
     "-c",
     "core.hooksPath=/dev/null",
@@ -47,6 +48,7 @@ _GIT_PREFIX = (
     "diff.external=",
 )
 _DIFF_TRUNCATION_MARKER = b"\n=== CODEMESH GIT SNAPSHOT DIFF TRUNCATED ===\n"
+_SUBJECT_IDENTITY_PROJECTION_VERSION = "v2"
 _OMISSION_ORDER = (
     "diff_truncated",
     "files_truncated",
@@ -406,7 +408,7 @@ class GitSnapshotCollector:
 
     def __init__(
         self,
-        max_diff_bytes: int = 262144,
+        max_diff_bytes: int = _DEFAULT_MAX_DIFF_BYTES,
         max_files: int = 500,
         max_file_bytes: int = 5_000_000,
         command_timeout_seconds: float = 10.0,
@@ -433,6 +435,7 @@ class GitSnapshotCollector:
         rubric_version: str,
         artifact_store: ArtifactStore,
         attachment_digests: tuple[str, ...] = (),
+        acceptance_scope_digest: str | None = None,
         collected_at: datetime | None = None,
     ) -> GitSnapshotResult:
         if not isinstance(repository_path, Path):
@@ -451,6 +454,13 @@ class GitSnapshotCollector:
             raise TypeError("artifact_store must be an exact ArtifactStore")
         if type(attachment_digests) is not tuple:
             raise TypeError("attachment_digests must be a tuple")
+        if acceptance_scope_digest is not None:
+            if not isinstance(acceptance_scope_digest, str):
+                raise TypeError("acceptance_scope_digest must be a str")
+            if _SHA256_DIGEST_RE.fullmatch(acceptance_scope_digest) is None:
+                raise ValueError(
+                    "acceptance_scope_digest must be a lowercase sha256 digest"
+                )
         if collected_at is None:
             collected_at = datetime.now(timezone.utc)
         elif not isinstance(collected_at, datetime):
@@ -757,17 +767,21 @@ class GitSnapshotCollector:
             omissions=omissions,
             complete=complete,
         )
-        manifest_digest = self._manifest_digest_from_payload(manifest)
+        subject_identity_digest = self._subject_identity_digest_from_manifest(
+            manifest
+        )
         subject_digest = compute_subject_digest(
             SubjectDigestInput(
+                schema_version=("v2" if acceptance_scope_digest is not None else "v1"),
                 repository=repository,
                 base_revision=base_revision,
                 head_revision=head_revision,
-                normalized_diff_digest=manifest_digest,
+                normalized_diff_digest=subject_identity_digest,
                 task_digest=task_digest,
                 policy_version=policy_version,
                 rubric_version=rubric_version,
                 attachment_digests=attachment_digests,
+                acceptance_scope_digest=acceptance_scope_digest,
             )
         )
         evidence_id = (
@@ -829,6 +843,7 @@ class GitSnapshotCollector:
         policy_version: str,
         rubric_version: str,
         attachment_digests: tuple[str, ...] = (),
+        acceptance_scope_digest: str | None = None,
     ) -> SubjectDigestInput:
         """Rebuild the exact subject input represented by one Git snapshot.
 
@@ -839,22 +854,85 @@ class GitSnapshotCollector:
 
         if type(snapshot) is not GitSnapshot:
             raise TypeError("snapshot must be an exact GitSnapshot")
-        manifest_digest = self._manifest_digest(snapshot)
+        schema_version = "v2" if acceptance_scope_digest is not None else "v1"
+        subject_identity_digest = self._subject_identity_digest(snapshot)
         subject_input = SubjectDigestInput(
+            schema_version=schema_version,
             repository=snapshot.repository,
             base_revision=snapshot.base_revision,
             head_revision=snapshot.head_revision,
-            normalized_diff_digest=manifest_digest,
+            normalized_diff_digest=subject_identity_digest,
             task_digest=task_digest,
             policy_version=policy_version,
             rubric_version=rubric_version,
             attachment_digests=attachment_digests,
+            acceptance_scope_digest=acceptance_scope_digest,
         )
-        if compute_subject_digest(subject_input) != snapshot.subject_digest:
-            raise GitSnapshotError(
-                "Git snapshot subject digest does not match its canonical facts"
-            )
-        return subject_input
+        if compute_subject_digest(subject_input) == snapshot.subject_digest:
+            return subject_input
+
+        # One exact legacy check keeps already-persisted snapshots readable
+        # without treating the old full-manifest identity as a new collect
+        # format or silently rewriting its digest.
+        legacy_manifest_digest = self._manifest_digest(snapshot)
+        legacy_subject_input = SubjectDigestInput(
+            schema_version=schema_version,
+            repository=snapshot.repository,
+            base_revision=snapshot.base_revision,
+            head_revision=snapshot.head_revision,
+            normalized_diff_digest=legacy_manifest_digest,
+            task_digest=task_digest,
+            policy_version=policy_version,
+            rubric_version=rubric_version,
+            attachment_digests=attachment_digests,
+            acceptance_scope_digest=acceptance_scope_digest,
+        )
+        if compute_subject_digest(legacy_subject_input) == snapshot.subject_digest:
+            return legacy_subject_input
+        raise GitSnapshotError(
+            "Git snapshot subject digest does not match its canonical facts"
+        )
+
+    def _subject_identity_digest(self, snapshot: GitSnapshot) -> str:
+        manifest = self._manifest_payload(
+            repository=snapshot.repository,
+            base_revision=snapshot.base_revision,
+            head_revision=snapshot.head_revision,
+            scope=snapshot.scope,
+            worktree_dirty=snapshot.worktree_dirty,
+            changes=snapshot.changes,
+            changed_files_total=snapshot.changed_files_total,
+            diff_artifact_digest=snapshot.diff_artifact_digest,
+            diff_bytes=snapshot.diff_bytes,
+            diff_truncated=snapshot.diff_truncated,
+            files_truncated=snapshot.files_truncated,
+            ignored_files_lower_bound=snapshot.ignored_files_lower_bound,
+            ignored_scan_truncated=snapshot.ignored_scan_truncated,
+            large_file_paths=snapshot.large_file_paths,
+            submodule_paths=snapshot.submodule_paths,
+            omissions=snapshot.omissions,
+            complete=snapshot.complete,
+        )
+        return self._subject_identity_digest_from_manifest(manifest)
+
+    @staticmethod
+    def _subject_identity_projection(
+        manifest: dict[str, object],
+    ) -> dict[str, object]:
+        projection = dict(manifest)
+        projection.pop("ignored_files_lower_bound", None)
+        projection["subject_identity_version"] = (
+            _SUBJECT_IDENTITY_PROJECTION_VERSION
+        )
+        return projection
+
+    @classmethod
+    def _subject_identity_digest_from_manifest(
+        cls, manifest: dict[str, object]
+    ) -> str:
+        return cls._manifest_digest_from_payload(
+            cls._subject_identity_projection(manifest)
+        )
 
     def _manifest_digest(self, snapshot: GitSnapshot) -> str:
         manifest = self._manifest_payload(

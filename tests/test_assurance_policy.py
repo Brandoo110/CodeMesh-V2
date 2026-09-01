@@ -50,7 +50,7 @@ BASE_COLLECTORS = (
 
 COLLECTOR_MAPPING_EXPECTED = (
     ("git_snapshot", "git_snapshot", "collector.git"),
-    ("task_policy_adr", "intake_documents", "collector.intake"),
+    ("task_policy_adr", "task_policy_adr", "collector.task_policy_adr"),
     ("deterministic_commands", "command_batch", "collector.command"),
     ("authz_validation", "authz_validation", "collector.authz_validation"),
     (
@@ -244,8 +244,8 @@ def _base_entries(subject_digest=None, *, fresh_until=FIXED_TIME):
         _entry(
             subject_digest,
             "ev-2",
-            "intake_documents",
-            "collector.intake",
+            "task_policy_adr",
+            "collector.task_policy_adr",
             fresh_until=fresh_until,
         ),
         _entry(
@@ -671,7 +671,7 @@ def _base_collector_case(entries, *, subject_digest=None, evaluated_at=FIXED_TIM
 
 def _rules_table():
     return {
-        "rules_version": "gate.v0",
+        "rules_version": "gate.v1",
         "reason_order": [
             "SUBJECT_DIGEST_MISMATCH",
             "FINDING_STALE",
@@ -701,7 +701,7 @@ def _rules_table():
         ],
         "collector_mapping": {
             "git_snapshot": ["git_snapshot", "collector.git"],
-            "task_policy_adr": ["intake_documents", "collector.intake"],
+            "task_policy_adr": ["task_policy_adr", "collector.task_policy_adr"],
             "deterministic_commands": ["command_batch", "collector.command"],
             "evidence_manifest": None,
             "authz_validation": [
@@ -734,6 +734,16 @@ def _rules_table():
         "blocking_severities": sorted(["high", "critical"]),
         "blocking_statuses": sorted(["open", "acknowledged"]),
     }
+
+
+def _legacy_rules_table():
+    table = _rules_table()
+    table["rules_version"] = "gate.v0"
+    table["collector_mapping"]["task_policy_adr"] = [
+        "intake_documents",
+        "collector.intake",
+    ]
+    return table
 
 
 def _rules_digest():
@@ -1934,7 +1944,7 @@ def test_rules_table_immutable_and_digest_independently_recomputed():
     )
     with pytest.raises(TypeError):
         policy_module._RULES_TABLE["rules_version"] = "gate.v1"
-    assert policy_module._RULES_TABLE["rules_version"] == "gate.v0"
+    assert policy_module._RULES_TABLE["rules_version"] == "gate.v1"
     with pytest.raises(TypeError):
         policy_module._COLLECTOR_MAPPING["git_snapshot"] = ("x", "y")
     with pytest.raises(TypeError):
@@ -1972,6 +1982,58 @@ def test_decision_id_independently_recomputed():
     data = result.decision.model_dump(mode="json")
     assert result.decision.decision_id == _decision_id_for(data)
     assert result.decision.rules_digest == _rules_digest()
+
+
+def test_legacy_rules_digest_replays_exact_decision_without_current_rejudgment():
+    value = _input()
+    legacy_entries = tuple(
+        entry.model_copy(
+            update=(
+                {
+                    "kind": "intake_documents",
+                    "producer": "collector.intake",
+                }
+                if entry.kind == "task_policy_adr"
+                else {}
+            )
+        )
+        for entry in value.risk_result.input.manifest.entries
+    )
+    legacy_manifest = _manifest(value.subject.subject_digest, entries=legacy_entries)
+    legacy_risk = _risk_result(
+        value.subject.subject_digest,
+        snapshot=value.risk_result.input.snapshot,
+        intake=value.risk_result.input.intake,
+        manifest=legacy_manifest,
+        declarations=value.risk_result.input.declarations,
+    )
+    legacy_input = _input(
+        subject=value.subject,
+        risk_result=legacy_risk,
+        execution_receipts=value.execution_receipts,
+        evaluated_at=value.evaluated_at,
+    )
+    prospective = PolicyGate.evaluate(legacy_input)
+    assert prospective.decision.outcome == "BLOCKED"
+    assert "REQUIRED_COLLECTOR_MISSING" in prospective.decision.reason_codes
+
+    legacy_digest = _sha256(_canonical_bytes(_legacy_rules_table()))
+    data = PolicyGate.evaluate(value).decision.model_dump(mode="json")
+    data.update(
+        {
+            "rules_digest": legacy_digest,
+            "outcome": "PASS",
+            "reason_codes": (),
+        }
+    )
+    data["decision_id"] = _decision_id_for(data)
+    legacy_decision = PolicyDecision.model_validate(data)
+
+    assert policy_module._LEGACY_RULES_DIGEST == legacy_digest
+    restored = PolicyGateResult.model_validate(
+        {"input": legacy_input, "decision": legacy_decision}
+    )
+    assert restored.decision == legacy_decision
 
 
 @pytest.mark.parametrize(

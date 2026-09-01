@@ -1603,6 +1603,30 @@ def test_normalize_dedupes_identical_records(tmp_path):
     assert len(result.questions) == 1
 
 
+@pytest.mark.parametrize(
+    ("section", "draft_type", "factory"),
+    (
+        ("findings", single_module._FindingDraft, _valid_finding),
+        ("questions", single_module._QuestionDraft, _valid_question),
+    ),
+)
+def test_normalize_rejects_duplicate_evidence_refs_in_finding_and_question(
+    tmp_path, section, draft_type, factory
+):
+    reviewer_input = _reviewer_input()
+    duplicate = factory(evidence_refs=["ev-a", "ev-a"])
+
+    with pytest.raises(ValidationError):
+        draft_type.model_validate_json(json.dumps(duplicate))
+
+    raw = _response_bytes(
+        reviewer_input.subject.subject_digest,
+        **{section: (duplicate,)},
+    )
+    with pytest.raises(SingleReviewerPayloadError):
+        _normalize(ArtifactStore(tmp_path), reviewer_input, raw=raw)
+
+
 def test_normalize_same_claim_different_role_or_refs_stays_distinct(tmp_path):
     reviewer_input = _reviewer_input()
     raw = _response_bytes(

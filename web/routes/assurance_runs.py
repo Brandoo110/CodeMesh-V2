@@ -9,11 +9,12 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 
 from assurance.run_service import (
     AssuranceRunError,
     AssuranceRunIntent,
+    AssuranceRunOfficialEvidenceError,
     AssuranceRunPreconditionError,
     AssuranceRunRedactionError,
     AssuranceRunResult,
@@ -22,6 +23,7 @@ from assurance.run_service import (
     AssuranceRunValidationError,
     IdempotencyConflictError,
 )
+from assurance.official_evidence import OFFICIAL_EVIDENCE_REASON_CODES
 from web.assurance_run_composition import AssuranceRunWebDependencies
 from web.assurance_store import (
     AssuranceWebConflictError,
@@ -49,6 +51,7 @@ class AssuranceRunRequest(BaseModel):
     adr_paths: tuple[str, ...] = ()
     runbook_paths: tuple[str, ...] = ()
     command_ids: tuple[str, ...] = Field(min_length=1, max_length=16)
+    official_evidence_run_id: StrictStr | None = None
     changed_lines_total: StrictInt | None = Field(default=None, ge=0)
     external_side_effects: Literal[
         "none_declared", "present_declared", "unknown"
@@ -126,6 +129,20 @@ def _to_intent(request: AssuranceRunRequest) -> AssuranceRunIntent:
 def _map_run_exception(exc: BaseException) -> JSONResponse:
     """Map only stable public classes; never expose exception text."""
 
+    if isinstance(exc, AssuranceRunOfficialEvidenceError):
+        try:
+            reason_code = getattr(exc, "reason_code", None)
+        except Exception:
+            reason_code = None
+        if type(reason_code) is not str or reason_code not in OFFICIAL_EVIDENCE_REASON_CODES:
+            reason_code = "unknown"
+        return _error(
+            422,
+            "ASSURANCE_OFFICIAL_EVIDENCE_INVALID",
+            "official evidence report was not accepted",
+            "OFFICIAL_EVIDENCE_INVALID",
+            reason_code,
+        )
     if isinstance(exc, AssuranceRunPreconditionError):
         return _error(
             412,

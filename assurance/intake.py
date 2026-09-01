@@ -971,3 +971,235 @@ def _lstat_key(stat_result) -> tuple:
 
 def _sha256_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+_TASK_POLICY_KIND = "task_policy_adr"
+_TASK_POLICY_PRODUCER = "collector.task_policy_adr"
+
+
+def _task_policy_limits() -> dict[str, int]:
+    return {
+        "max_declared_paths": _MAX_DECLARED_PATHS,
+        "max_file_bytes": _MAX_FILE_BYTES,
+        "max_total_bytes": _MAX_TOTAL_BYTES,
+        "max_frontmatter_bytes": _MAX_FRONTMATTER_BYTES,
+        "max_frontmatter_items": _MAX_FRONTMATTER_ITEMS,
+    }
+
+
+def _task_policy_manifest_payload(
+    snapshot: IntakeSnapshot,
+    intake_evidence: Evidence | None = None,
+) -> dict[str, object]:
+    """Build the path/digest-only contract for the dedicated collector.
+
+    The original ``intake_documents`` Evidence remains the owner of the full
+    intake manifest.  This second manifest is deliberately a separate,
+    deterministic projection for the task/policy/ADR collector and never
+    contains document bodies.
+    """
+
+    if type(snapshot) is not IntakeSnapshot:
+        raise TypeError("snapshot must be an exact IntakeSnapshot")
+    if intake_evidence is None:
+        intake_evidence = Evidence(
+            schema_version="v1",
+            evidence_id=(
+                "ev_intake_"
+                + hashlib.sha256(
+                    (
+                        snapshot.subject_digest
+                        + snapshot.manifest_artifact_digest
+                    ).encode("ascii")
+                ).hexdigest()[:32]
+            ),
+            subject_digest=snapshot.subject_digest,
+            kind="intake_documents",
+            producer="collector.intake",
+            artifact_digest=snapshot.manifest_artifact_digest,
+            source_ref=f"intake_documents:{snapshot.subject_digest}",
+            status="success" if snapshot.complete else "truncated",
+            trust_level="deterministic",
+            collected_at=snapshot.collected_at,
+        )
+    if type(intake_evidence) is not Evidence:
+        raise TypeError("intake_evidence must be an exact Evidence")
+    if (
+        intake_evidence.subject_digest != snapshot.subject_digest
+        or intake_evidence.kind != "intake_documents"
+        or intake_evidence.producer != "collector.intake"
+        or intake_evidence.artifact_digest != snapshot.manifest_artifact_digest
+        or intake_evidence.source_ref
+        != f"intake_documents:{snapshot.subject_digest}"
+        or intake_evidence.trust_level != "deterministic"
+    ):
+        raise IntakeCollectionError("intake Evidence binding is invalid")
+
+    documents = tuple(
+        document
+        for document in snapshot.documents
+        if document.kind in {"task_spec", "policy", "adr"}
+    )
+    notices = tuple(snapshot.notices)
+    adr_paths = tuple(
+        document.path for document in documents if document.kind == "adr"
+    )
+    adr_missing = any(notice.code == "adr_not_found" for notice in notices)
+    complete = (
+        snapshot.task_present
+        and snapshot.policy_count > 0
+        and not any(
+            notice.category == "missing_evidence" for notice in notices
+        )
+        and not adr_missing
+    )
+
+    document_states: dict[str, dict[str, object]] = {}
+    for kind in ("task_spec", "policy", "adr"):
+        matching = tuple(document for document in documents if document.kind == kind)
+        if kind == "adr" and adr_missing:
+            status = "missing"
+            state_complete = False
+            empty = False
+            omissions = [
+                notice.code for notice in notices if notice.code == "adr_not_found"
+            ]
+        elif kind == "adr" and not adr_paths:
+            status = "not_declared"
+            state_complete = False
+            empty = True
+            omissions = []
+        else:
+            status = "success" if matching else "not_declared"
+            state_complete = bool(matching)
+            empty = False
+            omissions = [] if matching else [f"{kind}_not_declared"]
+        document_states[kind] = {
+            "kind": kind,
+            "status": status,
+            "complete": state_complete,
+            "empty": empty,
+            "omissions": omissions,
+            "subject_digest": snapshot.subject_digest,
+            "items": [
+                document.model_dump(mode="json") for document in matching
+            ],
+            "adr_paths": list(adr_paths) if kind == "adr" else [],
+        }
+
+    return {
+        "schema_version": "v1",
+        "subject_digest": snapshot.subject_digest,
+        "intake_evidence": {
+            "evidence_id": intake_evidence.evidence_id,
+            "kind": intake_evidence.kind,
+            "producer": intake_evidence.producer,
+            "subject_digest": intake_evidence.subject_digest,
+            "artifact_digest": intake_evidence.artifact_digest,
+            "source_ref": intake_evidence.source_ref,
+            "status": intake_evidence.status,
+            "trust_level": intake_evidence.trust_level,
+        },
+        "intake_manifest_digest": snapshot.manifest_artifact_digest,
+        "documents": [
+            document.model_dump(mode="json") for document in documents
+        ],
+        "document_states": document_states,
+        "notices": [notice.model_dump(mode="json") for notice in notices],
+        "task_digest": snapshot.task_digest,
+        "task_present": snapshot.task_present,
+        "policy_count": snapshot.policy_count,
+        "adr_count": snapshot.adr_count,
+        "adr_paths": list(adr_paths),
+        "complete": complete,
+        "limits": _task_policy_limits(),
+    }
+
+
+def _build_task_policy_adr_evidence(
+    result: IntakeResult,
+    *,
+    artifact_store: ArtifactStore,
+) -> Evidence:
+    """Persist and return the independent task/policy/ADR Evidence.
+
+    Every declared task, policy, and ADR document is reread from CAS and
+    checked against its typed path, digest, and byte size before the dedicated
+    Evidence can be marked successful.  A declared-but-missing ADR is kept
+    explicit and makes this dedicated Evidence truncated; an empty ADR list is
+    an explicit successful ``not_declared`` state when task and policy pass.
+    """
+
+    if type(result) is not IntakeResult:
+        raise TypeError("result must be an exact IntakeResult")
+    if type(artifact_store) is not ArtifactStore:
+        raise TypeError("artifact_store must be an exact ArtifactStore")
+    snapshot = result.snapshot
+    if result.evidence.artifact_digest != snapshot.manifest_artifact_digest:
+        raise IntakeCollectionError("intake manifest Evidence binding is invalid")
+
+    expected_manifest = {
+        "schema_version": "v1",
+        "subject_digest": snapshot.subject_digest,
+        "documents": [
+            document.model_dump(mode="json")
+            for document in snapshot.documents
+        ],
+        "notices": [notice.model_dump(mode="json") for notice in snapshot.notices],
+        "task_digest": snapshot.task_digest,
+        "task_present": snapshot.task_present,
+        "policy_count": snapshot.policy_count,
+        "adr_count": snapshot.adr_count,
+        "runbook_count": snapshot.runbook_count,
+        "complete": snapshot.complete,
+        "limits": _task_policy_limits(),
+    }
+    try:
+        raw_manifest = artifact_store.get_bytes(
+            snapshot.manifest_artifact_digest
+        )
+        manifest = json.loads(raw_manifest.decode("utf-8"))
+    except Exception as exc:
+        raise IntakeCollectionError("intake manifest CAS read failed") from exc
+    if manifest != expected_manifest:
+        raise IntakeCollectionError("intake manifest CAS binding is invalid")
+
+    for document in snapshot.documents:
+        try:
+            raw_document = artifact_store.get_bytes(document.artifact_digest)
+        except Exception as exc:
+            raise IntakeCollectionError("intake document CAS read failed") from exc
+        if len(raw_document) != document.byte_size or _sha256_bytes(raw_document) != document.artifact_digest:
+            raise IntakeCollectionError("intake document CAS binding is invalid")
+
+    payload = _task_policy_manifest_payload(snapshot, result.evidence)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    try:
+        artifact_digest = artifact_store.put_bytes(encoded)
+    except Exception as exc:
+        raise IntakeCollectionError("task policy Evidence persistence failed") from exc
+    if artifact_digest != _sha256_bytes(encoded):
+        raise IntakeCollectionError("task policy Evidence digest mismatch")
+    return Evidence(
+        schema_version="v1",
+        evidence_id=(
+            "ev_task_policy_adr_"
+            + hashlib.sha256(
+                (snapshot.subject_digest + artifact_digest).encode("ascii")
+            ).hexdigest()[:32]
+        ),
+        subject_digest=snapshot.subject_digest,
+        kind=_TASK_POLICY_KIND,
+        producer=_TASK_POLICY_PRODUCER,
+        artifact_digest=artifact_digest,
+        source_ref=f"{_TASK_POLICY_KIND}:{snapshot.subject_digest}",
+        status="success" if payload["complete"] else "truncated",
+        trust_level="deterministic",
+        collected_at=result.evidence.collected_at,
+    )

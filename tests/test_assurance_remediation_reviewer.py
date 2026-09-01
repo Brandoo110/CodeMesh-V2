@@ -10,7 +10,12 @@ import assurance.snapshot as snapshot_module
 import pytest
 
 from assurance.contracts import Finding
-from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    SubjectDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+)
 from assurance.remediation import (
     RemediationController,
     RemediationPolicy,
@@ -334,6 +339,46 @@ def test_adapter_derives_exact_intent_and_calls_public_prepare_once(
     assert derived.external_side_effects == declarations.external_side_effects
     assert derived.provider_boundary == declarations.provider_boundary
     assert idempotency_key
+
+
+def test_remediation_preserves_v2_scope_identity_and_rejects_scope_drift(
+    tmp_path: Path, monkeypatch
+) -> None:
+    service, intent, baseline, workspace, changed_bundle, subject_input, finding = (
+        _baseline_and_changed_subject(tmp_path, monkeypatch)
+    )
+    assert baseline.freshness_source_binding.subject_identity_version == "v2"
+    assert subject_input.schema_version == "v2"
+    assert changed_bundle.freshness_source_binding.subject_identity_version == "v2"
+
+    request, selected_finding = _request_for_baseline(baseline)
+    recording = _RecordingPrepareService(changed_bundle)
+    adapter = AssuranceRemediationReviewer(
+        baseline_bundle=baseline,
+        service_factory=lambda _root: recording,
+    )
+    drifted = subject_input.model_copy(
+        update={
+            "acceptance_scope_digest": compute_acceptance_scope_digest(
+                AcceptanceScopeDigestInput(
+                    task_path=intent.task_path,
+                    policy_paths=(),
+                    adr_paths=intent.adr_paths,
+                    runbook_paths=intent.runbook_paths,
+                )
+            ),
+        }
+    )
+    assert asyncio.run(
+        adapter.rerun(
+            reviewer_role="architecture",
+            subject_input=drifted,
+            subject_digest=compute_subject_digest(drifted),
+            workspace=workspace,
+            request=request,
+            selected_finding=selected_finding,
+        )
+    ) is None
 
 
 def test_exact_prepared_success_binds_receipt_and_hides_bundle_from_result(

@@ -21,6 +21,11 @@ from assurance import (
     normalize_repository_identity,
 )
 from assurance.contracts import ChangeSubject, PolicyDecision
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    canonical_acceptance_scope_payload,
+    compute_acceptance_scope_digest,
+)
 
 
 def _valid_input(**overrides):
@@ -105,6 +110,101 @@ class TestSubjectDigestInputContract(unittest.TestCase):
         values["unexpected"] = True
         with self.assertRaises(ValidationError):
             SubjectDigestInput.model_validate(values)
+
+    def test_v1_canonical_bytes_remain_exact_and_v2_requires_scope(self):
+        subject = _valid_input()
+        self.assertEqual(subject.schema_version, "v1")
+        self.assertNotIn(
+            "acceptance_scope_digest",
+            json.loads(canonical_subject_payload(subject)),
+        )
+        with self.assertRaises(ValidationError):
+            SubjectDigestInput.model_validate(
+                {
+                    **subject.model_dump(mode="json"),
+                    "schema_version": "v2",
+                }
+            )
+
+    def test_v2_scope_changes_subject_digest(self):
+        scope = compute_acceptance_scope_digest(
+            AcceptanceScopeDigestInput(
+                task_path="TASK.md",
+                policy_paths=("POLICY.md",),
+                adr_paths=(),
+                runbook_paths=(),
+            )
+        )
+        first = _valid_input(
+            schema_version="v2", acceptance_scope_digest=scope
+        )
+        second_scope = compute_acceptance_scope_digest(
+            AcceptanceScopeDigestInput(
+                task_path="TASK.md",
+                policy_paths=(),
+                adr_paths=(),
+                runbook_paths=(),
+            )
+        )
+        second = _valid_input(
+            schema_version="v2", acceptance_scope_digest=second_scope
+        )
+        self.assertNotEqual(
+            compute_subject_digest(first), compute_subject_digest(second)
+        )
+
+    def test_v2_dump_round_trip_is_exact_and_v1_dump_golden_is_unchanged(self):
+        scope = compute_acceptance_scope_digest(
+            AcceptanceScopeDigestInput(
+                task_path="TASK.md",
+                policy_paths=("POLICY.md",),
+                adr_paths=(),
+                runbook_paths=(),
+            )
+        )
+        subject = _valid_input(
+            schema_version="v2",
+            acceptance_scope_digest=scope,
+        )
+        dumped = subject.model_dump(mode="json")
+        assert dumped["schema_version"] == "v2"
+        assert dumped["acceptance_scope_digest"] == scope
+        assert SubjectDigestInput.model_validate(dumped) == subject
+
+        assert _valid_input().model_dump(mode="json") == {
+            "schema_version": "v1",
+            "repository": "acme/service",
+            "base_revision": "base-abc123",
+            "head_revision": "head-def456",
+            "normalized_diff_digest": "sha256:" + "a" * 64,
+            "task_digest": "sha256:" + "b" * 64,
+            "policy_version": "policy-1",
+            "rubric_version": "rubric-1",
+            "attachment_digests": [],
+        }
+
+
+class TestAcceptanceScopeDigestInput(unittest.TestCase):
+    def test_canonical_payload_contains_exactly_four_scope_fields(self):
+        scope = AcceptanceScopeDigestInput(
+            task_path="TASK.md",
+            policy_paths=["POLICY.md"],
+            adr_paths=[],
+            runbook_paths=[],
+        )
+        self.assertEqual(
+            json.loads(canonical_acceptance_scope_payload(scope)),
+            {
+                "task_path": "TASK.md",
+                "policy_paths": ["POLICY.md"],
+                "adr_paths": [],
+                "runbook_paths": [],
+            },
+        )
+        self.assertEqual(
+            compute_acceptance_scope_digest(scope),
+            compute_acceptance_scope_digest(scope),
+        )
 
     def test_assignment_mutation_rejected(self):
         subject = _valid_input()
@@ -479,7 +579,8 @@ class TestCanonicalSubjectPayload(unittest.TestCase):
         )
         payload = json.loads(canonical_subject_payload(subject))
         self.assertEqual(
-            set(payload.keys()), set(SubjectDigestInput.model_fields)
+            set(payload.keys()),
+            set(SubjectDigestInput.model_fields) - {"acceptance_scope_digest"},
         )
         self.assertEqual(payload["repository"], subject.repository)
         self.assertEqual(

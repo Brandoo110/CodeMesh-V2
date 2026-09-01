@@ -1,7 +1,11 @@
 """Synchronous web-facing assurance repository over SQLiteAssuranceStore."""
 import hashlib
+import base64
+import binascii
+import io
 import json
 import sqlite3
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -13,6 +17,13 @@ from assurance.run_service import (
     AssuranceRunResult,
     AssuranceRunService,
     FreshnessSourceBinding,
+    _OfficialEvidenceCommitProof,
+)
+from assurance.official_evidence import (
+    OFFICIAL_EVIDENCE_KINDS,
+    OfficialEvidenceSource,
+    parse_official_evidence_receipt,
+    parse_official_evidence_report,
 )
 from assurance.contracts import (
     AcceptanceCase, Evidence, ExecutionReceipt, Finding,
@@ -36,7 +47,11 @@ from assurance.remediation import (
     RemediationStatus,
     ReviewerRerunReceipt,
 )
-from assurance.state_machine import AcceptanceBinding, AcceptanceEvent
+from assurance.state_machine import (
+    AcceptanceBinding,
+    AcceptanceEvent,
+    apply_acceptance_event,
+)
 from assurance.store import (
     CaseNotFoundError,
     ProjectionIntegrityError,
@@ -59,6 +74,7 @@ from web.assurance_run_committer import (
     _ensure_run_schema,
     _load_bundle_from_row,
     _load_pointer,
+    _parse_canonical_json,
     _public_bundle_json,
     _result_pointer,
     _source_binding_json,
@@ -94,9 +110,192 @@ class AssuranceWebNotFoundError(AssuranceWebError):
     """Case or supplemental resource does not exist."""
 
 
+class _OfficialProofIntegrityError(AssuranceWebError):
+    """A stored official run cannot be reconstructed from its proof bytes."""
+
+
 _UNSET = object()
 _LIVE_BASELINE_CORRUPT = object()
 _REMEDIATION_OPERATION = "remediate"
+_RUN_PROGRESS_ADDITIVE_CASE_FIELDS = (
+    "evidence_refs",
+    "finding_refs",
+    "execution_receipt_refs",
+    "policy_decision_refs",
+    "human_decision_refs",
+    "created_at",
+)
+_OFFICIAL_PROOF_TABLE = "assurance_official_evidence_proofs"
+_OFFICIAL_PROOF_MAX_REPORT_BYTES = 512 * 1024
+_OFFICIAL_PROOF_MAX_RESULT_BYTES = 8 * 1024 * 1024
+_OFFICIAL_PROOF_MAX_ZIP_BYTES = 4 * 1024 * 1024
+_OFFICIAL_PROOF_MAX_SOURCE_BYTES = 8 * 1024 * 1024
+
+
+def _validate_official_evidence_provenance(bundle: AssuranceRunBundle) -> None:
+    """Bind each public official Evidence locator to its trace identity."""
+
+    manifest_entries = {
+        entry.evidence_id: entry for entry in bundle.manifest.manifest.entries
+    }
+    for evidence in bundle.evidence:
+        if evidence.kind not in {"dependency_audit", "ci_iac_validation"}:
+            continue
+        manifest_entry = manifest_entries.get(evidence.evidence_id)
+        if manifest_entry is None or any(
+            getattr(manifest_entry, field) != getattr(evidence, field)
+            for field in (
+                "kind",
+                "producer",
+                "subject_digest",
+                "artifact_digest",
+                "source_ref",
+                "status",
+                "trust_level",
+                "collected_at",
+            )
+        ):
+            raise AssuranceRunPersistenceError(
+                "official Evidence provenance disagrees with its manifest"
+            )
+        source = evidence.source_ref.split(":")
+        trace = (evidence.trace_id or "").split(":")
+        if (
+            len(source) != 8
+            or source[:3] != ["github", "official", evidence.kind]
+            or source[3] != "run"
+            or source[5] != "artifact"
+            or source[7] != "success"
+            or not source[4].isdecimal()
+            or source[4] == "0"
+            or source[4].startswith("0")
+            or not source[6].isdecimal()
+            or source[6] == "0"
+            or source[6].startswith("0")
+            or len(trace) != 4
+            or trace[0] != "github"
+            or trace[1] != source[4]
+            or not trace[2].isdecimal()
+            or trace[2] == "0"
+            or trace[2].startswith("0")
+            or not trace[3].isdecimal()
+            or trace[3] == "0"
+            or trace[3].startswith("0")
+        ):
+            raise AssuranceRunPersistenceError(
+                "official Evidence provenance does not match its trace"
+            )
+
+
+def _validate_run_policy_event_association(bundle: AssuranceRunBundle) -> None:
+    """Require one Run's policy decision to close over its own event refs."""
+
+    decision_id = bundle.policy.decision.decision_id
+    refs = tuple(
+        reference
+        for event in bundle.events
+        for reference in event.policy_decision_refs
+    )
+    if not refs or refs != (decision_id,):
+        raise AssuranceRunPersistenceError(
+            "run policy decision is not exactly associated with its events"
+        )
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("JSON constants are not allowed")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _parse_proof_json(data: bytes, label: str) -> object:
+    if type(data) is not bytes:
+        raise ValueError(f"official proof {label} must be bytes")
+    try:
+        return json.loads(
+            data.decode("utf-8", errors="strict"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"official proof {label} is invalid JSON") from exc
+
+
+def _proof_digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _parse_official_artifact_bytes(
+    artifact_bytes: bytes,
+    *,
+    kind: str,
+    report_bytes: bytes,
+    result_bytes: bytes,
+) -> None:
+    """Re-parse the exact typed files from a persisted official ZIP."""
+
+    report_name = (
+        "dependency_audit.json"
+        if kind == "dependency_audit"
+        else "ci_iac_validation.json"
+    )
+    result_name = (
+        "dependency-audit-result.json"
+        if kind == "dependency_audit"
+        else "ci-iac-result.json"
+    )
+    expected_names = {
+        "dependency_audit.json",
+        "ci_iac_validation.json",
+        "dependency-audit-result.json",
+        "ci-iac-result.json",
+    }
+    if type(artifact_bytes) is not bytes or len(artifact_bytes) > _OFFICIAL_PROOF_MAX_ZIP_BYTES:
+        raise AssuranceRunPersistenceError("official artifact bytes are invalid")
+    try:
+        with zipfile.ZipFile(io.BytesIO(artifact_bytes)) as archive:
+            infos = archive.infolist()
+            names = tuple(info.filename for info in infos)
+            if len(names) != 4 or set(names) != expected_names:
+                raise ValueError("official artifact file set is invalid")
+            total_uncompressed = 0
+            for info in infos:
+                if (
+                    info.file_size < 0
+                    or info.compress_size < 0
+                    or info.file_size > _OFFICIAL_PROOF_MAX_RESULT_BYTES
+                    or total_uncompressed + info.file_size
+                    > _OFFICIAL_PROOF_MAX_SOURCE_BYTES
+                ):
+                    raise ValueError("official artifact member size is invalid")
+                total_uncompressed += info.file_size
+            actual_report = archive.read(report_name)
+            actual_result = archive.read(result_name)
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
+        raise AssuranceRunPersistenceError(
+            "official artifact bytes cannot be parsed"
+        ) from exc
+    if actual_report != report_bytes or actual_result != result_bytes:
+        raise AssuranceRunPersistenceError(
+            "official artifact files do not match their proof bytes"
+        )
+
+
+def _stable_freshness_source_binding(source: FreshnessSourceBinding) -> str:
+    """Canonical identity, excluding only the per-observation subject time."""
+
+    data = source.model_dump(mode="json")
+    subject = dict(data["subject"])
+    subject.pop("created_at", None)
+    data["subject"] = subject
+    return _canonical_json(data)
 
 
 @dataclass(frozen=True)
@@ -174,6 +373,7 @@ class AssuranceWebRepository:
         *,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult:
         """Persist a complete GP-03 bundle in one short SQLite transaction."""
 
@@ -182,6 +382,7 @@ class AssuranceWebRepository:
                 bundle,
                 idempotency_key=idempotency_key,
                 request_digest=request_digest,
+                official_proofs=official_proofs,
             )
         except AssuranceRunConflictError as exc:
             raise AssuranceWebConflictError(str(exc)) from exc
@@ -559,6 +760,11 @@ class AssuranceWebRepository:
             bundle = _load_bundle_from_row(row)
             _assert_row_columns(row, bundle)
             _load_pointer(unit_of_work.connection, row["idempotency_key"], bundle)
+            _validate_official_evidence_provenance(bundle)
+            _validate_run_policy_event_association(bundle)
+            self._load_official_commit_proofs_in_transaction(
+                unit_of_work.connection, bundle
+            )
             if baseline_binding is None:
                 baseline_binding = bundle.binding
                 baseline_bundle = bundle
@@ -731,6 +937,11 @@ class AssuranceWebRepository:
             bundle = _load_bundle_from_row(run_row)
             _assert_row_columns(run_row, bundle)
             _load_pointer(unit_of_work.connection, bundle.idempotency_key, bundle)
+            _validate_official_evidence_provenance(bundle)
+            _validate_run_policy_event_association(bundle)
+            self._load_official_commit_proofs_in_transaction(
+                unit_of_work.connection, bundle
+            )
             handoff = PreparedRemediationHandoff(result=result, bundle=bundle)
         except AssuranceWebError:
             raise
@@ -1009,6 +1220,9 @@ class AssuranceWebRepository:
         stored_bundle = _load_bundle_from_row(run_row)
         _assert_row_columns(run_row, stored_bundle)
         _load_pointer(conn, bundle.idempotency_key, stored_bundle)
+        _validate_official_evidence_provenance(stored_bundle)
+        _validate_run_policy_event_association(stored_bundle)
+        self._load_official_commit_proofs_in_transaction(conn, stored_bundle)
         if stored_bundle != bundle or run_row["case_id"] != expected_case.case_id:
             raise AssuranceWebError("remediation run row does not match handoff")
 
@@ -1147,11 +1361,19 @@ class AssuranceWebRepository:
     def lookup(self, idempotency_key: str, request_digest: str):
         return self.lookup_run(idempotency_key, request_digest)
 
-    def commit(self, bundle, *, idempotency_key: str, request_digest: str):
+    def commit(
+        self,
+        bundle,
+        *,
+        idempotency_key: str,
+        request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
+    ):
         return self.commit_run(
             bundle,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            official_proofs=official_proofs,
         )
 
     def _lookup_run_in_transaction_boundary(
@@ -1191,6 +1413,9 @@ class AssuranceWebRepository:
                 )
             bundle = _load_bundle_from_row(row)
             _assert_row_columns(row, bundle)
+            _validate_official_evidence_provenance(bundle)
+            _validate_run_policy_event_association(bundle)
+            self._load_official_commit_proofs_in_transaction(conn, bundle)
             _load_pointer(conn, idempotency_key, bundle)
             self._projection_in_transaction(
                 unit_of_work, bundle.case.case_id, check_live=False
@@ -1202,16 +1427,229 @@ class AssuranceWebRepository:
                 bundle=bundle,
             )
 
+    def _validate_run_progression_in_transaction(
+        self, unit_of_work, bundle: AssuranceRunBundle
+    ):
+        """Validate a new immutable run as a suffix of one Case aggregate.
+
+        A run bundle is intentionally self-contained and replays from its own
+        DRAFT snapshot.  Once a subject has a committed run, however, the
+        canonical Case is the authoritative aggregate.  This validator binds
+        the stored run/event prefix, then applies only the new event suffix in
+        memory before any write is attempted.
+        """
+
+        conn = unit_of_work.connection
+        current = unit_of_work.load_case(bundle.case.case_id)
+        binding = unit_of_work.get_binding(bundle.case.case_id)
+        if (
+            current.case.case_id != bundle.case.case_id
+            or current.case.subject_digest != bundle.subject.subject_digest
+            or bundle.draft_case.case_id != bundle.case.case_id
+            or bundle.draft_case.subject_digest != bundle.subject.subject_digest
+            or binding != bundle.binding
+        ):
+            raise AssuranceRunConflictError(
+                "run continuation identity does not match the canonical Case"
+            )
+
+        initial_row = conn.execute(
+            "SELECT case_id, subject_digest, initial_case_json"
+            " FROM assurance_cases WHERE case_id = ?",
+            (bundle.case.case_id,),
+        ).fetchone()
+        if initial_row is None:
+            raise AssuranceRunPersistenceError(
+                "canonical Case disappeared during run continuation"
+            )
+        try:
+            initial_data = json.loads(initial_row["initial_case_json"])
+            initial_case = AcceptanceCase.model_validate(initial_data)
+        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
+            raise AssuranceRunPersistenceError(
+                "canonical Case initial snapshot is invalid"
+            ) from exc
+        if _canonical_json(initial_case) != initial_row["initial_case_json"]:
+            raise AssuranceRunPersistenceError(
+                "canonical Case initial snapshot is not canonical"
+            )
+        if (
+            initial_case.case_id != initial_row["case_id"]
+            or initial_case.subject_digest != initial_row["subject_digest"]
+            or initial_case.state != "DRAFT"
+        ):
+            raise AssuranceRunPersistenceError(
+                "canonical Case initial snapshot is not a DRAFT"
+            )
+
+        runs = self._load_web_runs_in_transaction(
+            conn, bundle.case.case_id, require_pointers=True
+        )
+        if not runs:
+            raise AssuranceRunPersistenceError(
+                "canonical Case has no immutable run history"
+            )
+        baseline_source = runs[0].freshness_source_binding
+        baseline_source_identity = _stable_freshness_source_binding(baseline_source)
+        if any(
+            _stable_freshness_source_binding(stored.freshness_source_binding)
+            != baseline_source_identity
+            for stored in runs
+        ):
+            raise AssuranceRunPersistenceError(
+                "stored run history has drifting FreshnessSourceBinding"
+            )
+        if (
+            _stable_freshness_source_binding(bundle.freshness_source_binding)
+            != baseline_source_identity
+        ):
+            raise AssuranceRunConflictError(
+                "continuation freshness source binding does not match the Case baseline"
+            )
+
+        event_positions = {
+            event.event_id: position
+            for position, event in enumerate(current.applied_events)
+        }
+        positioned = []
+        for stored in runs:
+            if (
+                stored.case.case_id != bundle.case.case_id
+                or stored.subject.subject_digest != bundle.subject.subject_digest
+                or stored.binding != binding
+                or stored.draft_case.state != "DRAFT"
+                or stored.draft_case.case_id != bundle.case.case_id
+                or stored.draft_case.subject_digest != bundle.subject.subject_digest
+            ):
+                raise AssuranceRunPersistenceError(
+                    "stored run history has a mismatched Case identity"
+                )
+            positions = [event_positions.get(event.event_id) for event in stored.events]
+            if (
+                any(position is None for position in positions)
+                or len(set(positions)) != len(positions)
+                or positions != list(
+                    range(positions[0], positions[0] + len(positions))
+                )
+                or tuple(current.applied_events[positions[0] : positions[0] + len(positions)])
+                != stored.events
+            ):
+                raise AssuranceRunPersistenceError(
+                    "stored run events are not an exact Case history prefix"
+                )
+            positioned.append((positions[0], stored))
+        positioned.sort(key=lambda item: item[0])
+        cursor = 0
+        for position, stored in positioned:
+            if position != cursor:
+                raise AssuranceRunPersistenceError(
+                    "stored run events leave a Case history gap or overlap"
+                )
+            cursor += len(stored.events)
+        if cursor != len(current.applied_events):
+            raise AssuranceRunPersistenceError(
+                "canonical Case contains events without immutable run provenance"
+            )
+        if positioned[0][0] != 0 or positioned[0][1].draft_case != initial_case:
+            raise AssuranceRunPersistenceError(
+                "stored run history does not begin at the canonical DRAFT"
+            )
+
+        decisions = unit_of_work.list_decisions(bundle.case.case_id)
+        seen_policy_ids = set()
+        for _, stored in positioned:
+            matches = tuple(
+                decision
+                for decision in decisions
+                if isinstance(decision, PolicyDecision)
+                and decision.decision_id == stored.policy.decision.decision_id
+            )
+            if len(matches) != 1 or matches[0] != stored.policy.decision:
+                raise AssuranceRunPersistenceError(
+                    "stored run policy decision is not an exact Case decision"
+                )
+            if stored.policy.decision.decision_id in seen_policy_ids:
+                raise AssuranceRunPersistenceError(
+                    "stored run history repeats a policy decision"
+                )
+            seen_policy_ids.add(stored.policy.decision.decision_id)
+        if {
+            decision.decision_id
+            for decision in decisions
+            if isinstance(decision, PolicyDecision)
+        } != seen_policy_ids:
+            raise AssuranceRunPersistenceError(
+                "canonical Case contains policy decisions without run provenance"
+            )
+
+        latest_policy = next(
+            (
+                decision
+                for decision in reversed(decisions)
+                if isinstance(decision, PolicyDecision)
+            ),
+            None,
+        )
+        if latest_policy is None:
+            raise AssuranceRunPersistenceError(
+                "canonical Case has no authoritative policy decision"
+            )
+        if latest_policy.outcome not in {"BLOCKED", "STALE"}:
+            raise AssuranceRunConflictError(
+                "Case already has a non-blocked continuation"
+            )
+
+        existing_event_ids = set(event_positions)
+        next_state = current
+        for event in bundle.events:
+            if event.event_id in existing_event_ids:
+                raise AssuranceRunConflictError(
+                    "run continuation attempted to reuse an existing event"
+                )
+            try:
+                next_state = apply_acceptance_event(next_state, event)
+            except (TypeError, ValueError) as exc:
+                raise AssuranceRunConflictError(
+                    "run continuation events are not an allowed suffix"
+                ) from exc
+
+        next_case = next_state.case.model_dump(mode="json")
+        candidate_case = bundle.case.model_dump(mode="json")
+        for field in _RUN_PROGRESS_ADDITIVE_CASE_FIELDS:
+            next_case.pop(field, None)
+            candidate_case.pop(field, None)
+        if next_case != candidate_case:
+            raise AssuranceRunConflictError(
+                "run continuation Case does not match the aggregate suffix"
+            )
+        for field in _RUN_PROGRESS_ADDITIVE_CASE_FIELDS:
+            if field == "created_at":
+                continue
+            candidate_refs = set(getattr(bundle.case, field))
+            aggregate_refs = set(getattr(next_state.case, field))
+            if not candidate_refs.issubset(aggregate_refs):
+                raise AssuranceRunConflictError(
+                    "run continuation Case references are not aggregate-derived"
+                )
+        if bundle.policy.decision.decision_id in seen_policy_ids:
+            raise AssuranceRunConflictError(
+                "run continuation attempted to reuse a policy decision"
+            )
+        return current, next_state, tuple(stored for _, stored in positioned)
+
     def _commit_run_in_transaction_boundary(
         self,
         bundle: AssuranceRunBundle,
         *,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult:
         from web.assurance_run_committer import _validate_run_arguments
 
         _validate_run_arguments(bundle, idempotency_key, request_digest)
+        _validate_official_evidence_provenance(bundle)
+        _validate_run_policy_event_association(bundle)
         public_json = _public_bundle_json(bundle)
         source_json = _source_binding_json(bundle.freshness_source_binding)
         if str(bundle.freshness_source_binding.repository_path) in public_json:
@@ -1270,6 +1708,11 @@ class AssuranceWebRepository:
                     )
                 winner = _load_bundle_from_row(existing)
                 _assert_row_columns(existing, winner)
+                _validate_official_evidence_provenance(winner)
+                _validate_run_policy_event_association(winner)
+                self._load_official_commit_proofs_in_transaction(conn, winner)
+                if official_proofs:
+                    self._validate_official_commit_proofs(winner, official_proofs)
                 _load_pointer(conn, idempotency_key, winner)
                 self._projection_in_transaction(
                     unit_of_work, winner.case.case_id, check_live=False
@@ -1292,6 +1735,8 @@ class AssuranceWebRepository:
                     "run idempotency pointer exists without its run row"
                 )
 
+            self._validate_official_commit_proofs(bundle, official_proofs)
+
             existing_case = conn.execute(
                 "SELECT case_id FROM assurance_cases WHERE case_id = ?",
                 (bundle.case.case_id,),
@@ -1301,8 +1746,126 @@ class AssuranceWebRepository:
                 (bundle.subject.subject_digest,),
             ).fetchone()
             if existing_case is not None or subject_case is not None:
-                raise AssuranceRunConflictError(
-                    "deterministic case already exists for another run key"
+                found_case_ids = {
+                    row["case_id"]
+                    for row in (existing_case, subject_case)
+                    if row is not None
+                }
+                if found_case_ids != {bundle.case.case_id}:
+                    raise AssuranceRunConflictError(
+                        "subject is already bound to another Case"
+                    )
+                current, next_state, _ = self._validate_run_progression_in_transaction(
+                    unit_of_work, bundle
+                )
+                committed_decisions = unit_of_work.list_decisions(
+                    bundle.case.case_id
+                )
+                if any(
+                    isinstance(decision, PolicyDecision)
+                    and decision.decision_id == bundle.policy.decision.decision_id
+                    for decision in committed_decisions
+                ):
+                    raise AssuranceRunConflictError(
+                        "run continuation attempted to reuse a policy decision"
+                    )
+                stored_policy = unit_of_work.append_policy_decision(
+                    bundle.case.case_id, bundle.policy.decision
+                )
+                if stored_policy != bundle.policy.decision:
+                    raise AssuranceRunPersistenceError(
+                        "stored continuation policy decision does not match bundle"
+                    )
+                for event in bundle.events:
+                    unit_of_work.append_event(bundle.case.case_id, event)
+                replayed = unit_of_work.load_case(bundle.case.case_id)
+                if (
+                    replayed.case != next_state.case
+                    or replayed.applied_events
+                    != current.applied_events + bundle.events
+                ):
+                    raise AssuranceRunPersistenceError(
+                        "stored Case replay does not equal the continuation suffix"
+                    )
+
+                source = bundle.freshness_source_binding
+                metadata = {
+                    "author": source.author,
+                    "author_provenance": source.author_provenance,
+                    "risk": bundle.risk.classification.risk_level,
+                    "run_id": bundle.run_id,
+                }
+                self._touch_web_case(
+                    conn,
+                    bundle.case.case_id,
+                    replayed.case.updated_at,
+                    metadata=metadata,
+                    evidence=bundle.evidence,
+                    findings=bundle.findings,
+                    receipt=bundle.execution_receipt,
+                )
+                committed_at = bundle.completed_at.isoformat()
+                conn.execute(
+                    "INSERT INTO assurance_web_runs (idempotency_key, request_digest,"
+                    " run_id, case_id, subject_digest, bundle_json,"
+                    " source_binding_json, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_digest,
+                        bundle.run_id,
+                        bundle.case.case_id,
+                        bundle.subject.subject_digest,
+                        public_json,
+                        source_json,
+                        committed_at,
+                    ),
+                )
+                self._persist_official_commit_proofs_in_transaction(
+                    conn, bundle, official_proofs
+                )
+                projection = self._projection_in_transaction(
+                    unit_of_work,
+                    bundle.case.case_id,
+                    require_run_pointers=False,
+                    check_live=False,
+                )
+                if projection["case"] != replayed.case.model_dump(mode="json"):
+                    raise AssuranceRunPersistenceError(
+                        "committed continuation projection Case does not match replay"
+                    )
+                if projection["receipt"] != bundle.execution_receipt.model_dump(
+                    mode="json"
+                ):
+                    raise AssuranceRunPersistenceError(
+                        "committed continuation projection Receipt does not match bundle"
+                    )
+                pointer_data = _result_pointer(
+                    bundle,
+                    bundle_json=public_json,
+                    source_binding_json=source_json,
+                )
+                conn.execute(
+                    "INSERT INTO assurance_web_idempotency"
+                    " (idempotency_key, operation, payload_digest, result_json, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        "run",
+                        request_digest,
+                        _canonical_json(pointer_data),
+                        committed_at,
+                    ),
+                )
+                stored_bundle = self._load_committed_run_in_transaction(
+                    conn,
+                    idempotency_key,
+                    expected_case_id=bundle.case.case_id,
+                )
+                return AssuranceRunResult(
+                    run_id=stored_bundle.run_id,
+                    request_digest=stored_bundle.request_digest,
+                    cached=False,
+                    bundle=stored_bundle,
                 )
 
             unit_of_work.create_case(bundle.draft_case, bundle.binding)
@@ -1349,6 +1912,9 @@ class AssuranceWebRepository:
                     committed_at,
                 ),
             )
+            self._persist_official_commit_proofs_in_transaction(
+                conn, bundle, official_proofs
+            )
             projection = self._projection_in_transaction(
                 unit_of_work,
                 bundle.case.case_id,
@@ -1380,11 +1946,16 @@ class AssuranceWebRepository:
                     committed_at,
                 ),
             )
+            stored_bundle = self._load_committed_run_in_transaction(
+                conn,
+                idempotency_key,
+                expected_case_id=bundle.case.case_id,
+            )
             return AssuranceRunResult(
-                run_id=bundle.run_id,
-                request_digest=request_digest,
+                run_id=stored_bundle.run_id,
+                request_digest=stored_bundle.request_digest,
                 cached=False,
-                bundle=bundle,
+                bundle=stored_bundle,
             )
 
     def create_change(self, case, binding, metadata, idempotency_key, payload) -> dict:
@@ -1665,6 +2236,9 @@ class AssuranceWebRepository:
                 bundle = _load_bundle_from_row(row)
                 _assert_row_columns(row, bundle)
                 _load_pointer(conn, row["idempotency_key"], bundle)
+                _validate_official_evidence_provenance(bundle)
+                _validate_run_policy_event_association(bundle)
+                self._load_official_commit_proofs_in_transaction(conn, bundle)
                 if (
                     row["case_id"] != case_id
                     or row["subject_digest"] != state.case.subject_digest
@@ -1757,6 +2331,10 @@ class AssuranceWebRepository:
                 case_id,
                 require_pointers=require_run_pointers,
             )
+        except _OfficialProofIntegrityError:
+            # An official run's proof is part of the authoritative aggregate;
+            # never hide its corruption behind a partial live projection.
+            raise
         except AssuranceWebError:
             if not self._live_required:
                 raise
@@ -1818,13 +2396,432 @@ class AssuranceWebRepository:
                 raise AssuranceRunPersistenceError(
                     "stored run case binding does not match projection"
                 )
+            try:
+                _validate_official_evidence_provenance(bundle)
+                _validate_run_policy_event_association(bundle)
+                self._load_official_commit_proofs_in_transaction(conn, bundle)
+            except AssuranceRunPersistenceError as exc:
+                raise _OfficialProofIntegrityError(str(exc)) from exc
             return (
                 bundle.freshness_source_binding,
                 bundle.git.snapshot,
                 bundle.intake.snapshot,
             )
+        except _OfficialProofIntegrityError:
+            raise
         except Exception:
             return _LIVE_BASELINE_CORRUPT
+
+    @staticmethod
+    def _official_sources_json(
+        proof: _OfficialEvidenceCommitProof,
+    ) -> str:
+        return _canonical_json(
+            {
+                "sources": [
+                    {
+                        **source.model_dump(mode="json"),
+                        "bytes": base64.b64encode(data).decode("ascii"),
+                    }
+                    for source, data in proof.source_bindings
+                ],
+                "workflow_definition": {
+                    **proof.workflow_definition[0].model_dump(mode="json"),
+                    "bytes": base64.b64encode(proof.workflow_definition[1]).decode(
+                        "ascii"
+                    ),
+                },
+            }
+        )
+
+    def _validate_official_commit_proofs(
+        self,
+        bundle: AssuranceRunBundle,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...],
+        *,
+        historical_readback: bool = False,
+    ) -> tuple[tuple, ...]:
+        """Re-hash and re-bind verified official bytes before any write."""
+
+        if type(official_proofs) is not tuple:
+            raise AssuranceRunPersistenceError(
+                "official commit proofs must be an immutable tuple"
+            )
+        official_evidence = tuple(
+            item for item in bundle.evidence if item.kind in OFFICIAL_EVIDENCE_KINDS
+        )
+        if not official_evidence:
+            if official_proofs:
+                raise AssuranceRunPersistenceError(
+                    "official proofs are not allowed without official Evidence"
+                )
+            return ()
+        _validate_official_evidence_provenance(bundle)
+        if {item.kind for item in official_evidence} != set(OFFICIAL_EVIDENCE_KINDS):
+            raise AssuranceRunPersistenceError(
+                "official Evidence must contain the complete typed set"
+            )
+        if len(official_proofs) != len(OFFICIAL_EVIDENCE_KINDS):
+            raise AssuranceRunPersistenceError(
+                "official Evidence proof is missing or duplicated"
+            )
+        by_evidence = {item.evidence_id: item for item in official_evidence}
+        if len(by_evidence) != len(official_evidence):
+            raise AssuranceRunPersistenceError(
+                "official Evidence IDs are not unique"
+            )
+        seen_ids = set()
+        rows = []
+        groups = set()
+        for proof in official_proofs:
+            if type(proof) is not _OfficialEvidenceCommitProof:
+                raise AssuranceRunPersistenceError(
+                    "official commit proof is not the private immutable type"
+                )
+            if proof.evidence_id in seen_ids:
+                raise AssuranceRunPersistenceError(
+                    "official Evidence proof is duplicated"
+                )
+            seen_ids.add(proof.evidence_id)
+            evidence = by_evidence.get(proof.evidence_id)
+            if evidence is None or evidence.kind != proof.kind:
+                raise AssuranceRunPersistenceError(
+                    "official proof does not bind bundle Evidence"
+                )
+            if (
+                proof.kind not in OFFICIAL_EVIDENCE_KINDS
+                or proof.subject_digest != bundle.subject.subject_digest
+                or evidence.subject_digest != proof.subject_digest
+                or proof.evidence_mode != "official"
+                or type(proof.workflow_run_attempt) is not int
+                or proof.workflow_run_attempt <= 0
+            ):
+                raise AssuranceRunPersistenceError(
+                    "official proof identity is invalid"
+                )
+            workflow_binding = proof.workflow_definition
+            if (
+                type(workflow_binding) is not tuple
+                or len(workflow_binding) != 2
+                or type(workflow_binding[0]) is not OfficialEvidenceSource
+                or type(workflow_binding[1]) is not bytes
+                or len(workflow_binding[1]) != workflow_binding[0].byte_size
+                or len(workflow_binding[1]) > _OFFICIAL_PROOF_MAX_SOURCE_BYTES
+                or _proof_digest(workflow_binding[1]) != workflow_binding[0].digest
+            ):
+                raise AssuranceRunPersistenceError(
+                    "official workflow definition bytes do not match their binding"
+                )
+            groups.add(
+                (
+                    proof.workflow_run_id,
+                    proof.workflow_run_attempt,
+                    proof.job_id,
+                    proof.artifact_id,
+                    proof.artifact_digest,
+                    proof.artifact_byte_size,
+                    workflow_binding[0].path,
+                    workflow_binding[0].digest,
+                    workflow_binding[0].byte_size,
+                )
+            )
+            byte_fields = (
+                ("artifact", proof.artifact_bytes, proof.artifact_byte_size, _OFFICIAL_PROOF_MAX_ZIP_BYTES, False),
+                ("receipt", proof.receipt_bytes, proof.receipt_byte_size, _OFFICIAL_PROOF_MAX_REPORT_BYTES + _OFFICIAL_PROOF_MAX_RESULT_BYTES, False),
+                ("report", proof.report_bytes, proof.report_byte_size, _OFFICIAL_PROOF_MAX_REPORT_BYTES, True),
+                ("result", proof.result_bytes, proof.result_byte_size, _OFFICIAL_PROOF_MAX_RESULT_BYTES, True),
+            )
+            for label, data, size, maximum, allow_empty in byte_fields:
+                if (
+                    type(data) is not bytes
+                    or type(size) is not int
+                    or size < 0
+                    or (not allow_empty and size <= 0)
+                    or size != len(data)
+                    or size > maximum
+                    or _proof_digest(data) != getattr(proof, f"{label}_digest", None)
+                ):
+                    raise AssuranceRunPersistenceError(
+                        f"official {label} bytes do not match their digest or size"
+                    )
+            try:
+                receipt = parse_official_evidence_receipt(
+                    proof.receipt_bytes, allow_legacy=historical_readback
+                )
+                report = parse_official_evidence_report(
+                    proof.report_bytes, allow_legacy=historical_readback
+                )
+                result = _parse_proof_json(proof.result_bytes, "result bytes")
+            except (TypeError, ValueError, UnicodeDecodeError) as exc:
+                raise AssuranceRunPersistenceError(
+                    "official proof bytes cannot be parsed"
+                ) from exc
+            if not isinstance(result, (dict, list)):
+                raise AssuranceRunPersistenceError(
+                    "official result bytes must contain an object or array"
+                )
+            try:
+                canonical_receipt = _canonical_json(
+                    receipt.model_dump(mode="json")
+                ).encode("utf-8")
+            except (TypeError, ValueError, UnicodeEncodeError) as exc:
+                raise AssuranceRunPersistenceError(
+                    "official proof bytes cannot be canonically serialized"
+                ) from exc
+            # The trusted internal receipt remains canonical.  Report/result
+            # members are provider-owned raw JSON; typed equality and the ZIP
+            # member check below retain their semantic and byte binding.
+            if not historical_readback and proof.receipt_bytes != canonical_receipt:
+                raise AssuranceRunPersistenceError(
+                    "official proof bytes are not canonical"
+                )
+            _parse_official_artifact_bytes(
+                proof.artifact_bytes,
+                kind=proof.kind,
+                report_bytes=proof.report_bytes,
+                result_bytes=proof.result_bytes,
+            )
+            if (
+                receipt.kind != proof.kind
+                or receipt.subject_digest != proof.subject_digest
+                or receipt.evidence_mode != "official"
+                or receipt.repository_identity != bundle.subject.repository
+                or receipt.head_revision != bundle.subject.head_revision
+                or receipt.producer != evidence.producer
+                or receipt.workflow_run_id != proof.workflow_run_id
+                or receipt.workflow_run_attempt != proof.workflow_run_attempt
+                or receipt.job_id != proof.job_id
+                or receipt.artifact_id != proof.artifact_id
+                or receipt.artifact_digest != proof.artifact_digest
+                or receipt.artifact_byte_size != proof.artifact_byte_size
+                or receipt.report_digest != proof.report_digest
+                or receipt.report_byte_size != proof.report_byte_size
+                or receipt.result_digest != proof.result_digest
+                or receipt.result_byte_size != proof.result_byte_size
+                or receipt.workflow_definition != workflow_binding[0]
+                or report.workflow_definition != receipt.workflow_definition
+                or report != receipt.report
+                or result != receipt.result
+                or proof.receipt_digest != evidence.artifact_digest
+                or proof.receipt_byte_size != len(proof.receipt_bytes)
+                or proof.artifact_digest != _proof_digest(proof.artifact_bytes)
+                or proof.artifact_byte_size != len(proof.artifact_bytes)
+                or proof.receipt_digest != _proof_digest(proof.receipt_bytes)
+                or proof.report_digest != _proof_digest(proof.report_bytes)
+                or proof.result_digest != _proof_digest(proof.result_bytes)
+            ):
+                raise AssuranceRunPersistenceError(
+                    "official proof receipt/report/result binding is invalid"
+                )
+            if type(proof.source_bindings) is not tuple:
+                raise AssuranceRunPersistenceError(
+                    "official source bindings must be immutable"
+                )
+            source_metadata = []
+            for source, data in proof.source_bindings:
+                if (
+                    type(source) is not OfficialEvidenceSource
+                    or type(data) is not bytes
+                    or len(data) != source.byte_size
+                    or len(data) > _OFFICIAL_PROOF_MAX_SOURCE_BYTES
+                    or _proof_digest(data) != source.digest
+                ):
+                    raise AssuranceRunPersistenceError(
+                        "official source bytes do not match their binding"
+                    )
+                source_metadata.append(source)
+            if tuple(source_metadata) != receipt.source_paths:
+                raise AssuranceRunPersistenceError(
+                    "official source bindings do not match receipt"
+                )
+            expected_source_ref = (
+                f"github:official:{proof.kind}:run:{proof.workflow_run_id}:"
+                f"artifact:{proof.artifact_id}:success"
+            )
+            expected_trace = (
+                f"github:{proof.workflow_run_id}:{proof.workflow_run_attempt}:"
+                f"{proof.job_id}"
+            )
+            if (
+                evidence.source_ref != expected_source_ref
+                or evidence.trace_id != expected_trace
+                or evidence.status != "success"
+                or evidence.trust_level != "observed"
+                or evidence.producer != f"collector.{proof.kind}"
+            ):
+                raise AssuranceRunPersistenceError(
+                    "official Evidence locator is not bound to its proof"
+                )
+            rows.append(
+                (
+                    bundle.run_id,
+                    proof.evidence_id,
+                    proof.kind,
+                    proof.subject_digest,
+                    proof.evidence_mode,
+                    proof.workflow_run_id,
+                    proof.workflow_run_attempt,
+                    proof.job_id,
+                    proof.artifact_id,
+                    proof.artifact_digest,
+                    proof.artifact_byte_size,
+                    proof.artifact_bytes,
+                    proof.receipt_digest,
+                    proof.receipt_byte_size,
+                    proof.receipt_bytes,
+                    proof.report_digest,
+                    proof.report_byte_size,
+                    proof.report_bytes,
+                    proof.result_digest,
+                    proof.result_byte_size,
+                    proof.result_bytes,
+                    self._official_sources_json(proof),
+                )
+            )
+        if seen_ids != set(by_evidence):
+            raise AssuranceRunPersistenceError(
+                "official Evidence proof set does not match bundle"
+            )
+        if len(groups) != 1:
+            raise AssuranceRunPersistenceError(
+                "official Evidence does not share one workflow provenance"
+            )
+        return tuple(rows)
+
+    def _persist_official_commit_proofs_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        bundle: AssuranceRunBundle,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...],
+    ) -> None:
+        rows = self._validate_official_commit_proofs(bundle, official_proofs)
+        for row in rows:
+            conn.execute(
+                f"INSERT INTO {_OFFICIAL_PROOF_TABLE} ("
+                "run_id, evidence_id, kind, subject_digest, evidence_mode,"
+                "workflow_run_id, workflow_run_attempt, job_id, artifact_id,"
+                "artifact_digest, artifact_byte_size, artifact_bytes,"
+                "receipt_digest, receipt_byte_size, receipt_bytes,"
+                "report_digest, report_byte_size, report_bytes,"
+                "result_digest, result_byte_size, result_bytes, source_bindings_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+
+    def _load_official_commit_proofs_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        bundle: AssuranceRunBundle,
+    ) -> tuple[_OfficialEvidenceCommitProof, ...]:
+        rows = conn.execute(
+            f"SELECT * FROM {_OFFICIAL_PROOF_TABLE} WHERE run_id = ?"
+            " ORDER BY evidence_id ASC",
+            (bundle.run_id,),
+        ).fetchall()
+        proofs = []
+        legacy_shapes = set()
+        for row in rows:
+            try:
+                source_data = _parse_canonical_json(
+                    row["source_bindings_json"],
+                    "official proof source bindings",
+                )
+                legacy_source_shape = isinstance(source_data, list)
+                legacy_shapes.add(legacy_source_shape)
+                if legacy_source_shape:
+                    source_items = source_data
+                    workflow_item = None
+                elif isinstance(source_data, dict) and set(source_data) == {
+                    "sources",
+                    "workflow_definition",
+                }:
+                    source_items = source_data["sources"]
+                    workflow_item = source_data["workflow_definition"]
+                    if not isinstance(source_items, list) or not isinstance(
+                        workflow_item, dict
+                    ):
+                        raise ValueError("official proof source shape is invalid")
+                else:
+                    raise ValueError("official proof source shape is invalid")
+
+                def decode_binding(item: object) -> tuple[OfficialEvidenceSource, bytes]:
+                    if not isinstance(item, dict) or set(item) != {
+                        "schema_version",
+                        "path",
+                        "digest",
+                        "byte_size",
+                        "bytes",
+                    }:
+                        raise ValueError("source binding shape is invalid")
+                    encoded = item["bytes"]
+                    if type(encoded) is not str:
+                        raise ValueError("source bytes are not base64")
+                    data = base64.b64decode(encoded, validate=True)
+                    source = OfficialEvidenceSource.model_validate(
+                        {key: item[key] for key in item if key != "bytes"}
+                    )
+                    return source, data
+
+                source_bindings = [decode_binding(item) for item in source_items]
+                if legacy_source_shape:
+                    receipt = parse_official_evidence_receipt(
+                        row["receipt_bytes"], allow_legacy=True
+                    )
+                    workflow_matches = [
+                        binding
+                        for binding in source_bindings
+                        if binding[0].path == receipt.workflow_definition.path
+                    ]
+                    if len(workflow_matches) != 1:
+                        raise ValueError("legacy workflow definition binding is invalid")
+                    workflow_definition = workflow_matches[0]
+                    source_bindings = [
+                        binding
+                        for binding in source_bindings
+                        if binding is not workflow_definition
+                    ]
+                else:
+                    workflow_definition = decode_binding(workflow_item)
+                proofs.append(
+                    _OfficialEvidenceCommitProof(
+                        evidence_id=row["evidence_id"],
+                        kind=row["kind"],
+                        subject_digest=row["subject_digest"],
+                        evidence_mode=row["evidence_mode"],
+                        workflow_run_id=row["workflow_run_id"],
+                        workflow_run_attempt=row["workflow_run_attempt"],
+                        job_id=row["job_id"],
+                        artifact_id=row["artifact_id"],
+                        artifact_digest=row["artifact_digest"],
+                        artifact_byte_size=row["artifact_byte_size"],
+                        artifact_bytes=row["artifact_bytes"],
+                        receipt_digest=row["receipt_digest"],
+                        receipt_byte_size=row["receipt_byte_size"],
+                        receipt_bytes=row["receipt_bytes"],
+                        report_digest=row["report_digest"],
+                        report_byte_size=row["report_byte_size"],
+                        report_bytes=row["report_bytes"],
+                        result_digest=row["result_digest"],
+                        result_byte_size=row["result_byte_size"],
+                        result_bytes=row["result_bytes"],
+                        source_bindings=tuple(source_bindings),
+                        workflow_definition=workflow_definition,
+                    )
+                )
+            except (TypeError, ValueError, KeyError, binascii.Error) as exc:
+                raise AssuranceRunPersistenceError(
+                    "stored official proof is invalid"
+                ) from exc
+        if len(legacy_shapes) > 1:
+            raise AssuranceRunPersistenceError(
+                "stored official proof shapes must not be mixed"
+            )
+        self._validate_official_commit_proofs(
+            bundle,
+            tuple(proofs),
+            historical_readback=bool(legacy_shapes and True in legacy_shapes),
+        )
+        return tuple(proofs)
 
     def _live_freshness_result(self, live_baseline) -> LiveFreshness:
         checked_at = datetime.now(timezone.utc)
@@ -2114,6 +3111,13 @@ class AssuranceWebRepository:
         existing = destination.get(item_id)
         if existing is not None:
             if existing != value:
+                if label == "evidence":
+                    existing_without_time = dict(existing)
+                    value_without_time = dict(value)
+                    existing_without_time.pop("collected_at", None)
+                    value_without_time.pop("collected_at", None)
+                    if existing_without_time == value_without_time:
+                        return
                 raise AssuranceWebError(
                     f"conflicting immutable {label} {item_id!r} in run projection"
                 )
@@ -2292,7 +3296,19 @@ class AssuranceWebRepository:
         for model in new_models:
             data = model.model_dump(mode="json")
             if data[id_field] in index:
-                result[index[data[id_field]]] = data
+                existing = result[index[data[id_field]]]
+                if existing != data:
+                    if id_field == "evidence_id":
+                        existing_without_time = dict(existing)
+                        data_without_time = dict(data)
+                        existing_without_time.pop("collected_at", None)
+                        data_without_time.pop("collected_at", None)
+                        if existing_without_time == data_without_time:
+                            continue
+                    raise AssuranceWebError(
+                        f"conflicting immutable projection {id_field}"
+                        f" {data[id_field]!r}"
+                    )
             else:
                 index[data[id_field]] = len(result)
                 result.append(data)
@@ -2301,6 +3317,35 @@ class AssuranceWebRepository:
     def _load_web_case_in_transaction(self, conn, case_id) -> dict | None:
         row = conn.execute("SELECT metadata_json, evidence_json, findings_json, receipt_json FROM assurance_web_cases WHERE case_id = ?", (case_id,)).fetchone()
         return dict(row) if row is not None else None
+
+    def _load_committed_run_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        idempotency_key: str,
+        *,
+        expected_case_id: str | None = None,
+    ) -> AssuranceRunBundle:
+        """Rehydrate one result from its immutable Run row, never Case state."""
+
+        row = conn.execute(
+            "SELECT * FROM assurance_web_runs WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None:
+            raise AssuranceRunPersistenceError(
+                "committed run row disappeared during transaction"
+            )
+        bundle = _load_bundle_from_row(row)
+        _assert_row_columns(row, bundle)
+        if expected_case_id is not None and bundle.case.case_id != expected_case_id:
+            raise AssuranceRunPersistenceError(
+                "committed run case binding does not match result"
+            )
+        _validate_official_evidence_provenance(bundle)
+        _validate_run_policy_event_association(bundle)
+        self._load_official_commit_proofs_in_transaction(conn, bundle)
+        _load_pointer(conn, idempotency_key, bundle)
+        return bundle
 
     def _load_web_runs_in_transaction(
         self, conn, case_id, *, require_pointers: bool = True
@@ -2317,6 +3362,12 @@ class AssuranceWebRepository:
                 _assert_row_columns(row, bundle)
                 if require_pointers:
                     _load_pointer(conn, row["idempotency_key"], bundle)
+                try:
+                    _validate_official_evidence_provenance(bundle)
+                    _validate_run_policy_event_association(bundle)
+                    self._load_official_commit_proofs_in_transaction(conn, bundle)
+                except AssuranceRunPersistenceError as exc:
+                    raise _OfficialProofIntegrityError(str(exc)) from exc
             except AssuranceRunPersistenceError as exc:
                 raise AssuranceWebError(str(exc)) from exc
             if bundle.case.case_id != case_id:

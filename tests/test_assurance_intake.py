@@ -1525,3 +1525,66 @@ def test_source_inspection_no_subprocess_network_model_or_glob():
                 assert func.attr not in {"system", "popen", "glob"}
     assert "http://" not in source
     assert "https://" not in source
+
+
+def test_task_policy_adr_evidence_is_independent_and_binds_empty_adr(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo, "task.md", b"---\ntitle: T\nowner: o\n---\n- [ ] ship\n")
+    _write(repo, "policy.md", b"# Policy\n")
+    store = ArtifactStore(tmp_path / "artifacts")
+
+    intake = _collect(
+        repo,
+        store,
+        task_path="task.md",
+        policy_paths=("policy.md",),
+        adr_paths=(),
+    )
+    dedicated = intake_module._build_task_policy_adr_evidence(
+        intake, artifact_store=store
+    )
+
+    assert intake.evidence.kind == "intake_documents"
+    assert intake.evidence.producer == "collector.intake"
+    assert dedicated.kind == "task_policy_adr"
+    assert dedicated.producer == "collector.task_policy_adr"
+    assert dedicated.subject_digest == SUBJECT
+    assert dedicated.status == "success"
+    assert dedicated.artifact_digest != intake.evidence.artifact_digest
+    payload = json.loads(store.get_bytes(dedicated.artifact_digest))
+    assert payload["subject_digest"] == SUBJECT
+    assert payload["adr_paths"] == []
+    assert payload["document_states"]["adr"]["status"] == "not_declared"
+    assert payload["document_states"]["adr"]["empty"] is True
+    assert payload["intake_evidence"]["kind"] == "intake_documents"
+    assert payload["intake_evidence"]["producer"] == "collector.intake"
+    assert payload["intake_evidence"]["artifact_digest"] == (
+        intake.snapshot.manifest_artifact_digest
+    )
+    assert all("body" not in item for item in payload["documents"])
+
+
+def test_task_policy_adr_evidence_rejects_declared_missing_adr(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo, "task.md", b"---\ntitle: T\nowner: o\n---\n- [ ] ship\n")
+    _write(repo, "policy.md", b"# Policy\n")
+    store = ArtifactStore(tmp_path / "artifacts")
+
+    intake = _collect(
+        repo,
+        store,
+        task_path="task.md",
+        policy_paths=("policy.md",),
+        adr_paths=("missing.md",),
+    )
+    dedicated = intake_module._build_task_policy_adr_evidence(
+        intake, artifact_store=store
+    )
+
+    assert intake.snapshot.complete is True
+    assert dedicated.status == "truncated"
+    payload = json.loads(store.get_bytes(dedicated.artifact_digest))
+    assert payload["complete"] is False
+    assert payload["document_states"]["adr"]["status"] == "missing"

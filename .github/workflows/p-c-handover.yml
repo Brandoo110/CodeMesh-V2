@@ -1,0 +1,356 @@
+name: P-C Handover Experience
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact final candidate commit SHA to validate
+        required: true
+        type: string
+      pull_request_number:
+        description: Open pull request number whose head is target_sha
+        required: true
+        type: string
+      subject_digest:
+        description: Runtime subject digest collected for target_sha
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p-c-handover-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  handover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CODEMESH_TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Validate workflow dispatch inputs
+        id: validate_dispatch_inputs
+        env:
+          CODEMESH_EVENT: ${{ github.event_name }}
+          CODEMESH_INPUT_TARGET_SHA: ${{ inputs.target_sha || '' }}
+          CODEMESH_INPUT_PR_NUMBER: ${{ inputs.pull_request_number || '' }}
+          CODEMESH_INPUT_SUBJECT_DIGEST: ${{ inputs.subject_digest || '' }}
+        run: |
+          if test "$CODEMESH_EVENT" = workflow_dispatch; then
+            printf '%s\n' "$CODEMESH_INPUT_TARGET_SHA" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$'
+            printf '%s\n' "$CODEMESH_INPUT_PR_NUMBER" | grep -Eq '^[1-9][0-9]{0,18}$'
+            printf '%s\n' "$CODEMESH_INPUT_SUBJECT_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          fi
+
+      - name: Checkout exact candidate
+        id: checkout_candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Assert exact candidate checkout
+        id: assert_checkout
+        run: test "$(git rev-parse HEAD)" = "$CODEMESH_TARGET_SHA"
+
+      - name: Set up Python
+        id: setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install web runtime
+        id: install_web_runtime
+        run: python -m pip install --disable-pip-version-check -e ".[web]"
+
+      - name: Run isolated API walkthrough
+        id: api_walkthrough
+        run: python scripts/p_c_handover_walkthrough.py --output-dir "$RUNNER_TEMP/p-c-api-walkthrough"
+
+      - name: Set up pnpm
+        id: setup_pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up Node
+        id: setup_node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        id: install_frontend
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Run official dependency audit
+        id: dependency_audit
+        working-directory: frontend
+        run: |
+          mkdir -p "$RUNNER_TEMP/p-c-official"
+          set +e
+          pnpm audit --prod --audit-level=high --json > "$RUNNER_TEMP/p-c-official/dependency-audit-result.json"
+          audit_status=$?
+          set -e
+          test "$audit_status" -eq 0
+
+      - name: Frontend focused checks
+        id: frontend_checks
+        working-directory: frontend
+        run: |
+          pnpm test
+          pnpm exec tsc --noEmit --allowImportingTsExtensions
+          pnpm exec eslint . --rule 'react-hooks/set-state-in-effect: off' --rule 'react-hooks/exhaustive-deps: off'
+          NEXT_PUBLIC_API_BASE=http://127.0.0.1:8010 pnpm build
+
+      - name: Start isolated API and frontend
+        id: start_local_runtime
+        env:
+          P_C_DB: ${{ runner.temp }}/p-c-browser.sqlite
+          P_C_API_LOG: ${{ runner.temp }}/p-c-api.log
+          P_C_FRONTEND_LOG: ${{ runner.temp }}/p-c-frontend.log
+        run: |
+          PYTHONPATH=. python scripts/p_c_demo_server.py --db "$P_C_DB" --port 8010 >"$P_C_API_LOG" 2>&1 &
+          echo $! > "$RUNNER_TEMP/p-c-api.pid"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8010/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:8010/api/health >/dev/null
+          (cd frontend && NEXT_PUBLIC_API_BASE=http://127.0.0.1:8010 pnpm start -p 3010 >"$P_C_FRONTEND_LOG" 2>&1 & echo $! > "$RUNNER_TEMP/p-c-frontend.pid")
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3010/ >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:3010/ >/dev/null
+
+      - name: Install Playwright runner
+        id: install_playwright
+        run: |
+          mkdir -p "$RUNNER_TEMP/p-c-playwright"
+          npm install --prefix "$RUNNER_TEMP/p-c-playwright" --no-save --no-package-lock playwright@1.55.0
+          cp scripts/p_c_browser_walkthrough.mjs "$RUNNER_TEMP/p-c-playwright/walkthrough.mjs"
+
+      - name: Install headless Chromium
+        id: install_chromium
+        run: "$RUNNER_TEMP/p-c-playwright/node_modules/.bin/playwright install --with-deps chromium"
+
+      - name: Run target-user browser walkthrough
+        id: browser_walkthrough
+        env:
+          FRONTEND_URL: http://127.0.0.1:3010
+          WALKTHROUGH_OUTPUT_DIR: ${{ runner.temp }}/p-c-browser-walkthrough
+        run: node "$RUNNER_TEMP/p-c-playwright/walkthrough.mjs"
+
+      - name: Generate typed official validation reports
+        id: generate_official_reports
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CODEMESH_WORKFLOW_JOB: ${{ github.job }}
+          CODEMESH_EVENT: ${{ github.event_name }}
+          CODEMESH_PR_NUMBER: ${{ inputs.pull_request_number || '' }}
+          CODEMESH_SUBJECT_DIGEST: ${{ inputs.subject_digest || '' }}
+          CODEMESH_CHECKOUT_STATUS: ${{ steps.checkout_candidate.outcome }}
+          CODEMESH_ASSERT_CHECKOUT_STATUS: ${{ steps.assert_checkout.outcome }}
+          CODEMESH_PYTHON_INSTALL_STATUS: ${{ steps.install_web_runtime.outcome }}
+          CODEMESH_PNPM_SETUP_STATUS: ${{ steps.setup_pnpm.outcome }}
+          CODEMESH_NODE_SETUP_STATUS: ${{ steps.setup_node.outcome }}
+          CODEMESH_INSTALL_STATUS: ${{ steps.install_frontend.outcome }}
+          CODEMESH_API_STATUS: ${{ steps.api_walkthrough.outcome }}
+          CODEMESH_AUDIT_STATUS: ${{ steps.dependency_audit.outcome }}
+          CODEMESH_FOCUSED_STATUS: ${{ steps.frontend_checks.outcome }}
+          CODEMESH_RUNTIME_STATUS: ${{ steps.start_local_runtime.outcome }}
+          CODEMESH_PLAYWRIGHT_STATUS: ${{ steps.install_playwright.outcome }}
+          CODEMESH_CHROMIUM_STATUS: ${{ steps.install_chromium.outcome }}
+          CODEMESH_BROWSER_STATUS: ${{ steps.browser_walkthrough.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/p-c-official"
+          CODEMESH_REPORT_ROOT="$PWD" CODEMESH_REPORT_OUTPUT="$RUNNER_TEMP/p-c-official" python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          import re
+
+          root = Path(os.environ["CODEMESH_REPORT_ROOT"])
+          out = Path(os.environ["CODEMESH_REPORT_OUTPUT"])
+          target = os.environ["CODEMESH_TARGET_SHA"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+          workflow = os.environ.get("GITHUB_WORKFLOW", "P-C Handover Experience")
+          workflow_path = ".github/workflows/p-c-handover.yml"
+          event = os.environ["CODEMESH_EVENT"]
+          if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", target) is None:
+              raise SystemExit("workflow target SHA is invalid")
+          pull_request_number = int(os.environ["CODEMESH_PR_NUMBER"])
+          subject_digest = os.environ["CODEMESH_SUBJECT_DIGEST"]
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", subject_digest) is None:
+              raise SystemExit("workflow_dispatch subject digest is invalid")
+          run_id = os.environ["GITHUB_RUN_ID"]
+          attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+          job_id = os.environ["CODEMESH_WORKFLOW_JOB"]
+          step_status = {
+              "checkout": os.environ["CODEMESH_CHECKOUT_STATUS"],
+              "exact_checkout": os.environ["CODEMESH_ASSERT_CHECKOUT_STATUS"],
+              "python_install": os.environ["CODEMESH_PYTHON_INSTALL_STATUS"],
+              "pnpm_setup": os.environ["CODEMESH_PNPM_SETUP_STATUS"],
+              "node_setup": os.environ["CODEMESH_NODE_SETUP_STATUS"],
+              "install": os.environ["CODEMESH_INSTALL_STATUS"],
+              "api_walkthrough": os.environ["CODEMESH_API_STATUS"],
+              "dependency_audit": os.environ["CODEMESH_AUDIT_STATUS"],
+              "focused_checks": os.environ["CODEMESH_FOCUSED_STATUS"],
+              "build": os.environ["CODEMESH_FOCUSED_STATUS"],
+              "local_runtime": os.environ["CODEMESH_RUNTIME_STATUS"],
+              "playwright_install": os.environ["CODEMESH_PLAYWRIGHT_STATUS"],
+              "chromium_install": os.environ["CODEMESH_CHROMIUM_STATUS"],
+              "browser_walkthrough": os.environ["CODEMESH_BROWSER_STATUS"],
+          }
+          if any(value != "success" for value in step_status.values()):
+              raise SystemExit("official validation step did not succeed")
+
+          def git_blob_facts(relative):
+              listing = subprocess.run(
+                  ("git", "ls-tree", "-z", target, "--", relative),
+                  cwd=root,
+                  check=True,
+                  capture_output=True,
+              ).stdout
+              entries = listing.split(b"\x00")
+              if len(entries) != 2 or not entries[0]:
+                  raise SystemExit("target Git blob is missing")
+              header, path = entries[0].split(b"\t", 1)
+              mode, object_type, object_id = header.split(b" ")
+              if (
+                  path.decode("utf-8", errors="strict") != relative
+                  or object_type != b"blob"
+                  or mode not in {b"100644", b"100755"}
+                  or re.fullmatch(rb"[0-9a-f]{40,64}", object_id) is None
+              ):
+                  raise SystemExit("target Git object is not a regular blob")
+              data = subprocess.run(
+                  ("git", "cat-file", "blob", object_id.decode("ascii")),
+                  cwd=root,
+                  check=True,
+                  capture_output=True,
+              ).stdout
+              return {
+                  "schema_version": "v1",
+                  "path": relative,
+                  "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+                  "byte_size": len(data),
+              }
+
+          workflow_definition = git_blob_facts(workflow_path)
+
+          def write_report(
+              kind,
+              result_relative,
+              sources,
+              *,
+              report_status,
+              report_conclusion,
+              checks=(),
+              audit_command=None,
+          ):
+              result = out / result_relative
+              data = {
+                  "schema_version": "v1",
+                  "kind": kind,
+                  "repository_identity": repository,
+                  "head_revision": target,
+                  "subject_digest": subject_digest,
+                  "producer": "collector." + kind,
+                  "source_paths": [git_blob_facts(item) for item in sources],
+                  "workflow_name": workflow,
+                  "workflow_path": workflow_path,
+                  "event": event,
+                  "pull_request_number": pull_request_number,
+                  "workflow_run_id": run_id,
+                  "workflow_run_attempt": attempt,
+                  "job_id": job_id,
+                  "job_name": job_id,
+                  "status": report_status,
+                  "conclusion": report_conclusion,
+                  "result_path": result_relative,
+                  "result_digest": "sha256:" + hashlib.sha256(result.read_bytes()).hexdigest(),
+                  "result_byte_size": result.stat().st_size,
+                  "checks": list(checks),
+                  "workflow_definition": workflow_definition,
+                  "evidence_mode": "official",
+              }
+              if audit_command is not None:
+                  data["audit_command"] = audit_command
+              (out / (kind + ".json")).write_text(
+                  json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                  encoding="utf-8",
+              )
+
+          (out / "ci-iac-result.json").write_text(
+              json.dumps(
+                  {
+                      "schema_version": "v1",
+                      "validation": "exact checkout, install, focused checks, build, and browser walkthrough completed",
+                      "synthetic_walkthrough_artifact": False,
+                  },
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ),
+              encoding="utf-8",
+          )
+
+          write_report(
+              "dependency_audit",
+              "dependency-audit-result.json",
+              ("frontend/package.json", "frontend/pnpm-lock.yaml"),
+              report_status=step_status["dependency_audit"],
+              report_conclusion=step_status["dependency_audit"],
+              audit_command="pnpm audit --prod --audit-level=high --json",
+          )
+          write_report(
+              "ci_iac_validation",
+              "ci-iac-result.json",
+              ("frontend/package.json", "frontend/pnpm-lock.yaml"),
+              report_status=step_status["browser_walkthrough"],
+              report_conclusion=step_status["browser_walkthrough"],
+              checks=(
+                  {"name": name, "status": status, "conclusion": "success"}
+                  for name, status in step_status.items()
+                  if name in {"checkout", "install", "focused_checks", "build", "browser_walkthrough"}
+              ),
+          )
+          PY
+
+      - name: Upload official validation reports
+        if: success() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: p-c-official-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/p-c-official
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload walkthrough artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p-c-handover-walkthrough-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/p-c-api-walkthrough
+            ${{ runner.temp }}/p-c-browser-walkthrough
+            ${{ runner.temp }}/p-c-api.log
+            ${{ runner.temp }}/p-c-frontend.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Stop isolated walkthrough processes
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/p-c-frontend.pid"; then kill "$(cat "$RUNNER_TEMP/p-c-frontend.pid")" 2>/dev/null || true; fi
+          if test -f "$RUNNER_TEMP/p-c-api.pid"; then kill "$(cat "$RUNNER_TEMP/p-c-api.pid")" 2>/dev/null || true; fi

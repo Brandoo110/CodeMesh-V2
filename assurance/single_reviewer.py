@@ -667,9 +667,9 @@ _RESPONSE_SCHEMA_TEXT = """{
   "additionalProperties": false,
   "required": ["schema_version", "subject_digest", "rubric_hash", "findings", "questions"],
   "properties": {
-    "schema_version": {"const": "v1"},
-    "subject_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-    "rubric_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "schema_version": {"type": "string", "enum": ["v1"]},
+    "subject_digest": {"type": "string"},
+    "rubric_hash": {"type": "string"},
     "findings": {
       "type": "array",
       "items": {
@@ -677,11 +677,11 @@ _RESPONSE_SCHEMA_TEXT = """{
         "additionalProperties": false,
         "required": ["reviewer_role", "claim", "evidence_refs", "severity", "confidence"],
         "properties": {
-          "reviewer_role": {"enum": ["intent", "architecture", "operability"]},
-          "claim": {"type": "string", "minLength": 1},
-          "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
-          "severity": {"enum": ["info", "low", "medium", "high", "critical"]},
-          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+          "reviewer_role": {"type": "string", "enum": ["intent", "architecture", "operability"]},
+          "claim": {"type": "string"},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}},
+          "severity": {"type": "string", "enum": ["info", "low", "medium", "high", "critical"]},
+          "confidence": {"type": "number"}
         }
       }
     },
@@ -692,10 +692,10 @@ _RESPONSE_SCHEMA_TEXT = """{
         "additionalProperties": false,
         "required": ["reviewer_role", "question", "reason", "evidence_refs"],
         "properties": {
-          "reviewer_role": {"enum": ["intent", "architecture", "operability"]},
-          "question": {"type": "string", "minLength": 1},
-          "reason": {"enum": ["model_question", "truncated_context"]},
-          "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+          "reviewer_role": {"type": "string", "enum": ["intent", "architecture", "operability"]},
+          "question": {"type": "string"},
+          "reason": {"type": "string", "enum": ["model_question", "truncated_context"]},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}}
         }
       }
     }

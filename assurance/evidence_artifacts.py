@@ -33,6 +33,7 @@ from assurance.commands import CommandBatchSnapshot, CommandObservation
 from assurance.contracts import Evidence
 from assurance.digests import normalize_repo_path
 from assurance.intake import IntakeDocument, IntakeNotice, IntakeSnapshot
+from assurance.snapshot import _DEFAULT_MAX_DIFF_BYTES
 
 
 _SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -42,7 +43,7 @@ _READ_CHUNK_BYTES = 64 * 1024
 
 # These limits are the collector contracts.  The resolver never trusts a
 # manifest to widen them; manifest-local limits may only be narrower.
-_MAX_GIT_BYTES = 262_144
+_MAX_GIT_BYTES = _DEFAULT_MAX_DIFF_BYTES
 _MAX_INTAKE_MANIFEST_BYTES = 4_718_592  # approximately 4.5 MiB
 _MAX_COMMAND_MANIFEST_BYTES = 262_144
 _MAX_UNKNOWN_ARTIFACT_BYTES = 262_144

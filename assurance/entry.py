@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MAX_JSON_BYTES = 256 * 1024
 _MAX_ARTIFACT_INDEX_BYTES = 256 * 1024
 _MAX_ARTIFACT_BYTES = 256 * 1024
+_DEFAULT_RUN_CREATE_TIMEOUT_SECONDS = 240.0
+_MAX_RUN_CREATE_TIMEOUT_SECONDS = 600.0
 
 
 class AssuranceEntryError(RuntimeError):
@@ -118,6 +121,17 @@ def _validate_base_url(value: object) -> str:
     return raw
 
 
+def _validate_run_create_timeout(value: object) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError("run_create_timeout must be finite")
+    if value <= 0 or value > _MAX_RUN_CREATE_TIMEOUT_SECONDS:
+        raise ValueError(
+            "run_create_timeout must be > 0 and <= "
+            f"{_MAX_RUN_CREATE_TIMEOUT_SECONDS:g} seconds"
+        )
+    return float(value)
+
+
 def _drop_freshness_timestamp(value: object, *, in_freshness: bool = False) -> object:
     """Ignore only the live probe timestamp while comparing CaseViews."""
 
@@ -159,11 +173,13 @@ class AssuranceHttpClient:
         base_url: str = "http://127.0.0.1:8010",
         *,
         timeout: float = 20.0,
+        run_create_timeout: float = _DEFAULT_RUN_CREATE_TIMEOUT_SECONDS,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = _validate_base_url(base_url)
         if type(timeout) not in (int, float) or timeout <= 0:
             raise ValueError("timeout must be positive")
+        self._run_create_timeout = _validate_run_create_timeout(run_create_timeout)
         parsed = httpx.URL(self.base_url)
         loopback_hosts = {"127.0.0.1", "localhost", "::1"}
         # Production use is local-first.  Tests may inject a MockTransport and
@@ -222,13 +238,19 @@ class AssuranceHttpClient:
         *,
         json_payload: Mapping[str, object] | None = None,
         headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
+        request_options: dict[str, object] = {
+            "json": dict(json_payload) if json_payload is not None else None,
+            "headers": dict(headers or {}),
+        }
+        if timeout is not None:
+            request_options["timeout"] = timeout
         try:
             response = self._client.request(
                 method,
                 endpoint,
-                json=dict(json_payload) if json_payload is not None else None,
-                headers=dict(headers or {}),
+                **request_options,
             )
         except httpx.RequestError as exc:
             raise AssuranceTransportError("assurance service is unavailable") from exc
@@ -270,6 +292,7 @@ class AssuranceHttpClient:
             "/api/assurance/runs",
             json_payload=request,
             headers={"Idempotency-Key": key},
+            timeout=self._run_create_timeout,
         )
         payload = self._json(response)
         try:

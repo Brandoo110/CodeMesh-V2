@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from assurance.run_service import (
     AssuranceRunError,
+    AssuranceRunOfficialEvidenceError,
     AssuranceRunPreconditionError,
     AssuranceRunRedactionError,
     AssuranceRunStaleError,
@@ -37,6 +38,7 @@ def _payload(intent) -> dict:
         "adr_paths": list(intent.adr_paths),
         "runbook_paths": list(intent.runbook_paths),
         "command_ids": list(intent.command_ids),
+        "official_evidence_run_id": intent.official_evidence_run_id,
         "changed_lines_total": intent.changed_lines_total,
         "external_side_effects": intent.external_side_effects,
         "provider_boundary": intent.provider_boundary,
@@ -139,6 +141,7 @@ def test_request_allowlist_and_idempotency_validation_are_sanitized(tmp_path):
     extra = _payload(intent) | {
         "api_key": "pseudo-secret-should-not-echo",
         "repository_path_secret": "/private/should-not-echo",
+        "official_evidence": ["/private/report.json"],
     }
     invalid_body = client.post(
         "/api/assurance/runs",
@@ -162,6 +165,34 @@ def test_request_allowlist_and_idempotency_validation_are_sanitized(tmp_path):
         assert "pseudo-secret" not in response.text
         assert "/private/should-not-echo" not in response.text
     assert service._reviewer_invoker.calls == 0
+
+
+def test_api_forwards_only_bounded_official_run_id(monkeypatch, tmp_path):
+    app, service, intent, _repository = _durable_app(tmp_path)
+    client = TestClient(app)
+    seen: list[str | None] = []
+
+    def fake_import(_intent, **_kwargs):
+        seen.append(_intent.official_evidence_run_id)
+        return ()
+
+    monkeypatch.setattr(service, "_import_official_evidence", fake_import)
+    body = _payload(intent) | {"official_evidence_run_id": "123"}
+    response = client.post(
+        "/api/assurance/runs",
+        headers={"Idempotency-Key": "run:official-id"},
+        json=body,
+    )
+
+    assert response.status_code == 201
+    assert seen == ["123"]
+
+    invalid = client.post(
+        "/api/assurance/runs",
+        headers={"Idempotency-Key": "run:official-int"},
+        json=body | {"official_evidence_run_id": 123},
+    )
+    assert invalid.status_code == 422
 
 
 def test_real_run_returns_only_public_projection_and_replays_from_same_repository(
@@ -237,6 +268,11 @@ class _UnusedRepository:
     ("error_type", "status_code", "code"),
     (
         (AssuranceRunValidationError, 422, "ASSURANCE_RUN_INVALID"),
+        (
+            AssuranceRunOfficialEvidenceError,
+            422,
+            "ASSURANCE_OFFICIAL_EVIDENCE_INVALID",
+        ),
         (AssuranceRunPreconditionError, 412, "ASSURANCE_RUN_PRECONDITION"),
         (AssuranceRunStaleError, 409, "ASSURANCE_RUN_STALE"),
         (IdempotencyConflictError, 409, "ASSURANCE_RUN_CONFLICT"),
@@ -280,6 +316,57 @@ def test_run_exception_mapping_is_stable_and_sanitized(
     assert "secret-token" not in response.text
     assert "/private/internal/repository" not in response.text
     assert service.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "expected"),
+    (
+        ("credential_missing_or_invalid", "credential_missing_or_invalid"),
+        ("github_transport", "github_transport"),
+        ("lineage_mismatch", "lineage_mismatch"),
+        ("artifact_structure_invalid", "artifact_structure_invalid"),
+        ("digest_or_size_mismatch", "digest_or_size_mismatch"),
+        ("unknown", "unknown"),
+        ("secret /private/report.zip", "unknown"),
+    ),
+)
+def test_official_reason_mapping_is_stable_and_allowlisted(
+    tmp_path, reason_code, expected
+):
+    service = _RaisingService(
+        AssuranceRunOfficialEvidenceError(reason_code=reason_code)
+    )
+    app = create_app(
+        assurance_run_dependencies=AssuranceRunWebDependencies(
+            service=service,
+            repository=_UnusedRepository(),
+        )
+    )
+    app.dependency_overrides[get_assurance_run_client] = lambda: "127.0.0.1"
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/assurance/runs",
+        headers={"Idempotency-Key": "run:reason"},
+        json={
+            "repository_path": str(tmp_path),
+            "repository_identity": "example/service",
+            "author": "author-agent",
+            "base_ref": "HEAD",
+            "task_path": "TASK.md",
+            "command_ids": ["check"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "ASSURANCE_OFFICIAL_EVIDENCE_INVALID"
+    assert response.json()["message"] == "official evidence report was not accepted"
+    assert response.json()["reason_codes"] == [
+        "OFFICIAL_EVIDENCE_INVALID",
+        expected,
+    ]
+    assert "secret" not in response.text
+    assert "/private/report.zip" not in response.text
 
 
 def test_reviewer_failure_is_a_blocked_successful_run_not_http_5xx(tmp_path):

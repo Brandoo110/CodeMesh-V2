@@ -23,9 +23,15 @@ import httpx
 from pydantic import SecretStr, ValidationError
 
 from assurance.artifacts import ArtifactStore
+from assurance.codex_cli_reviewer_invoker import CodexCliReviewerInvoker
 from assurance.commands import CommandSpec
 from assurance.contracts import Finding
-from assurance.digests import SubjectDigestInput, compute_subject_digest
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    SubjectDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+)
 from assurance.fixed_reviewer_invoker import (
     FixedOpenAICompatibleReviewerInvoker,
     FixedReviewerEndpoint,
@@ -48,6 +54,7 @@ from assurance.run_service import (
     AssuranceRunService,
     FreshnessSourceBinding,
     ReviewerRoute,
+    ReviewerInvoker,
 )
 from assurance.snapshot import GitSnapshotResult
 from orchestration.adapters import (
@@ -179,7 +186,7 @@ class AssuranceRuntime:
     repository: AssuranceWebRepository
     artifact_store: ArtifactStore
     context_builder: SafeReviewerContextBuilder
-    reviewer_invoker: FixedOpenAICompatibleReviewerInvoker
+    reviewer_invoker: ReviewerInvoker
     service: AssuranceRunService
     remediation_service: AssuranceRemediationService | None = None
     remediation_adapter: ModelAdapter | None = field(default=None, repr=False)
@@ -293,9 +300,11 @@ def _command_specs(value: object) -> tuple[CommandSpec, ...]:
 def _reviewer_route(value: object) -> ReviewerRoute:
     reviewer = _mapping(value, keys=_REVIEWER_KEYS, label="reviewer")
     provider = _text(reviewer["provider"], label="reviewer.provider")
-    if provider != "deepseek":
+    if provider not in {"deepseek", "openai-codex-desktop"}:
         raise _InvalidRuntimeConfig("reviewer.provider is not supported")
     model_ref = _text(reviewer["model_ref"], label="reviewer.model_ref")
+    if provider == "openai-codex-desktop" and model_ref != "gpt-5.6-luna":
+        raise _InvalidRuntimeConfig("reviewer.model_ref is not supported")
     timeout_seconds = _positive_int(
         reviewer["timeout_seconds"], label="reviewer.timeout_seconds"
     )
@@ -544,6 +553,19 @@ def _revalidate_remediation_root(path: object, configured_root: Path) -> Path:
     return resolved
 
 
+def _scope_kwargs_for_subject_identity_version(
+    subject_identity_version: object,
+    acceptance_scope_digest: str,
+) -> dict[str, str]:
+    """Return only the scope argument allowed by a persisted identity version."""
+
+    if subject_identity_version == "v1":
+        return {}
+    if subject_identity_version == "v2":
+        return {"acceptance_scope_digest": acceptance_scope_digest}
+    raise ValueError("unsupported subject identity version")
+
+
 def _scoped_run_config(
     config: AssuranceRuntimeConfig,
     root: Path,
@@ -658,6 +680,18 @@ def _build_remediation_service(
             raise ValueError("remediation request is not bound to its context")
 
         requested_subject_input: SubjectDigestInput | None = None
+        acceptance_scope_digest = compute_acceptance_scope_digest(
+            AcceptanceScopeDigestInput(
+                task_path=source_binding.task_path,
+                policy_paths=source_binding.policy_paths,
+                adr_paths=source_binding.adr_paths,
+                runbook_paths=source_binding.runbook_paths,
+            )
+        )
+        scope_kwargs = _scope_kwargs_for_subject_identity_version(
+            source_binding.subject_identity_version,
+            acceptance_scope_digest,
+        )
 
         def subject_builder(
             _patch_digest: str, *, workspace: IsolatedWorkspace
@@ -688,6 +722,7 @@ def _build_remediation_service(
                     rubric_version=source_binding.rubric_version,
                     artifact_store=scratch_store,
                     attachment_digests=source_binding.attachment_digests,
+                    **scope_kwargs,
                 )
                 if type(git_result) is not GitSnapshotResult:
                     raise TypeError("Git collector returned an invalid result")
@@ -697,6 +732,7 @@ def _build_remediation_service(
                     policy_version=source_binding.policy_version,
                     rubric_version=source_binding.rubric_version,
                     attachment_digests=source_binding.attachment_digests,
+                    **scope_kwargs,
                 )
             requested_subject_input = subject_input
             return subject_input, compute_subject_digest(subject_input)
@@ -794,7 +830,7 @@ def _read_config(config_ref: object) -> AssuranceRuntimeConfig | None:
 
 def _environment_values(
     environ: Mapping[str, str] | None,
-) -> tuple[object, object, str | None] | None:
+) -> tuple[object, str | None, str | None] | None:
     source = os.environ if environ is None else environ
     if not isinstance(source, Mapping):
         return None
@@ -807,7 +843,7 @@ def _environment_values(
     if type(config_ref) is not str or not config_ref.strip():
         return None
     if type(reviewer_api_key) is not str or not reviewer_api_key.strip():
-        return None
+        reviewer_api_key = None
     if type(remediation_api_key) is not str or not remediation_api_key.strip():
         remediation_api_key = None
     return config_ref, reviewer_api_key, remediation_api_key
@@ -815,7 +851,7 @@ def _environment_values(
 
 def _build_runtime(
     config: AssuranceRuntimeConfig,
-    reviewer_api_key: str,
+    reviewer_api_key: str | None,
     reviewer_transport: httpx.AsyncBaseTransport | None,
     remediation_api_key: str | None,
     remediation_adapter_factory: RemediationAdapterFactory | None,
@@ -846,15 +882,20 @@ def _build_runtime(
         repository.initialize()
         artifact_store = ArtifactStore(config.artifact_store_root)
         context_builder = SafeReviewerContextBuilder()
-        endpoint = FixedReviewerEndpoint(
-            route=config.reviewer,
-            base_url=_FIXED_REVIEWER_BASE_URL,
-            api_key=SecretStr(reviewer_api_key),
-        )
-        reviewer_invoker = FixedOpenAICompatibleReviewerInvoker(
-            endpoint,
-            transport=reviewer_transport,
-        )
+        if config.reviewer.provider == "openai-codex-desktop":
+            reviewer_invoker = CodexCliReviewerInvoker()
+        else:
+            if reviewer_api_key is None:
+                raise ValueError("DeepSeek reviewer requires an API key")
+            endpoint = FixedReviewerEndpoint(
+                route=config.reviewer,
+                base_url=_FIXED_REVIEWER_BASE_URL,
+                api_key=SecretStr(reviewer_api_key),
+            )
+            reviewer_invoker = FixedOpenAICompatibleReviewerInvoker(
+                endpoint,
+                transport=reviewer_transport,
+            )
         service = AssuranceRunService(
             artifact_store=artifact_store,
             reviewer_invoker=reviewer_invoker,
@@ -912,6 +953,8 @@ def load_assurance_runtime_from_environment(
     config_ref, reviewer_api_key, remediation_api_key = values
     config = _read_config(config_ref)
     if config is None:
+        return None
+    if config.reviewer.provider == "deepseek" and reviewer_api_key is None:
         return None
     try:
         config = _validate_paths(config)

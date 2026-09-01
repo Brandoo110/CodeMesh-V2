@@ -1,10 +1,13 @@
 """GP-02 focused tests for the in-memory AssuranceRunService orchestration."""
 
 import asyncio
+import hashlib
+import io
 import json
 import shutil
 import subprocess
 import threading
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -15,15 +18,22 @@ from pydantic import SecretStr
 
 from assurance.artifacts import ArtifactStore
 from assurance.commands import CommandSpec
+from assurance.contracts import Evidence
+from assurance.digests import (
+    AcceptanceScopeDigestInput,
+    compute_acceptance_scope_digest,
+)
 from assurance.fixed_reviewer_invoker import (
     FixedOpenAICompatibleReviewerInvoker,
     FixedReviewerEndpoint,
 )
+from assurance.manifest import EvidenceManifest
 from assurance.run_service import (
     AssuranceRunBundle,
     AssuranceRunConfig,
     AssuranceRunError,
     AssuranceRunIntent,
+    AssuranceRunOfficialEvidenceError,
     AssuranceRunRedactionError,
     AssuranceRunResult,
     AssuranceRunService,
@@ -38,6 +48,15 @@ from assurance.run_service import (
     ReviewerRoute,
     ReviewerRunRecord,
 )
+from assurance.official_evidence import (
+    OfficialEvidenceError,
+    OfficialEvidenceImport,
+    OfficialEvidenceReceipt,
+    OfficialEvidenceReport,
+    OfficialEvidenceSource,
+)
+
+NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -65,10 +84,28 @@ def _repository(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (root / "changed.txt").write_text("changed\n", encoding="utf-8")
-    _git(root, "add", "TASK.md", "POLICY.md")
+    workflow = root / ".github" / "workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "p-c-handover.yml").write_text(
+        "name: P-C Handover Experience\n", encoding="utf-8"
+    )
+    _git(root, "add", "TASK.md", "POLICY.md", ".github/workflows/p-c-handover.yml")
     _git(root, "commit", "-qm", "base")
     (root / "changed.txt").write_text("changed again\n", encoding="utf-8")
     return root
+
+
+def _add_api_contract(root: Path) -> None:
+    contract = root / "contracts" / "openapi.json"
+    contract.parent.mkdir()
+    contract.write_text(
+        '{"openapi":"3.0.0","paths":{}}\n', encoding="utf-8"
+    )
+    _git(root, "add", "contracts/openapi.json")
+    _git(root, "commit", "-qm", "add api contract")
+    api = root / "api"
+    api.mkdir()
+    (api / "routes.py").write_text("def route(): pass\n", encoding="utf-8")
 
 
 class _ContextBuilder:
@@ -76,7 +113,9 @@ class _ContextBuilder:
         self.disposition = disposition
         self.calls = 0
 
-    def prepare(self, evidences, *, artifact_store, subject_digest):
+    def prepare(
+        self, evidences, *, artifact_store, subject_digest, git_snapshot=None
+    ):
         self.calls += 1
         return ReviewerContextPlan(
             entries=tuple(
@@ -102,9 +141,10 @@ class _ContextBuilder:
 
 
 class _Reviewer:
-    def __init__(self, status="success", questions=False):
+    def __init__(self, status="success", questions=False, empty_findings=False):
         self.status = status
         self.questions = questions
+        self.empty_findings = empty_findings
         self.calls = 0
 
     async def invoke(self, prompt, *, run_id, route):
@@ -135,7 +175,19 @@ class _Reviewer:
             "schema_version": "v1",
             "subject_digest": prompt.input.subject.subject_digest,
             "rubric_hash": prompt.rubric_hash,
-            "findings": [],
+            "findings": (
+                []
+                if self.empty_findings
+                else [
+                    {
+                        "reviewer_role": "intent",
+                        "claim": "The acceptance scope is documented.",
+                        "evidence_refs": [prompt.input.contexts[0].evidence_id],
+                        "severity": "low",
+                        "confidence": 0.5,
+                    }
+                ]
+            ),
             "questions": list(questions),
         }
         return ReviewerInvocationResponse(
@@ -159,7 +211,14 @@ class _Committer:
         self.calls.append(("lookup", idempotency_key, request_digest))
         return self.cached
 
-    def commit(self, bundle, *, idempotency_key, request_digest):
+    def commit(
+        self,
+        bundle,
+        *,
+        idempotency_key,
+        request_digest,
+        official_proofs=(),
+    ):
         self.calls.append(("commit", idempotency_key, request_digest))
         self.cached = AssuranceRunResult(
             run_id=bundle.run_id,
@@ -168,6 +227,97 @@ class _Committer:
             bundle=bundle,
         )
         return self.cached
+
+
+class _OfficialProofCapturingCommitter:
+    def __init__(self):
+        self.proofs = ()
+
+    def lookup(self, _idempotency_key, _request_digest):
+        return None
+
+    def commit(
+        self,
+        bundle,
+        *,
+        idempotency_key,
+        request_digest,
+        official_proofs=(),
+    ):
+        self.proofs = official_proofs
+        return AssuranceRunResult(
+            run_id=bundle.run_id,
+            request_digest=request_digest,
+            cached=False,
+            bundle=bundle,
+        )
+
+
+class _ScopeIgnoringGitCollector:
+    def __init__(self):
+        self._collector = run_service_module.GitSnapshotCollector()
+        self.calls = []
+
+    def __getattr__(self, name):
+        return getattr(self._collector, name)
+
+    def collect(self, *args, **kwargs):
+        self.calls.append(kwargs.get("acceptance_scope_digest"))
+        kwargs.pop("acceptance_scope_digest", None)
+        return self._collector.collect(*args, **kwargs)
+
+
+class _LegacySignatureGitCollector:
+    def __init__(self):
+        self._collector = run_service_module.GitSnapshotCollector()
+
+    def __getattr__(self, name):
+        return getattr(self._collector, name)
+
+    def collect(
+        self,
+        repository_path,
+        *,
+        repository_identity,
+        base_ref,
+        task_digest,
+        policy_version,
+        rubric_version,
+        artifact_store,
+        attachment_digests=(),
+        collected_at=None,
+    ):
+        return self._collector.collect(
+            repository_path,
+            repository_identity=repository_identity,
+            base_ref=base_ref,
+            task_digest=task_digest,
+            policy_version=policy_version,
+            rubric_version=rubric_version,
+            artifact_store=artifact_store,
+            attachment_digests=attachment_digests,
+            collected_at=collected_at,
+        )
+
+
+class _RecordingScopedGitCollector:
+    def __init__(self):
+        self._collector = run_service_module.GitSnapshotCollector()
+        self.scope_digests = []
+
+    def __getattr__(self, name):
+        return getattr(self._collector, name)
+
+    def collect(self, *args, **kwargs):
+        self.scope_digests.append(kwargs.get("acceptance_scope_digest"))
+        return self._collector.collect(*args, **kwargs)
+
+
+class _ScopeIgnoringFinalGitCollector(_RecordingScopedGitCollector):
+    def collect(self, *args, **kwargs):
+        if self.scope_digests:
+            kwargs.pop("acceptance_scope_digest", None)
+        return super().collect(*args, **kwargs)
 
 
 def _service(
@@ -240,6 +390,486 @@ def test_intent_rejects_duplicate_or_empty_command_ids_before_io(tmp_path):
             task_path="TASK.md",
             command_ids=("check", "check"),
         )
+
+
+def test_acceptance_scope_changes_subject_and_case_identity(tmp_path):
+    service, intent = _service(tmp_path)
+    empty_scope = intent.model_copy(update={"policy_paths": ()})
+    declared_scope = intent
+
+    empty_result = asyncio.run(
+        service.run(empty_scope, idempotency_key="scope-empty")
+    )
+    service._committer.cached = None
+    declared_result = asyncio.run(
+        service.run(declared_scope, idempotency_key="scope-declared")
+    )
+
+    assert empty_result.bundle.subject.subject_digest != declared_result.bundle.subject.subject_digest
+    assert empty_result.bundle.case.case_id != declared_result.bundle.case.case_id
+    assert empty_result.bundle.binding.subject_digest != declared_result.bundle.binding.subject_digest
+
+
+def test_changed_scope_payload_under_old_idempotency_key_conflicts(tmp_path):
+    service, intent = _service(tmp_path)
+    first = asyncio.run(
+        service.run(
+            intent.model_copy(update={"policy_paths": ()}),
+            idempotency_key="scope-replay",
+        )
+    )
+    assert first.cached is False
+    with pytest.raises(run_service_module.IdempotencyConflictError):
+        asyncio.run(service.run(intent, idempotency_key="scope-replay"))
+
+
+def test_same_scope_new_run_keeps_subject_and_case_but_changes_run_id(tmp_path):
+    service, intent = _service(tmp_path)
+    first = asyncio.run(service.run(intent, idempotency_key="scope-run-1"))
+    service._committer.cached = None
+    second = asyncio.run(service.run(intent, idempotency_key="scope-run-2"))
+    assert second.cached is False
+    assert second.bundle.subject.subject_digest == first.bundle.subject.subject_digest
+    assert second.bundle.case.case_id == first.bundle.case.case_id
+    assert second.bundle.run_id != first.bundle.run_id
+
+
+def test_initial_fence_rejects_collector_that_ignores_scope(tmp_path):
+    service, intent = _service(tmp_path)
+    service._git_collector = _ScopeIgnoringGitCollector()
+
+    with pytest.raises(AssuranceRunStaleError, match="acceptance scope"):
+        asyncio.run(service.prepare(intent, idempotency_key="scope-ignored"))
+
+
+def test_initial_fence_rejects_legacy_collector_signature(tmp_path):
+    service, intent = _service(tmp_path)
+    service._git_collector = _LegacySignatureGitCollector()
+
+    with pytest.raises(AssuranceRunStaleError, match="acceptance scope"):
+        asyncio.run(service.prepare(intent, idempotency_key="scope-legacy"))
+
+
+def test_initial_and_final_fences_receive_and_bind_the_same_scope(tmp_path):
+    collector = _RecordingScopedGitCollector()
+    service, intent = _service(tmp_path)
+    service._git_collector = collector
+
+    bundle = asyncio.run(service.prepare(intent, idempotency_key="scope-recorded"))
+
+    expected_scope = compute_acceptance_scope_digest(
+        AcceptanceScopeDigestInput(
+            task_path=intent.task_path,
+            policy_paths=intent.policy_paths,
+            adr_paths=intent.adr_paths,
+            runbook_paths=intent.runbook_paths,
+        )
+    )
+    assert collector.scope_digests == [expected_scope, expected_scope]
+    assert bundle.freshness_source_binding.subject_identity_version == "v2"
+
+
+def test_final_fence_allows_ignored_count_only_subject_stability(tmp_path):
+    class _CountOnlyFinalGitCollector:
+        def __init__(self):
+            self._collector = run_service_module.GitSnapshotCollector()
+            self.calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._collector, name)
+
+        def collect(self, *args, **kwargs):
+            result = self._collector.collect(*args, **kwargs)
+            self.calls += 1
+            if self.calls == 2:
+                snapshot = result.snapshot.model_copy(
+                    update={
+                        "ignored_files_lower_bound": (
+                            result.snapshot.ignored_files_lower_bound + 1
+                        )
+                    }
+                )
+                return result.model_copy(update={"snapshot": snapshot})
+            return result
+
+    service, intent = _service(tmp_path)
+    service._git_collector = _CountOnlyFinalGitCollector()
+
+    bundle = asyncio.run(service.prepare(intent, idempotency_key="count-only-final"))
+
+    assert bundle.git.snapshot.ignored_files_lower_bound == 0
+
+
+def test_final_fence_rejects_collector_that_ignores_scope(tmp_path):
+    collector = _ScopeIgnoringFinalGitCollector()
+    service, intent = _service(tmp_path)
+    service._git_collector = collector
+
+    with pytest.raises(AssuranceRunStaleError, match="acceptance scope"):
+        asyncio.run(service.prepare(intent, idempotency_key="scope-final-ignored"))
+
+
+def _fake_official_import(
+    artifact_store: ArtifactStore,
+    *,
+    repository_path: Path,
+    kind: str,
+    subject_digest: str,
+    head_revision: str,
+    collected_at: datetime,
+) -> OfficialEvidenceImport:
+    def build_report(report_kind: str) -> tuple[OfficialEvidenceReport, bytes, bytes]:
+        result_path = (
+            "dependency-audit-result.json"
+            if report_kind == "dependency_audit"
+            else "ci-iac-result.json"
+        )
+        result_bytes = b'{"status":"success"}'
+        result_digest = "sha256:" + hashlib.sha256(result_bytes).hexdigest()
+        source_path = (
+            "TASK.md"
+            if report_kind == "dependency_audit"
+            else "POLICY.md"
+        )
+        source_bytes = (repository_path / source_path).read_bytes()
+        source = OfficialEvidenceSource(
+            path=source_path,
+            digest="sha256:" + hashlib.sha256(source_bytes).hexdigest(),
+            byte_size=len(source_bytes),
+        )
+        workflow_path = ".github/workflows/p-c-handover.yml"
+        workflow_bytes = (repository_path / workflow_path).read_bytes()
+        workflow_source = OfficialEvidenceSource(
+            path=workflow_path,
+            digest="sha256:" + hashlib.sha256(workflow_bytes).hexdigest(),
+            byte_size=len(workflow_bytes),
+        )
+        checks = ()
+        audit_command = "pnpm audit --prod --audit-level=high --json"
+        if report_kind == "ci_iac_validation":
+            checks = tuple(
+                {
+                    "name": name,
+                    "status": "success",
+                    "conclusion": "success",
+                }
+                for name in (
+                    "checkout",
+                    "install",
+                    "focused_checks",
+                    "build",
+                    "browser_walkthrough",
+                )
+            )
+            audit_command = None
+        report = OfficialEvidenceReport(
+            kind=report_kind,
+            repository_identity="example/service",
+            head_revision=head_revision,
+            subject_digest=subject_digest,
+            producer="collector." + report_kind,
+            source_paths=(source,),
+            workflow_definition=workflow_source,
+            workflow_name="P-C Handover Experience",
+            workflow_path=".github/workflows/p-c-handover.yml",
+            event="workflow_dispatch",
+            pull_request_number=7,
+            workflow_run_id="123",
+            workflow_run_attempt=1,
+            job_id="handover",
+            job_name="handover",
+            status="success",
+            conclusion="success",
+            result_path=result_path,
+            result_digest=result_digest,
+            result_byte_size=len(result_bytes),
+            checks=checks,
+            audit_command=audit_command,
+        )
+        report_bytes = json.dumps(
+            report.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return report, report_bytes, result_bytes
+
+    reports = {
+        report_kind: build_report(report_kind)
+        for report_kind in ("dependency_audit", "ci_iac_validation")
+    }
+    remote_buffer = io.BytesIO()
+    with zipfile.ZipFile(remote_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for report_kind, (report, report_bytes, result_bytes) in reports.items():
+            archive.writestr(
+                "dependency_audit.json"
+                if report_kind == "dependency_audit"
+                else "ci_iac_validation.json",
+                report_bytes,
+            )
+            archive.writestr(report.result_path, result_bytes)
+    remote_zip = remote_buffer.getvalue()
+    report, report_bytes, result_bytes = reports[kind]
+    source = report.source_paths[0]
+    workflow_source = report.workflow_definition
+    workflow_bytes = (repository_path / workflow_source.path).read_bytes()
+    result_digest = report.result_digest
+    remote_zip_digest = "sha256:" + hashlib.sha256(remote_zip).hexdigest()
+    receipt = OfficialEvidenceReceipt(
+        kind=kind,
+        subject_digest=subject_digest,
+        repository_identity="example/service",
+        head_revision=head_revision,
+        producer=report.producer,
+        source_paths=(source,),
+        workflow_definition=workflow_source,
+        workflow_name=report.workflow_name,
+        workflow_path=report.workflow_path,
+        event=report.event,
+        pull_request_number=report.pull_request_number,
+        workflow_run_id=report.workflow_run_id,
+        workflow_run_attempt=report.workflow_run_attempt,
+        job_id="456",
+        job_name="handover",
+        artifact_id="789",
+        artifact_name="p-c-official-validation-123",
+        artifact_digest=remote_zip_digest,
+        artifact_byte_size=len(remote_zip),
+        report_digest="sha256:" + hashlib.sha256(report_bytes).hexdigest(),
+        report_byte_size=len(report_bytes),
+        result_path=report.result_path,
+        result_digest=result_digest,
+        result_byte_size=len(result_bytes),
+        report=report,
+        result={"status": "success"},
+    )
+    receipt_bytes = json.dumps(
+        receipt.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    receipt_digest = artifact_store.put_bytes(receipt_bytes)
+    artifact_store.put_bytes(remote_zip)
+    evidence = Evidence(
+        evidence_id="ev_official_" + kind,
+        subject_digest=subject_digest,
+        kind=kind,
+        producer=report.producer,
+        artifact_digest=receipt_digest,
+        source_ref="github:official:" + kind + ":run:123:artifact:789:success",
+        trace_id="github:123:1:456",
+        status="success",
+        trust_level="observed",
+        collected_at=collected_at,
+    )
+    return OfficialEvidenceImport(
+        receipt=receipt,
+        evidence=evidence,
+        receipt_bytes=receipt_bytes,
+        receipt_digest=receipt_digest,
+        receipt_byte_size=len(receipt_bytes),
+        remote_zip_bytes=remote_zip,
+        remote_zip_digest=remote_zip_digest,
+        remote_zip_byte_size=len(remote_zip),
+        source_bindings=(source,),
+        workflow_definition=(workflow_source, workflow_bytes),
+    )
+
+
+class _FakeOfficialImporter:
+    calls = 0
+    verified = 0
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def import_run(self, run_id: str):
+        type(self).calls += 1
+        assert run_id == "123"
+        return tuple(
+            _fake_official_import(
+                self.kwargs["artifact_store"],
+                repository_path=self.kwargs["repository_path"],
+                kind=kind,
+                subject_digest=self.kwargs["subject_digest"],
+                head_revision=self.kwargs["head_revision"],
+                collected_at=self.kwargs["collected_at"],
+            )
+            for kind in ("dependency_audit", "ci_iac_validation")
+        )
+
+    def verify_import(self, _imported):
+        type(self).verified += 1
+
+
+def test_official_dependency_evidence_flows_through_manifest_risk_policy_and_bundle(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter)
+    service, intent = _service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    result = asyncio.run(service.run(intent, idempotency_key="official-dependency"))
+
+    assert [item.kind for item in result.bundle.evidence] == [
+        "git_snapshot",
+        "intake_documents",
+        "task_policy_adr",
+        "command_batch",
+        "evidence_manifest",
+        "dependency_audit",
+        "ci_iac_validation",
+    ]
+    assert any(
+        item.kind == "dependency_audit"
+        for item in result.bundle.manifest.manifest.entries
+    )
+    assert "dependency_audit" in result.bundle.risk.classification.required_collectors
+    assert result.bundle.policy.input.risk_result == result.bundle.risk
+    assert result.bundle.case.state == "EVIDENCE_COLLECTED"
+    assert _FakeOfficialImporter.calls == 1
+    assert _FakeOfficialImporter.verified == 2
+
+
+def test_official_commit_proof_carries_workflow_definition_bytes(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    committer = _OfficialProofCapturingCommitter()
+    service, intent = _service(tmp_path, committer=committer)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    result = asyncio.run(service.run(intent, idempotency_key="official-proof"))
+
+    assert result.bundle.case.state == "EVIDENCE_COLLECTED"
+    assert len(committer.proofs) == 2
+    assert {proof.kind for proof in committer.proofs} == {
+        "dependency_audit",
+        "ci_iac_validation",
+    }
+    assert all(proof.evidence_id in {item.evidence_id for item in result.bundle.evidence} for proof in committer.proofs)
+    assert all(
+        proof.workflow_definition[1]
+        == (intent.repository_path / ".github/workflows/p-c-handover.yml").read_bytes()
+        for proof in committer.proofs
+    )
+
+
+def test_missing_official_dependency_evidence_keeps_policy_blocked(tmp_path):
+    service, intent = _service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+
+    result = asyncio.run(service.run(intent, idempotency_key="missing-official"))
+
+    assert "dependency_audit" in result.bundle.risk.classification.required_collectors
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert result.bundle.policy.decision.reason_codes == (
+        "REQUIRED_COLLECTOR_MISSING",
+        "REQUIRED_REVIEWER_MISSING",
+    )
+    assert result.bundle.reviewer.status == "blocked_evidence"
+    assert result.bundle.reviewer.error_code == "OFFICIAL_EVIDENCE_MISSING"
+    assert service._reviewer_invoker.calls == 0
+    assert all(
+        item.kind not in {"dependency_audit", "ci_iac_validation"}
+        for item in result.bundle.evidence
+    )
+
+
+def test_provider_disabled_preflight_canonicalizes_mixed_blocked_reasons(tmp_path):
+    service, intent = _service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+
+    result = asyncio.run(service.run(intent, idempotency_key="mixed-blocked-reasons"))
+    receipt = result.bundle.execution_receipt
+    mixed_receipt = receipt.model_copy(
+        update={
+            "steps": (
+                receipt.steps[0].model_copy(
+                    update={
+                        "actual_role": "intent",
+                        "result": "failure",
+                        "schema_status": "invalid",
+                    }
+                ),
+                *receipt.steps[1:],
+            )
+        }
+    )
+    mixed_input = result.bundle.policy.input.model_copy(
+        update={"execution_receipts": (mixed_receipt,)}
+    )
+    mixed_policy = run_service_module.PolicyGate.evaluate(mixed_input)
+
+    assert mixed_policy.decision.outcome == "BLOCKED"
+    assert mixed_policy.decision.reason_codes == (
+        "REQUIRED_COLLECTOR_MISSING",
+        "REQUIRED_REVIEWER_MISSING",
+        "REQUIRED_REVIEWER_NOT_SUCCESS",
+    )
+    assert result.bundle.reviewer.status == "blocked_evidence"
+    assert result.bundle.reviewer.error_code == "OFFICIAL_EVIDENCE_MISSING"
+    assert service._reviewer_invoker.calls == 0
+
+
+def test_malformed_official_run_fails_before_reviewer_and_commit(tmp_path, monkeypatch):
+    class _MalformedImporter(_FakeOfficialImporter):
+        def import_run(self, _run_id):
+            raise OfficialEvidenceError()
+
+    monkeypatch.setattr(run_service_module, "OfficialEvidenceImporter", _MalformedImporter)
+    service, intent = _service(tmp_path)
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    with pytest.raises(AssuranceRunOfficialEvidenceError):
+        asyncio.run(service.run(intent, idempotency_key="malformed-official"))
+
+    assert not any(call[0] == "commit" for call in service._committer.calls)
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "expected"),
+    (
+        ("credential_missing_or_invalid", "credential_missing_or_invalid"),
+        ("github_transport", "github_transport"),
+        ("lineage_mismatch", "lineage_mismatch"),
+        ("artifact_structure_invalid", "artifact_structure_invalid"),
+        ("digest_or_size_mismatch", "digest_or_size_mismatch"),
+        ("unknown", "unknown"),
+        ("forged-secret /private/report.zip", "unknown"),
+        (None, "unknown"),
+    ),
+)
+def test_service_only_transmits_allowlisted_official_reason(
+    tmp_path, monkeypatch, reason_code, expected
+):
+    class _ReasonImporter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def import_run(self, _run_id):
+            raise OfficialEvidenceError(reason_code=reason_code)
+
+    monkeypatch.setattr(run_service_module, "OfficialEvidenceImporter", _ReasonImporter)
+    service, intent = _service(tmp_path)
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+
+    with pytest.raises(AssuranceRunOfficialEvidenceError) as caught:
+        asyncio.run(service.run(intent, idempotency_key="reason-" + str(expected)))
+
+    assert caught.value.reason_code == expected
+    assert not any(call[0] == "commit" for call in service._committer.calls)
 
 
 @pytest.mark.parametrize(
@@ -413,6 +1043,83 @@ def test_bundle_validator_binds_subject_facts_to_collected_results(
         bad_bundle._bind_all_results()
 
 
+def test_bundle_rejects_api_evidence_trace_id_bypass(tmp_path):
+    service, intent = _service(tmp_path)
+    _add_api_contract(intent.repository_path)
+
+    result = asyncio.run(service.run(intent, idempotency_key="api-trace-bypass"))
+    api = next(item for item in result.bundle.evidence if item.kind == "api_contract")
+    forged_api = api.model_copy(update={"trace_id": "forged:trace"})
+    forged_evidence = tuple(
+        forged_api if item.evidence_id == api.evidence_id else item
+        for item in result.bundle.evidence
+    )
+    forged_bundle = result.bundle.model_copy(update={"evidence": forged_evidence})
+
+    with pytest.raises(ValueError, match="api_contract Evidence is invalid"):
+        forged_bundle._bind_all_results()
+
+
+def test_bundle_rejects_cross_kind_duplicate_evidence_id_before_manifest_set_compare(
+    tmp_path, monkeypatch
+):
+    _FakeOfficialImporter.calls = 0
+    _FakeOfficialImporter.verified = 0
+    monkeypatch.setattr(
+        run_service_module, "OfficialEvidenceImporter", _FakeOfficialImporter
+    )
+    service, intent = _service(tmp_path)
+    (intent.repository_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3}\n', encoding="utf-8"
+    )
+    intent = intent.model_copy(update={"official_evidence_run_id": "123"})
+    bundle = asyncio.run(
+        service.run(intent, idempotency_key="cross-kind-duplicate")
+    ).bundle
+
+    duplicate_id = bundle.git.evidence.evidence_id
+    official = next(
+        item for item in bundle.evidence if item.kind == "dependency_audit"
+    )
+    forged_official = official.model_copy(update={"evidence_id": duplicate_id})
+    forged_evidence = tuple(
+        forged_official if item.evidence_id == official.evidence_id else item
+        for item in bundle.evidence
+    )
+
+    manifest_entries = tuple(
+        entry.model_copy(update={"evidence_id": duplicate_id})
+        if entry.evidence_id == official.evidence_id
+        else entry
+        for entry in bundle.manifest.manifest.entries
+    )
+    manifest_data = bundle.manifest.manifest.model_dump(mode="python")
+    manifest_data["entries"] = manifest_entries
+    forged_manifest = EvidenceManifest.model_construct(**manifest_data)
+    forged_manifest_result = bundle.manifest.model_copy(
+        update={"manifest": forged_manifest}
+    )
+    forged_risk_input = bundle.risk.input.model_copy(
+        update={"manifest": forged_manifest}
+    )
+    forged_risk = bundle.risk.model_copy(update={"input": forged_risk_input})
+    forged_policy_input = bundle.policy.input.model_copy(
+        update={"risk_result": forged_risk}
+    )
+    forged_policy = bundle.policy.model_copy(update={"input": forged_policy_input})
+    forged_bundle = bundle.model_copy(
+        update={
+            "evidence": forged_evidence,
+            "manifest": forged_manifest_result,
+            "risk": forged_risk,
+            "policy": forged_policy,
+        }
+    )
+
+    with pytest.raises(ValueError, match="evidence_id"):
+        forged_bundle._bind_all_results()
+
+
 @pytest.mark.parametrize("field_name", ["snapshot", "intake", "manifest"])
 def test_bundle_validator_binds_risk_input_to_exact_collected_results(
     tmp_path, field_name
@@ -532,6 +1239,7 @@ def test_prepare_returns_complete_bundle_without_committer_io(tmp_path):
     assert bundle.evidence == (
         bundle.git.evidence,
         bundle.intake.evidence,
+        next(item for item in bundle.evidence if item.kind == "task_policy_adr"),
         bundle.commands.evidence,
         bundle.manifest.evidence,
     )
@@ -541,6 +1249,16 @@ def test_prepare_returns_complete_bundle_without_committer_io(tmp_path):
     assert bundle.policy.input.execution_receipts == (bundle.execution_receipt,)
     assert bundle.freshness_source_binding.subject == bundle.subject
     assert committer.calls == []
+
+
+def test_default_run_service_git_collector_profile_is_one_mib(tmp_path):
+    service, _ = _service(tmp_path)
+
+    assert service._git_collector.max_diff_bytes == 1_048_576
+    assert (
+        run_service_module._DEFAULT_GIT_COLLECTOR_PROFILE["max_diff_bytes"]
+        == 1_048_576
+    )
 
 
 def test_run_cache_hit_skips_prepare_and_miss_prepares_once_then_commits_once(
@@ -607,7 +1325,14 @@ def test_unsafe_redaction_blocks_reviewer_and_commit(tmp_path):
 
 def test_redaction_adapter_error_fails_without_commit(tmp_path):
     class _ErrorContext(_ContextBuilder):
-        def prepare(self, evidences, *, artifact_store, subject_digest):
+        def prepare(
+            self,
+            evidences,
+            *,
+            artifact_store,
+            subject_digest,
+            git_snapshot=None,
+        ):
             self.calls += 1
             raise RuntimeError("redaction adapter unavailable")
 
@@ -640,6 +1365,131 @@ def test_reviewer_failure_is_a_failed_receipt_not_a_success_invocation(tmp_path,
     assert result.bundle.execution_receipt.overall_result in {"failure", "cancelled"}
     assert result.bundle.policy.decision.outcome == "BLOCKED"
     assert "REQUIRED_REVIEWER_NOT_SUCCESS" in result.bundle.policy.decision.reason_codes
+    assert all(step.fallback_reason is None for step in result.bundle.execution_receipt.steps)
+
+
+def test_new_safe_reviewer_failure_stage_is_durable_without_raw_transport_data(tmp_path):
+    class _LaunchFailureReviewer:
+        async def invoke(self, prompt, *, run_id, route):
+            return ReviewerInvocationResponse(
+                status="failure",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                error_code="REVIEWER_PROCESS_LAUNCH_FAILURE",
+            )
+
+    service, intent = _service(
+        tmp_path,
+        reviewer=_LaunchFailureReviewer(),
+        command_specs=(
+            CommandSpec(
+                command_id="check",
+                kind="test",
+                argv=("/usr/bin/true",),
+                cwd=".",
+                timeout_seconds=5.0,
+                max_output_bytes=4096,
+            ),
+        ),
+    )
+    result = asyncio.run(service.run(intent, idempotency_key="run-safe-stage"))
+
+    assert result.bundle.reviewer.status == "failure"
+    assert result.bundle.reviewer.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert result.bundle.reviewer.schema_status == "not_produced"
+    assert result.bundle.reviewer.raw_response_artifact_digest is None
+    assert result.bundle.reviewer.canonical_response_digest is None
+    assert result.bundle.reviewer.result_digest is None
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert all(
+        step.fallback_reason == "process_launch"
+        for step in result.bundle.execution_receipt.steps
+    )
+    serialized = json.dumps(result.model_dump(mode="json"), sort_keys=True)
+    for secret in ("launch secret", "/private/credential", "--token=do-not-leak"):
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    "failure_category",
+    (
+        "auth",
+        "rate_or_quota",
+        "model_availability",
+        "network_or_transport",
+        "provider_or_server",
+        "permission_or_policy",
+    ),
+)
+def test_categorized_nonzero_failure_stays_generic_and_blocks_persistence(
+    tmp_path, failure_category
+):
+    class _CategorizedFailureReviewer:
+        async def invoke(self, prompt, *, run_id, route):
+            return ReviewerInvocationResponse(
+                status="failure",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                error_code="REVIEWER_PROCESS_NONZERO_EXIT",
+                failure_category=failure_category,
+            )
+
+    service, intent = _service(tmp_path, reviewer=_CategorizedFailureReviewer())
+    result = asyncio.run(
+        service.run(intent, idempotency_key="run-categorized-" + failure_category)
+    )
+
+    assert result.bundle.reviewer.status == "failure"
+    assert result.bundle.reviewer.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+    assert all(
+        step.fallback_reason == failure_category
+        for step in result.bundle.execution_receipt.steps
+    )
+    assert all(step.schema_status == "not_produced" for step in result.bundle.execution_receipt.steps)
+    serialized = json.dumps(result.model_dump(mode="json"), sort_keys=True)
+    assert "REVIEWER_PROCESS_NONZERO_EXIT" not in serialized
+
+
+def test_unknown_category_preserves_historical_nonzero_receipt_stage(tmp_path):
+    class _UnknownFailureReviewer:
+        async def invoke(self, prompt, *, run_id, route):
+            return ReviewerInvocationResponse(
+                status="failure",
+                provider=route.provider,
+                model_ref=route.model_ref,
+                error_code="REVIEWER_PROVIDER_FAILURE",
+                failure_category="unknown",
+            )
+
+    service, intent = _service(tmp_path, reviewer=_UnknownFailureReviewer())
+    result = asyncio.run(
+        service.run(intent, idempotency_key="run-unknown-category")
+    )
+
+    assert result.bundle.reviewer.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert all(
+        step.fallback_reason == "nonzero_exit"
+        for step in result.bundle.execution_receipt.steps
+    )
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
+
+
+def test_empty_reviewer_findings_are_blocked_not_published(tmp_path):
+    service, intent = _service(tmp_path, reviewer=_Reviewer(empty_findings=True))
+
+    result = asyncio.run(
+        service.run(intent, idempotency_key="run-empty-findings")
+    )
+
+    assert result.bundle.reviewer.status == "failure"
+    assert result.bundle.reviewer.error_code == "REVIEWER_PROVIDER_FAILURE"
+    assert result.bundle.execution_receipt.overall_result == "failure"
+    assert all(
+        step.fallback_reason == "empty_findings"
+        for step in result.bundle.execution_receipt.steps
+    )
+    assert result.bundle.policy.decision.outcome == "BLOCKED"
 
 
 @pytest.mark.parametrize("variant", ["timeout", "cancelled", "invalid_json", "blocked", "failure_valid"])
@@ -818,7 +1668,15 @@ def test_unverified_transport_is_normalized_before_persisting_valid(tmp_path):
                 "schema_version": "v1",
                 "subject_digest": prompt.input.subject.subject_digest,
                 "rubric_hash": prompt.rubric_hash,
-                "findings": [],
+                "findings": [
+                    {
+                        "reviewer_role": "intent",
+                        "claim": "The acceptance scope is documented.",
+                        "evidence_refs": [prompt.input.contexts[0].evidence_id],
+                        "severity": "low",
+                        "confidence": 0.5,
+                    }
+                ],
                 "questions": [],
             }
             return ReviewerInvocationResponse(

@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import inspect
 import json
 import os
 import stat
+import subprocess
+import zipfile
+from types import MappingProxyType
 from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,10 +35,12 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
 from .artifacts import ArtifactStore
+from .api_contract import ApiContractCollector, ApiContractResult
 from .commands import (
     CommandBatchResult,
     CommandSpec,
@@ -48,12 +54,33 @@ from .contracts import (
     ExecutionStep,
     Finding,
 )
-from .digests import normalize_repo_path, normalize_repository_identity
-from .intake import IntakeResult, TaskPolicyCollector
+from .digests import (
+    AcceptanceScopeDigestInput,
+    SubjectDigestInput,
+    compute_acceptance_scope_digest,
+    compute_subject_digest,
+    normalize_repo_path,
+    normalize_repository_identity,
+)
+from .intake import (
+    IntakeResult,
+    TaskPolicyCollector,
+    _build_task_policy_adr_evidence,
+)
 from .manifest import (
     EvidenceManifestBuilder,
     EvidenceManifestInput,
     EvidenceManifestResult,
+)
+from .official_evidence import (
+    OFFICIAL_EVIDENCE_KINDS,
+    OFFICIAL_EVIDENCE_REASON_CODES,
+    OfficialEvidenceImport,
+    OfficialEvidenceSource,
+    OfficialEvidenceError,
+    OfficialEvidenceImporter,
+    parse_official_evidence_receipt,
+    parse_official_evidence_report,
 )
 from .policy import PolicyEvaluationInput, PolicyGate, PolicyGateResult
 from .risk import (
@@ -73,7 +100,11 @@ from .single_reviewer import (
     SingleReviewerResult,
     SingleStrongReviewer,
 )
-from .snapshot import GitSnapshotCollector, GitSnapshotResult
+from .snapshot import (
+    GitSnapshotCollector,
+    GitSnapshotResult,
+    _DEFAULT_MAX_DIFF_BYTES,
+)
 from .state_machine import (
     AcceptanceBinding,
     AcceptanceEvent,
@@ -88,6 +119,17 @@ _DEFAULT_POLICY_VERSION = "gate.v0"
 _DEFAULT_RUBRIC_VERSION = "single_general.v0"
 _DEFAULT_ORCHESTRATION_VERSION = "golden.v1"
 _DEFAULT_ROUTING_RULE = "single_general.v0:shared_invocation"
+SUPPORTED_COLLECTOR_EVIDENCE_KINDS = (
+    "git_snapshot",
+    "intake_documents",
+    "task_policy_adr",
+    "command_batch",
+    "evidence_manifest",
+    "api_contract",
+    "dependency_audit",
+    "ci_iac_validation",
+)
+MAX_SUPPORTED_EVIDENCE = len(SUPPORTED_COLLECTOR_EVIDENCE_KINDS)
 _REVIEWER_ROLES = ("intent", "architecture", "operability")
 _SAFE_REDACTION = frozenset({"declared_redacted", "not_applicable"})
 _REVIEWER_FAILURE_CODES = {
@@ -96,9 +138,46 @@ _REVIEWER_FAILURE_CODES = {
     "cancelled": "REVIEWER_CANCELLED",
     "budget_exceeded": "REVIEWER_BUDGET_EXCEEDED",
 }
+_REVIEWER_FAILURE_STAGE_CODES = MappingProxyType(
+    {
+        "process_launch": "REVIEWER_PROCESS_LAUNCH_FAILURE",
+        "process_communication": "REVIEWER_PROCESS_COMMUNICATION_FAILURE",
+        "nonzero_exit": "REVIEWER_PROCESS_NONZERO_EXIT",
+        "event_stream_invalid": "REVIEWER_EVENT_STREAM_INVALID",
+        "final_missing": "REVIEWER_RESPONSE_MISSING",
+        "final_schema_invalid": "REVIEWER_RESPONSE_SCHEMA_INVALID",
+    }
+)
+_REVIEWER_FAILURE_CATEGORIES = frozenset(
+    {
+        "auth",
+        "rate_or_quota",
+        "model_availability",
+        "network_or_transport",
+        "provider_or_server",
+        "permission_or_policy",
+        "unknown",
+    }
+)
+_REVIEWER_CLASSIFIED_FAILURE_CATEGORIES = frozenset(
+    _REVIEWER_FAILURE_CATEGORIES - {"unknown"}
+)
+_REVIEWER_FAILURE_CODE_FACTS = {
+    code: ("REVIEWER_PROVIDER_FAILURE", stage)
+    for stage, code in _REVIEWER_FAILURE_STAGE_CODES.items()
+}
+_REVIEWER_FAILURE_CODE_FACTS["REVIEWER_RESPONSE_MISSING"] = (
+    "REVIEWER_RESPONSE_MISSING",
+    "final_missing",
+)
+_REVIEWER_FAILURE_CODE_FACTS = MappingProxyType(_REVIEWER_FAILURE_CODE_FACTS)
+_REVIEWER_TRANSPORT_FAILURE_CODES = frozenset(
+    {"REVIEWER_PROVIDER_FAILURE", "REVIEWER_RESPONSE_MISSING"}
+).union(_REVIEWER_FAILURE_CODE_FACTS)
 _REVIEWER_ERROR_CODES = frozenset(
     {
         "REDACTION_UNSAFE",
+        "OFFICIAL_EVIDENCE_MISSING",
         "REVIEWER_PROVIDER_FAILURE",
         "REVIEWER_TIMEOUT",
         "REVIEWER_CANCELLED",
@@ -113,10 +192,11 @@ _REVIEWER_STATUS_ERROR_CODES = {
     "cancelled": frozenset({"REVIEWER_CANCELLED"}),
     "budget_exceeded": frozenset({"REVIEWER_BUDGET_EXCEEDED"}),
     "blocked_redaction": frozenset({"REDACTION_UNSAFE"}),
+    "blocked_evidence": frozenset({"OFFICIAL_EVIDENCE_MISSING"}),
     "invalid_json": frozenset({"REVIEWER_INVALID_JSON"}),
 }
 _DEFAULT_GIT_COLLECTOR_PROFILE = {
-    "max_diff_bytes": 262144,
+    "max_diff_bytes": _DEFAULT_MAX_DIFF_BYTES,
     "max_files": 500,
     "max_file_bytes": 5_000_000,
     "command_timeout_seconds": 10.0,
@@ -142,6 +222,36 @@ def _sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
+def _api_evidence_id(
+    subject_digest: str,
+    head_revision: str,
+    evidence: Evidence,
+) -> str:
+    material = "|".join(
+        (
+            subject_digest,
+            head_revision,
+            "contracts/openapi.json",
+            evidence.artifact_digest,
+            evidence.status,
+        )
+    ).encode("ascii")
+    return "ev_api_contract_" + hashlib.sha256(material).hexdigest()[:32]
+
+
+def _api_contract_required(snapshot: Any) -> bool:
+    """Mirror the risk module's public-API path signal without I/O."""
+
+    for change in snapshot.changes:
+        segments = change.path.lower().split("/")
+        if (
+            any(segment in {"api", "routes", "openapi"} for segment in segments)
+            or segments[-1] in {"openapi.json", "openapi.yaml", "openapi.yml"}
+        ):
+            return True
+    return False
+
+
 def _latency_ms(started: datetime, completed: datetime) -> int:
     delta = completed - started
     micros = (
@@ -149,6 +259,14 @@ def _latency_ms(started: datetime, completed: datetime) -> int:
         + delta.microseconds
     )
     return micros // 1000
+
+
+def _reviewer_failure_facts(
+    error_code: str | None,
+) -> tuple[str | None, str | None]:
+    """Decode only the fixed transport failure grammar into durable facts."""
+
+    return _REVIEWER_FAILURE_CODE_FACTS.get(error_code, (error_code, None))
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -201,6 +319,35 @@ class AssuranceRunValidationError(AssuranceRunError, ValueError):
 
 class AssuranceRunPreconditionError(AssuranceRunError):
     """A required external-side-effect precondition was not satisfied."""
+
+
+class AssuranceRunOfficialEvidenceError(AssuranceRunPreconditionError):
+    """A supplied official GitHub run was missing, invalid, or drifted."""
+
+    message = "official evidence precondition was not satisfied"
+
+    def __init__(
+        self,
+        *_args: object,
+        reason_code: object = None,
+        reason: object = None,
+    ) -> None:
+        candidate = reason_code if reason_code is not None else reason
+        if candidate is None and len(_args) == 1:
+            candidate = _args[0]
+        if type(candidate) is not str or candidate not in OFFICIAL_EVIDENCE_REASON_CODES:
+            candidate = "unknown"
+        self.reason_code = candidate
+        super().__init__()
+
+    def __str__(self) -> str:
+        return self.message
+
+    @property
+    def reason(self) -> str:
+        """Compatibility view over the single allowlisted failure reason."""
+
+        return self.reason_code
 
 
 class AssuranceRunStaleError(AssuranceRunError):
@@ -304,6 +451,7 @@ class FreshnessSourceBinding(BaseModel):
     subject: ChangeSubject
     author: str = Field(min_length=1)
     author_provenance: Literal["caller_declared"] = "caller_declared"
+    subject_identity_version: Literal["v1", "v2"] = "v1"
 
     @field_validator("repository_path")
     @classmethod
@@ -393,6 +541,41 @@ class FreshnessSourceBinding(BaseModel):
         if self.subject.policy_version != self.policy_version:
             raise ValueError("source policy version must match subject")
         return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_versioned(self, handler) -> dict[str, object]:
+        payload = handler(self)
+        if self.subject_identity_version == "v1":
+            payload.pop("subject_identity_version", None)
+        return payload
+
+
+@dataclass(frozen=True)
+class _OfficialEvidenceCommitProof:
+    """Verified official bytes handed only to the internal commit seam."""
+
+    evidence_id: str
+    kind: str
+    subject_digest: str
+    evidence_mode: Literal["official"]
+    workflow_run_id: str
+    workflow_run_attempt: int
+    job_id: str
+    artifact_id: str
+    artifact_digest: str
+    artifact_byte_size: int
+    artifact_bytes: bytes
+    receipt_digest: str
+    receipt_byte_size: int
+    receipt_bytes: bytes
+    report_digest: str
+    report_byte_size: int
+    report_bytes: bytes
+    result_digest: str
+    result_byte_size: int
+    result_bytes: bytes
+    source_bindings: tuple[tuple[OfficialEvidenceSource, bytes], ...]
+    workflow_definition: tuple[OfficialEvidenceSource, bytes]
 
 
 class ReviewerRoute(BaseModel):
@@ -506,6 +689,7 @@ class AssuranceRunIntent(BaseModel):
     adr_paths: tuple[str, ...] = ()
     runbook_paths: tuple[str, ...] = ()
     command_ids: tuple[str, ...] = Field(min_length=1, max_length=_MAX_COMMANDS)
+    official_evidence_run_id: str | None = None
     changed_lines_total: StrictInt | None = Field(default=None, ge=0)
     external_side_effects: Literal["none_declared", "present_declared", "unknown"] = (
         "unknown"
@@ -592,6 +776,17 @@ class AssuranceRunIntent(BaseModel):
             result.append(item)
         return tuple(result)
 
+    @field_validator("official_evidence_run_id", mode="before")
+    @classmethod
+    def _official_evidence_run_id(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if type(value) is not str or not value.isascii() or not value.isdecimal():
+            raise ValueError("official_evidence_run_id must be a positive numeric string")
+        if value == "0" or value.startswith("0") or len(value) > 19:
+            raise ValueError("official_evidence_run_id must be a positive numeric string")
+        return value
+
 
 class ReviewerContextPlanEntry(BaseModel):
     """One redaction decision and optional safe context for one Evidence."""
@@ -615,7 +810,7 @@ class ReviewerContextPlanEntry(BaseModel):
 
 
 class ReviewerContextPlan(BaseModel):
-    """A one-to-one redaction assessment for the three base Evidence items."""
+    """A one-to-one redaction assessment for every collected Evidence item."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -649,6 +844,15 @@ class ReviewerInvocationResponse(BaseModel):
     ] = "not_produced"
     error_code: str | None = Field(default=None, min_length=1)
     error_message: str | None = Field(default=None, min_length=1)
+    failure_category: Literal[
+        "auth",
+        "rate_or_quota",
+        "model_availability",
+        "network_or_transport",
+        "provider_or_server",
+        "permission_or_policy",
+        "unknown",
+    ] | None = None
 
     @field_validator("raw_response", mode="before")
     @classmethod
@@ -660,7 +864,7 @@ class ReviewerInvocationResponse(BaseModel):
     @model_validator(mode="after")
     def _success_facts(self) -> "ReviewerInvocationResponse":
         expected_error_codes = {
-            "failure": {"REVIEWER_PROVIDER_FAILURE", "REVIEWER_RESPONSE_MISSING"},
+            "failure": _REVIEWER_TRANSPORT_FAILURE_CODES,
             "timeout": {"REVIEWER_TIMEOUT"},
             "cancelled": {"REVIEWER_CANCELLED"},
             "budget_exceeded": {"REVIEWER_BUDGET_EXCEEDED"},
@@ -670,7 +874,11 @@ class ReviewerInvocationResponse(BaseModel):
                 raise ValueError("transport success must be unverified")
             if self.raw_response is None or not self.raw_response:
                 raise ValueError("transport success requires nonempty raw_response")
-            if self.error_code is not None or self.error_message is not None:
+            if (
+                self.error_code is not None
+                or self.error_message is not None
+                or self.failure_category is not None
+            ):
                 raise ValueError("transport success must not carry error facts")
         else:
             if self.raw_response is not None:
@@ -681,6 +889,16 @@ class ReviewerInvocationResponse(BaseModel):
                 raise ValueError("reviewer status and error_code do not match")
             if self.error_message is not None:
                 raise ValueError("reviewer error_message is not a domain fact")
+            if self.failure_category is not None:
+                if self.status != "failure":
+                    raise ValueError("failure category is only valid for nonzero failure")
+                if self.error_code not in {
+                    "REVIEWER_PROVIDER_FAILURE",
+                    _REVIEWER_FAILURE_STAGE_CODES["nonzero_exit"],
+                }:
+                    raise ValueError("failure category requires a nonzero-exit code")
+                if self.failure_category not in _REVIEWER_FAILURE_CATEGORIES:
+                    raise ValueError("failure category is not a stable enum value")
         usage_values = (self.input_tokens, self.output_tokens, self.cost_usd)
         if self.usage_status == "measured" and any(
             value is None for value in usage_values
@@ -705,6 +923,7 @@ class ReviewerRunRecord(BaseModel):
         "cancelled",
         "budget_exceeded",
         "blocked_redaction",
+        "blocked_evidence",
         "invalid_json",
     ]
     planned_route: ReviewerRoute
@@ -728,6 +947,7 @@ class ReviewerRunRecord(BaseModel):
     cost_usd: float | None = Field(default=None, ge=0)
     error_code: Literal[
         "REDACTION_UNSAFE",
+        "OFFICIAL_EVIDENCE_MISSING",
         "REVIEWER_PROVIDER_FAILURE",
         "REVIEWER_TIMEOUT",
         "REVIEWER_CANCELLED",
@@ -796,7 +1016,7 @@ class ReviewerRunRecord(BaseModel):
             ):
                 raise ValueError("invalid_json reviewer must not carry canonical or result facts")
         else:
-            if self.status == "blocked_redaction":
+            if self.status in {"blocked_redaction", "blocked_evidence"}:
                 expected_facts = (
                     self.prompt_id,
                     self.prompt_digest,
@@ -836,9 +1056,9 @@ class ReviewerRunRecord(BaseModel):
                 raise ValueError("failed reviewer must not carry success result facts")
             if self.schema_status != "not_produced":
                 raise ValueError("failed reviewer must not claim a produced schema")
-            if self.status == "blocked_redaction":
+            if self.status in {"blocked_redaction", "blocked_evidence"}:
                 if self.schema_status != "not_produced":
-                    raise ValueError("redaction-blocked reviewer must not claim a schema")
+                    raise ValueError("blocked reviewer must not claim a schema")
         if self.usage_status == "measured" and (
             self.input_tokens is None
             or self.output_tokens is None
@@ -865,6 +1085,7 @@ def _validate_reviewer_receipt_binding(
         "cancelled": ("cancelled", "cancelled"),
         "budget_exceeded": ("failure", "failure"),
         "blocked_redaction": ("blocked", "blocked"),
+        "blocked_evidence": ("blocked", "blocked"),
         "invalid_json": ("failure", "failure"),
     }
     expected_step_result, expected_overall = expected_results[reviewer.status]
@@ -885,7 +1106,7 @@ def _validate_reviewer_receipt_binding(
             raise ValueError("reviewer status does not match receipt step result")
         if step.schema_status != reviewer.schema_status:
             raise ValueError("reviewer schema status does not match receipt")
-        if reviewer.status == "blocked_redaction":
+        if reviewer.status in {"blocked_redaction", "blocked_evidence"}:
             if (
                 step.actual_role is not None
                 or step.model_ref is not None
@@ -933,7 +1154,9 @@ class AssuranceRunBundle(BaseModel):
     commands: CommandBatchResult
     manifest: EvidenceManifestResult
     risk: RiskClassificationResult
-    evidence: tuple[Evidence, ...] = Field(min_length=4)
+    evidence: tuple[Evidence, ...] = Field(
+        min_length=4, max_length=MAX_SUPPORTED_EVIDENCE
+    )
     findings: tuple[Finding, ...] = ()
     questions: tuple[ReviewQuestion, ...] = ()
     reviewer: ReviewerRunRecord
@@ -993,14 +1216,106 @@ class AssuranceRunBundle(BaseModel):
             raise ValueError("risk input intake must match bundle intake snapshot")
         if self.risk.input.manifest != self.manifest.manifest:
             raise ValueError("risk input manifest must match bundle manifest")
-        expected = (
-            self.git.evidence,
-            self.intake.evidence,
-            self.commands.evidence,
-            self.manifest.evidence,
+        dedicated_evidence = tuple(
+            item for item in self.evidence if item.kind == "task_policy_adr"
         )
-        if self.evidence != expected:
-            raise ValueError("bundle evidence must use the fixed collector order")
+        if len(dedicated_evidence) > 1:
+            raise ValueError("bundle task_policy_adr Evidence must be unique")
+        if dedicated_evidence:
+            dedicated = dedicated_evidence[0]
+            expected = (
+                self.git.evidence,
+                self.intake.evidence,
+                dedicated,
+                self.commands.evidence,
+                self.manifest.evidence,
+            )
+            if self.evidence[:5] != expected:
+                raise ValueError(
+                    "bundle evidence must use the fixed collector order"
+                )
+            if (
+                dedicated.producer != "collector.task_policy_adr"
+                or dedicated.trace_id is not None
+                or dedicated.status not in {"success", "truncated"}
+                or dedicated.trust_level != "deterministic"
+                or dedicated.subject_digest != subject_digest
+                or dedicated.source_ref != f"task_policy_adr:{subject_digest}"
+                or dedicated.artifact_digest == self.intake.evidence.artifact_digest
+                or dedicated.evidence_id
+                != "ev_task_policy_adr_"
+                + hashlib.sha256(
+                    (subject_digest + dedicated.artifact_digest).encode("ascii")
+                ).hexdigest()[:32]
+            ):
+                raise ValueError("bundle task_policy_adr Evidence is invalid")
+            tail_evidence = self.evidence[5:]
+        else:
+            expected = (
+                self.git.evidence,
+                self.intake.evidence,
+                self.commands.evidence,
+                self.manifest.evidence,
+            )
+            if self.evidence[:4] != expected:
+                raise ValueError(
+                    "bundle evidence must use the fixed collector order"
+                )
+            tail_evidence = self.evidence[4:]
+        api_evidence = tuple(
+            item for item in tail_evidence if item.kind == "api_contract"
+        )
+        official_evidence = tuple(
+            item for item in tail_evidence if item.kind in OFFICIAL_EVIDENCE_KINDS
+        )
+        if len(api_evidence) > 1:
+            raise ValueError("bundle api_contract Evidence must be unique")
+        if any(
+            item.producer != "collector.api_contract"
+            or item.trace_id is not None
+            or item.status not in {"success", "truncated"}
+            or item.trust_level != "deterministic"
+            or item.subject_digest != subject_digest
+            or item.source_ref != "api_contract:contracts/openapi.json"
+            or item.evidence_id
+            != _api_evidence_id(subject_digest, self.git.snapshot.head_revision, item)
+            for item in api_evidence
+        ):
+            raise ValueError("bundle api_contract Evidence is invalid")
+        if len(official_evidence) > len(OFFICIAL_EVIDENCE_KINDS):
+            raise ValueError("bundle contains too many official Evidence items")
+        if any(
+            item.producer != f"collector.{item.kind}"
+            or item.status != "success"
+            or item.trust_level != "observed"
+            or item.subject_digest != subject_digest
+            for item in official_evidence
+        ):
+            raise ValueError("bundle official Evidence is invalid")
+        if len({item.kind for item in official_evidence}) != len(official_evidence):
+            raise ValueError("bundle official Evidence kinds must be unique")
+        if len(api_evidence) + len(official_evidence) != len(tail_evidence):
+            raise ValueError("bundle Evidence contains an unsupported collector kind")
+        expected_tail = api_evidence + official_evidence
+        if tail_evidence != expected_tail:
+            raise ValueError("bundle Evidence must use the fixed collector order")
+        bundle_evidence_ids = tuple(item.evidence_id for item in self.evidence)
+        manifest_entry_ids = tuple(
+            item.evidence_id for item in self.manifest.manifest.entries
+        )
+        if len(bundle_evidence_ids) != len(set(bundle_evidence_ids)):
+            raise ValueError("bundle Evidence evidence_id values must be unique")
+        if len(manifest_entry_ids) != len(set(manifest_entry_ids)):
+            raise ValueError("manifest Evidence evidence_id values must be unique")
+        expected_manifest_evidence_ids = {
+            item.evidence_id
+            for item in self.evidence
+            if item != self.manifest.evidence
+        }
+        if {
+            item.evidence_id for item in self.manifest.manifest.entries
+        } != expected_manifest_evidence_ids:
+            raise ValueError("manifest must cover every bundle Evidence")
         if self.execution_receipt.subject_digest != subject_digest:
             raise ValueError("receipt must bind to subject")
         if self.policy.decision.subject_digest != subject_digest:
@@ -1046,7 +1361,7 @@ class AssuranceRunBundle(BaseModel):
                 raise ValueError("successful reviewer must bind SingleReviewerResult")
         elif self.reviewer.result_id is not None or self.reviewer.result_digest is not None:
             raise ValueError("failed reviewer must not bind a success result")
-        if self.reviewer.status == "blocked_redaction":
+        if self.reviewer.status in {"blocked_redaction", "blocked_evidence"}:
             if (
                 self.reviewer.prompt_id is not None
                 or self.reviewer.prompt_digest is not None
@@ -1108,6 +1423,7 @@ class ReviewerContextBuilder(Protocol):
         *,
         artifact_store: ArtifactStore,
         subject_digest: str,
+        git_snapshot: Any | None = None,
     ) -> ReviewerContextPlan:
         """Assess and optionally expose redacted content for each Evidence."""
 
@@ -1125,6 +1441,7 @@ class RunCommitter(Protocol):
         *,
         idempotency_key: str,
         request_digest: str,
+        official_proofs: tuple[_OfficialEvidenceCommitProof, ...] = (),
     ) -> AssuranceRunResult | AssuranceRunBundle:
         """Persist one complete bundle atomically."""
 
@@ -1142,6 +1459,7 @@ class AssuranceRunService:
         config: AssuranceRunConfig,
         git_collector: Any | None = None,
         intake_collector: Any | None = None,
+        api_contract_collector: Any | None = None,
         clock: Any | None = None,
     ) -> None:
         if type(artifact_store) is not ArtifactStore:
@@ -1161,6 +1479,9 @@ class AssuranceRunService:
         self._context_builder = context_builder
         self._git_collector = git_collector or GitSnapshotCollector()
         self._intake_collector = intake_collector or TaskPolicyCollector()
+        self._api_contract_collector = (
+            api_contract_collector or ApiContractCollector()
+        )
         self._command_collector = DeterministicCommandCollector(
             config.allowed_commands
         )
@@ -1196,16 +1517,23 @@ class AssuranceRunService:
         if cached_result is not None:
             return cached_result
 
-        bundle = await self._prepare_bundle(
+        prepared = await self._prepare_bundle(
             intent,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            with_proofs=True,
         )
+        bundle, official_proofs = prepared
+        commit_kwargs = {
+            "idempotency_key": idempotency_key,
+            "request_digest": request_digest,
+        }
+        if official_proofs:
+            commit_kwargs["official_proofs"] = official_proofs
         committed = await asyncio.to_thread(
             self._committer.commit,
             bundle,
-            idempotency_key=idempotency_key,
-            request_digest=request_digest,
+            **commit_kwargs,
         )
         if committed is None:
             raise AssuranceRunError("committer.commit did not return a persisted result")
@@ -1220,7 +1548,8 @@ class AssuranceRunService:
         *,
         idempotency_key: str,
         request_digest: str,
-    ) -> AssuranceRunBundle:
+        with_proofs: bool = False,
+    ) -> AssuranceRunBundle | tuple[AssuranceRunBundle, tuple[_OfficialEvidenceCommitProof, ...]]:
         """Build the complete in-memory bundle shared by prepare and run."""
 
         await asyncio.to_thread(self._validate_workspace, intent)
@@ -1233,20 +1562,42 @@ class AssuranceRunService:
         if type(task_digest) is not str or not task_digest.startswith("sha256:"):
             raise AssuranceRunValidationError("probe did not return a sha256 task digest")
 
-        git_result = await asyncio.to_thread(
-            self._git_collector.collect,
-            intent.repository_path,
-            repository_identity=intent.repository_identity,
-            base_ref=intent.base_ref,
+        acceptance_scope_digest = compute_acceptance_scope_digest(
+            AcceptanceScopeDigestInput(
+                task_path=intent.task_path,
+                policy_paths=intent.policy_paths,
+                adr_paths=intent.adr_paths,
+                runbook_paths=intent.runbook_paths,
+            )
+        )
+
+        try:
+            git_result = await asyncio.to_thread(
+                self._git_collector.collect,
+                intent.repository_path,
+                repository_identity=intent.repository_identity,
+                base_ref=intent.base_ref,
+                task_digest=task_digest,
+                policy_version=self._config.policy_version,
+                rubric_version=self._config.rubric_version,
+                artifact_store=self._artifact_store,
+                attachment_digests=(),
+                acceptance_scope_digest=acceptance_scope_digest,
+                collected_at=started_at,
+            )
+        except TypeError as exc:
+            raise AssuranceRunStaleError(
+                "initial Git collector cannot bind acceptance scope"
+            ) from exc
+        subject_digest = self._verify_scoped_git_result(
+            git_result,
             task_digest=task_digest,
             policy_version=self._config.policy_version,
             rubric_version=self._config.rubric_version,
-            artifact_store=self._artifact_store,
             attachment_digests=(),
-            collected_at=started_at,
+            acceptance_scope_digest=acceptance_scope_digest,
+            phase="initial",
         )
-        self._require_type(git_result, GitSnapshotResult, "git collector result")
-        subject_digest = git_result.snapshot.subject_digest
         if git_result.snapshot.repository != normalize_repository_identity(
             intent.repository_identity
         ):
@@ -1267,6 +1618,22 @@ class AssuranceRunService:
         if intake_result.snapshot.task_digest != task_digest:
             raise AssuranceRunStaleError("task changed between probe and intake")
         self._require_subjects(subject_digest, intake_result)
+        try:
+            task_policy_evidence = await asyncio.to_thread(
+                _build_task_policy_adr_evidence,
+                intake_result,
+                artifact_store=self._artifact_store,
+            )
+        except Exception as exc:
+            raise AssuranceRunStaleError(
+                "task/policy/ADR Evidence binding failed"
+            ) from exc
+        self._require_type(
+            task_policy_evidence,
+            Evidence,
+            "task/policy/ADR Evidence",
+        )
+        self._require_subjects(subject_digest, task_policy_evidence)
 
         command_result = await asyncio.to_thread(
             self._command_collector.collect,
@@ -1279,17 +1646,51 @@ class AssuranceRunService:
         self._require_type(command_result, CommandBatchResult, "command collector result")
         self._require_subjects(subject_digest, command_result)
 
-        evidences = (
+        base_evidences = (
             git_result.evidence,
             intake_result.evidence,
+            task_policy_evidence,
             command_result.evidence,
         )
+        api_result: ApiContractResult | None = None
+        if _api_contract_required(git_result.snapshot):
+            api_result = await asyncio.to_thread(
+                self._api_contract_collector.collect,
+                intent.repository_path,
+                subject_digest=subject_digest,
+                head_revision=git_result.snapshot.head_revision,
+                artifact_store=self._artifact_store,
+                collected_at=started_at,
+            )
+            self._require_type(api_result, ApiContractResult, "api contract collector result")
+            self._require_subjects(subject_digest, api_result)
+            # A missing fixed source has no Evidence to bind into the
+            # manifest.  Keep the absence explicit to the policy gate rather
+            # than fabricating a successful or truncated collector entry.
+            if api_result.snapshot.omissions == ("source_missing",):
+                api_result = None
+        collector_evidences = base_evidences + (
+            (api_result.evidence,) if api_result is not None else ()
+        )
+        official_imports = await asyncio.to_thread(
+            self._import_official_evidence,
+            intent,
+            repository_identity=git_result.snapshot.repository,
+            head_revision=git_result.snapshot.head_revision,
+            subject_digest=subject_digest,
+            collected_at=started_at,
+        )
+        official_evidences = tuple(item.evidence for item in official_imports)
+        all_evidences = collector_evidences + official_evidences
         context_plan = await asyncio.to_thread(
-            self._prepare_context, evidences, subject_digest
+            self._prepare_context,
+            all_evidences,
+            subject_digest,
+            git_result.snapshot,
         )
         manifest_result = await asyncio.to_thread(
             self._build_manifest,
-            evidences,
+            all_evidences,
             context_plan,
             subject_digest,
             started_at,
@@ -1331,13 +1732,48 @@ class AssuranceRunService:
             updated_at=started_at,
         )
 
-        reviewer_record, findings, questions, receipt = await self._review(
-            subject=subject,
-            risk_result=risk_result,
-            context_plan=context_plan,
-            run_id=self._run_id(request_digest, idempotency_key),
-            evaluated_at=self._now(),
+        run_id = self._run_id(request_digest, idempotency_key)
+        required_gaps = self._required_collector_gaps(
+            risk_result,
+            base_evidences=base_evidences,
+            manifest_evidence=manifest_result.evidence,
+            api_evidence=api_result.evidence if api_result is not None else None,
+            official_evidences=official_evidences,
         )
+        redaction_unsafe = any(
+            item.disposition == RedactionDisposition.CONTAINS_UNREDACTED_CONTENT
+            for item in context_plan.entries
+        )
+        if redaction_unsafe:
+            reviewer_record, findings, questions, receipt = await self._review(
+                subject=subject,
+                risk_result=risk_result,
+                context_plan=context_plan,
+                run_id=run_id,
+                evaluated_at=self._now(),
+            )
+        elif required_gaps:
+            blocked_reason = (
+                "api_contract_missing"
+                if required_gaps == ("api_contract",)
+                else "official_evidence_missing"
+            )
+            reviewer_record, findings, questions, receipt = (
+                self._blocked_evidence_review(
+                    subject_digest=subject.subject_digest,
+                    run_id=run_id,
+                    evaluated_at=self._now(),
+                    fallback_reason=blocked_reason,
+                )
+            )
+        else:
+            reviewer_record, findings, questions, receipt = await self._review(
+                subject=subject,
+                risk_result=risk_result,
+                context_plan=context_plan,
+                run_id=run_id,
+                evaluated_at=self._now(),
+            )
         policy_input = PolicyEvaluationInput(
             schema_version="v1",
             subject=subject,
@@ -1359,25 +1795,35 @@ class AssuranceRunService:
             intake_result,
             manifest_result,
             fence_collection_at,
+            official_imports,
+            api_result=api_result,
+            task_policy_evidence=task_policy_evidence,
+            acceptance_scope_digest=acceptance_scope_digest,
         )
         freshness_source_binding = await asyncio.to_thread(
             self._build_freshness_source_binding,
             intent,
             git_result,
             subject,
+            subject_identity_version="v2",
         )
 
         case, events = self._build_case_and_events(
             draft_case=draft_case,
             subject_digest=subject_digest,
-            evidence=evidences + (manifest_result.evidence,),
+            evidence=(
+                base_evidences
+                + (manifest_result.evidence,)
+                + ((api_result.evidence,) if api_result is not None else ())
+                + official_evidences
+            ),
             findings=findings,
             questions=questions,
             receipt=receipt,
             policy=policy_result,
             occurred_at=fence_at,
         )
-        return AssuranceRunBundle(
+        bundle = AssuranceRunBundle(
             schema_version="v1",
             run_id=self._run_id(request_digest, idempotency_key),
             idempotency_key=idempotency_key,
@@ -1391,7 +1837,12 @@ class AssuranceRunService:
             commands=command_result,
             manifest=manifest_result,
             risk=risk_result,
-            evidence=evidences + (manifest_result.evidence,),
+            evidence=(
+                base_evidences
+                + (manifest_result.evidence,)
+                + ((api_result.evidence,) if api_result is not None else ())
+                + official_evidences
+            ),
             findings=findings,
             questions=questions,
             reviewer=reviewer_record,
@@ -1405,6 +1856,256 @@ class AssuranceRunService:
             started_at=started_at,
             completed_at=fence_at,
         )
+        official_proofs = self._build_official_commit_proofs(
+            official_imports,
+            repository_path=intent.repository_path,
+            head_revision=git_result.snapshot.head_revision,
+        )
+        if with_proofs:
+            return bundle, official_proofs
+        return bundle
+
+    @staticmethod
+    def _build_official_commit_proofs(
+        official_imports: tuple[OfficialEvidenceImport, ...],
+        *,
+        repository_path: Path,
+        head_revision: str,
+    ) -> tuple[_OfficialEvidenceCommitProof, ...]:
+        """Materialize only bytes already fenced by the verified importer."""
+
+        if not official_imports:
+            return ()
+        proofs = []
+        expected_zip_files = {
+            "dependency_audit": "dependency_audit.json",
+            "ci_iac_validation": "ci_iac_validation.json",
+        }
+        expected_result_files = {
+            "dependency_audit": "dependency-audit-result.json",
+            "ci_iac_validation": "ci-iac-result.json",
+        }
+        for imported in official_imports:
+            if type(imported) is not OfficialEvidenceImport:
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="unknown"
+                )
+            receipt = imported.receipt
+            evidence = imported.evidence
+            receipt_bytes = imported.receipt_bytes
+            artifact_bytes = imported.remote_zip_bytes
+            if (
+                type(receipt_bytes) is not bytes
+                or type(artifact_bytes) is not bytes
+                or imported.receipt_digest != _sha256(receipt_bytes)
+                or imported.receipt_byte_size != len(receipt_bytes)
+                or imported.remote_zip_digest != _sha256(artifact_bytes)
+                or imported.remote_zip_byte_size != len(artifact_bytes)
+                or receipt.artifact_digest != imported.remote_zip_digest
+                or receipt.artifact_byte_size != imported.remote_zip_byte_size
+                or evidence.artifact_digest != imported.receipt_digest
+                or evidence.kind != receipt.kind
+                or evidence.subject_digest != receipt.subject_digest
+                or receipt.evidence_mode != "official"
+            ):
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="digest_or_size_mismatch"
+                )
+            try:
+                parsed_receipt = parse_official_evidence_receipt(receipt_bytes)
+                if parsed_receipt != receipt:
+                    raise ValueError("receipt bytes do not reparse exactly")
+                with zipfile.ZipFile(io.BytesIO(artifact_bytes)) as archive:
+                    names = tuple(info.filename for info in archive.infolist())
+                    if set(names) != {
+                        "dependency_audit.json",
+                        "ci_iac_validation.json",
+                        "dependency-audit-result.json",
+                        "ci-iac-result.json",
+                    } or len(names) != 4:
+                        raise ValueError("official artifact file set is invalid")
+                    report_bytes = archive.read(expected_zip_files[receipt.kind])
+                    result_bytes = archive.read(expected_result_files[receipt.kind])
+                parsed_report = parse_official_evidence_report(report_bytes)
+                if parsed_report != receipt.report:
+                    raise ValueError("report bytes do not reparse exactly")
+                parsed_result = json.loads(
+                    result_bytes.decode("utf-8"),
+                    parse_constant=lambda _value: (_ for _ in ()).throw(
+                        ValueError("invalid JSON constant")
+                    ),
+                )
+                if not isinstance(parsed_result, (dict, list)) or parsed_result != receipt.result:
+                    raise ValueError("result bytes do not bind to receipt")
+            except OfficialEvidenceError as exc:
+                reason_code = getattr(exc, "reason_code", "unknown")
+                if reason_code not in OFFICIAL_EVIDENCE_REASON_CODES:
+                    reason_code = "unknown"
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code=reason_code
+                ) from exc
+            except (OSError, ValueError, TypeError, UnicodeDecodeError, zipfile.BadZipFile) as exc:
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="artifact_structure_invalid"
+                ) from exc
+            if (
+                _sha256(report_bytes) != receipt.report_digest
+                or len(report_bytes) != receipt.report_byte_size
+                or _sha256(result_bytes) != receipt.result_digest
+                or len(result_bytes) != receipt.result_byte_size
+            ):
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="digest_or_size_mismatch"
+                )
+            source_bindings = []
+            for source in imported.source_bindings:
+                if type(source) is not OfficialEvidenceSource:
+                    raise AssuranceRunOfficialEvidenceError(
+                        reason_code="artifact_structure_invalid"
+                    )
+                try:
+                    blob = subprocess.run(
+                        (
+                            "git",
+                            "cat-file",
+                            "blob",
+                            f"{head_revision}:{source.path}",
+                        ),
+                        cwd=repository_path,
+                        check=True,
+                        capture_output=True,
+                        timeout=5.0,
+                    ).stdout
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise AssuranceRunOfficialEvidenceError(
+                        reason_code="artifact_structure_invalid"
+                    ) from exc
+                if len(blob) != source.byte_size or _sha256(blob) != source.digest:
+                    raise AssuranceRunOfficialEvidenceError(
+                        reason_code="digest_or_size_mismatch"
+                    )
+                source_bindings.append((source, blob))
+            if tuple(source for source, _ in source_bindings) != receipt.source_paths:
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="lineage_mismatch"
+                )
+            workflow_binding = imported.workflow_definition
+            if (
+                type(workflow_binding) is not tuple
+                or len(workflow_binding) != 2
+                or type(workflow_binding[0]) is not OfficialEvidenceSource
+                or type(workflow_binding[1]) is not bytes
+                or workflow_binding[0] != receipt.workflow_definition
+                or len(workflow_binding[1]) != workflow_binding[0].byte_size
+                or _sha256(workflow_binding[1]) != workflow_binding[0].digest
+            ):
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="digest_or_size_mismatch"
+                )
+            workflow_source = workflow_binding[0]
+            try:
+                workflow_blob = subprocess.run(
+                    (
+                        "git",
+                        "cat-file",
+                        "blob",
+                        f"{head_revision}:{workflow_source.path}",
+                    ),
+                    cwd=repository_path,
+                    check=True,
+                    capture_output=True,
+                    timeout=5.0,
+                ).stdout
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="artifact_structure_invalid"
+                ) from exc
+            if (
+                workflow_blob != workflow_binding[1]
+                or len(workflow_blob) != workflow_source.byte_size
+                or _sha256(workflow_blob) != workflow_source.digest
+            ):
+                raise AssuranceRunOfficialEvidenceError(
+                    reason_code="digest_or_size_mismatch"
+                )
+            proofs.append(
+                _OfficialEvidenceCommitProof(
+                    evidence_id=evidence.evidence_id,
+                    kind=receipt.kind,
+                    subject_digest=receipt.subject_digest,
+                    evidence_mode=receipt.evidence_mode,
+                    workflow_run_id=receipt.workflow_run_id,
+                    workflow_run_attempt=receipt.workflow_run_attempt,
+                    job_id=receipt.job_id,
+                    artifact_id=receipt.artifact_id,
+                    artifact_digest=receipt.artifact_digest,
+                    artifact_byte_size=receipt.artifact_byte_size,
+                    artifact_bytes=artifact_bytes,
+                    receipt_digest=imported.receipt_digest,
+                    receipt_byte_size=imported.receipt_byte_size,
+                    receipt_bytes=receipt_bytes,
+                    report_digest=receipt.report_digest,
+                    report_byte_size=receipt.report_byte_size,
+                    report_bytes=report_bytes,
+                    result_digest=receipt.result_digest,
+                    result_byte_size=receipt.result_byte_size,
+                    result_bytes=result_bytes,
+                    source_bindings=tuple(source_bindings),
+                    workflow_definition=(workflow_source, workflow_blob),
+                )
+            )
+        return tuple(proofs)
+
+    def _import_official_evidence(
+        self,
+        intent: AssuranceRunIntent,
+        *,
+        repository_identity: str,
+        head_revision: str,
+        subject_digest: str,
+        collected_at: datetime,
+    ) -> tuple[OfficialEvidenceImport, ...]:
+        if intent.official_evidence_run_id is None:
+            return ()
+        try:
+            importer = OfficialEvidenceImporter(
+                workspace_root=self._config.workspace_root,
+                repository_path=intent.repository_path,
+                repository_identity=repository_identity,
+                head_revision=head_revision,
+                subject_digest=subject_digest,
+                artifact_store=self._artifact_store,
+                collected_at=collected_at,
+                github_token=os.getenv("GITHUB_TOKEN") or None,
+            )
+            imports = importer.import_run(intent.official_evidence_run_id)
+        except OfficialEvidenceError as exc:
+            try:
+                reason_code = getattr(exc, "reason_code", None)
+            except Exception:
+                reason_code = None
+            if type(reason_code) is not str or reason_code not in OFFICIAL_EVIDENCE_REASON_CODES:
+                reason_code = "unknown"
+            raise AssuranceRunOfficialEvidenceError(
+                reason_code=reason_code
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise AssuranceRunOfficialEvidenceError(
+                reason_code="unknown"
+            ) from exc
+        if type(imports) is not tuple or any(
+            type(item) is not OfficialEvidenceImport for item in imports
+        ):
+            raise AssuranceRunOfficialEvidenceError(
+                "official run did not contain the complete typed evidence set"
+            )
+        kinds = tuple(item.receipt.kind for item in imports)
+        if set(kinds) != set(OFFICIAL_EVIDENCE_KINDS) or len(kinds) != len(set(kinds)):
+            raise AssuranceRunOfficialEvidenceError(
+                "official run did not contain the complete typed evidence set"
+            )
+        order = {kind: index for index, kind in enumerate(OFFICIAL_EVIDENCE_KINDS)}
+        return tuple(sorted(imports, key=lambda item: order[item.receipt.kind]))
 
     def _validate_intent(self, intent: AssuranceRunIntent, idempotency_key: str) -> None:
         if type(intent) is not AssuranceRunIntent:
@@ -1417,6 +2118,18 @@ class AssuranceRunService:
             raise AssuranceRunValidationError("idempotency_key must be nonblank")
         if len(idempotency_key.encode("utf-8")) > 256:
             raise AssuranceRunValidationError("idempotency_key is too long")
+        run_id = intent.official_evidence_run_id
+        if run_id is not None and (
+            type(run_id) is not str
+            or not run_id.isascii()
+            or not run_id.isdecimal()
+            or run_id == "0"
+            or run_id.startswith("0")
+            or len(run_id) > 19
+        ):
+            raise AssuranceRunValidationError(
+                "official_evidence_run_id must be a positive numeric string"
+            )
         if not intent.repository_path.is_absolute():
             raise AssuranceRunValidationError("repository_path must be absolute")
         try:
@@ -1483,6 +2196,69 @@ class AssuranceRunService:
         if type(value) is not expected:
             raise AssuranceRunError(f"{label} must be an exact {expected.__name__}")
 
+    def _verify_scoped_git_result(
+        self,
+        git_result: Any,
+        *,
+        task_digest: str,
+        policy_version: str,
+        rubric_version: str,
+        attachment_digests: tuple[str, ...],
+        acceptance_scope_digest: str,
+        phase: str,
+    ) -> str:
+        """Rebuild the canonical v2 subject before accepting a Git result."""
+
+        if type(git_result) is not GitSnapshotResult:
+            raise AssuranceRunStaleError(
+                f"{phase} Git collector returned an invalid result"
+            )
+        build_subject_input = getattr(self._git_collector, "build_subject_input", None)
+        if not callable(build_subject_input):
+            try:
+                canonical_collector = GitSnapshotCollector(
+                    max_diff_bytes=self._git_collector.max_diff_bytes,
+                    max_files=self._git_collector.max_files,
+                    max_file_bytes=self._git_collector.max_file_bytes,
+                    command_timeout_seconds=self._git_collector.command_timeout_seconds,
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise AssuranceRunStaleError(
+                    f"{phase} Git collector cannot rebuild acceptance scope; "
+                    "collector profile unavailable"
+                ) from exc
+            build_subject_input = canonical_collector.build_subject_input
+        try:
+            subject_input = build_subject_input(
+                git_result.snapshot,
+                task_digest=task_digest,
+                policy_version=policy_version,
+                rubric_version=rubric_version,
+                attachment_digests=attachment_digests,
+                acceptance_scope_digest=acceptance_scope_digest,
+            )
+        except Exception as exc:
+            raise AssuranceRunStaleError(
+                f"{phase} Git collector did not bind acceptance scope"
+            ) from exc
+        if (
+            type(subject_input) is not SubjectDigestInput
+            or subject_input.schema_version != "v2"
+            or subject_input.acceptance_scope_digest != acceptance_scope_digest
+        ):
+            raise AssuranceRunStaleError(
+                f"{phase} Git collector did not produce a v2 scoped subject"
+            )
+        subject_digest = compute_subject_digest(subject_input)
+        if (
+            subject_digest != git_result.snapshot.subject_digest
+            or git_result.evidence.subject_digest != subject_digest
+        ):
+            raise AssuranceRunStaleError(
+                f"{phase} Git result subject is not bound to acceptance scope"
+            )
+        return subject_digest
+
     @staticmethod
     def _require_subjects(subject_digest: str, value: Any) -> None:
         nested = []
@@ -1494,13 +2270,17 @@ class AssuranceRunService:
             raise AssuranceRunStaleError("collector result subject digest mismatch")
 
     def _prepare_context(
-        self, evidences: tuple[Evidence, ...], subject_digest: str
+        self,
+        evidences: tuple[Evidence, ...],
+        subject_digest: str,
+        git_snapshot: Any | None = None,
     ) -> ReviewerContextPlan:
         try:
             value = self._context_builder.prepare(
                 evidences,
                 artifact_store=self._artifact_store,
                 subject_digest=subject_digest,
+                git_snapshot=git_snapshot,
             )
         except Exception as exc:
             raise AssuranceRunRedactionError("redaction assessment failed") from exc
@@ -1509,7 +2289,7 @@ class AssuranceRunService:
         expected = {item.evidence_id: item for item in evidences}
         actual = {item.evidence_id: item for item in value.entries}
         if set(expected) != set(actual):
-            raise AssuranceRunRedactionError("redaction plan must cover every base Evidence")
+            raise AssuranceRunRedactionError("redaction plan must cover every Evidence")
         for evidence_id, evidence in expected.items():
             entry = actual[evidence_id]
             if entry.kind != evidence.kind or entry.artifact_digest != evidence.artifact_digest:
@@ -1573,6 +2353,8 @@ class AssuranceRunService:
         intent: AssuranceRunIntent,
         git_result: GitSnapshotResult,
         subject: ChangeSubject,
+        *,
+        subject_identity_version: Literal["v1", "v2"] = "v1",
     ) -> FreshnessSourceBinding:
         """Capture final-fence local source facts without exposing them publicly."""
 
@@ -1620,7 +2402,78 @@ class AssuranceRunService:
             subject=subject,
             author=intent.author,
             author_provenance=intent.author_provenance,
+            subject_identity_version=subject_identity_version,
         )
+
+    @staticmethod
+    def _required_collector_gaps(
+        risk_result: RiskClassificationResult,
+        *,
+        base_evidences: tuple[Evidence, ...],
+        manifest_evidence: Evidence,
+        api_evidence: Evidence | None,
+        official_evidences: tuple[Evidence, ...],
+    ) -> tuple[str, ...]:
+        """Return required collectors that are absent or not successful.
+
+        A truncated or failed collector is never handed to the provider as a
+        successful run.  The same gate applies to local and official evidence;
+        the latter remains subject to its importer-specific proof fence.
+        """
+
+        by_kind = {item.kind: item for item in base_evidences}
+        by_name: dict[str, Evidence] = {
+            "git_snapshot": by_kind["git_snapshot"],
+            "task_policy_adr": by_kind["task_policy_adr"],
+            "deterministic_commands": by_kind["command_batch"],
+            "evidence_manifest": manifest_evidence,
+        }
+        if api_evidence is not None:
+            by_name["api_contract"] = api_evidence
+        by_name.update({item.kind: item for item in official_evidences})
+        gaps = []
+        for collector in risk_result.classification.required_collectors:
+            evidence = by_name.get(collector)
+            if evidence is None or evidence.status != "success":
+                gaps.append(collector)
+        return tuple(gaps)
+
+    def _blocked_evidence_review(
+        self,
+        *,
+        subject_digest: str,
+        run_id: str,
+        evaluated_at: datetime,
+        fallback_reason: str = "official_evidence_missing",
+    ) -> tuple[
+        ReviewerRunRecord,
+        tuple[Finding, ...],
+        tuple[ReviewQuestion, ...],
+        ExecutionReceipt,
+    ]:
+        """Record missing official collectors without calling the provider."""
+
+        route = self._config.reviewer_route
+        receipt = self._failure_receipt(
+            run_id=run_id,
+            subject_digest=subject_digest,
+            status="blocked_evidence",
+            route=route,
+            started_at=evaluated_at,
+            completed_at=evaluated_at,
+            actual_provider=None,
+            actual_model_ref=None,
+            fallback_reason=fallback_reason,
+        )
+        reviewer = ReviewerRunRecord(
+            status="blocked_evidence",
+            planned_route=route,
+            rubric_version=self._config.rubric_version,
+            schema_status="not_produced",
+            usage_status="unavailable",
+            error_code="OFFICIAL_EVIDENCE_MISSING",
+        )
+        return reviewer, (), (), receipt
 
     async def _review(
         self,
@@ -1702,9 +2555,19 @@ class AssuranceRunService:
         if completed < started:
             completed = started
         if response.status != "success":
-            response_error_code = response.error_code
+            response_error_code, failure_stage = _reviewer_failure_facts(
+                response.error_code
+            )
             if response_error_code not in _REVIEWER_STATUS_ERROR_CODES[response.status]:
                 response_error_code = _REVIEWER_FAILURE_CODES[response.status]
+                failure_stage = None
+            if response.failure_category in _REVIEWER_CLASSIFIED_FAILURE_CATEGORIES:
+                failure_stage = response.failure_category
+            elif (
+                response.failure_category == "unknown"
+                and response.error_code == "REVIEWER_PROVIDER_FAILURE"
+            ):
+                failure_stage = "nonzero_exit"
             receipt = self._failure_receipt(
                 run_id=run_id,
                 subject_digest=subject.subject_digest,
@@ -1717,6 +2580,7 @@ class AssuranceRunService:
                 input_tokens=self._usage_value(response, "input_tokens") or 0,
                 output_tokens=self._usage_value(response, "output_tokens") or 0,
                 cost_usd=self._usage_value(response, "cost_usd") or 0.0,
+                fallback_reason=failure_stage,
             )
             return (
                 ReviewerRunRecord(
@@ -1756,6 +2620,7 @@ class AssuranceRunService:
                 input_tokens=self._usage_value(response, "input_tokens") or 0,
                 output_tokens=self._usage_value(response, "output_tokens") or 0,
                 cost_usd=self._usage_value(response, "cost_usd") or 0.0,
+                fallback_reason="final_missing",
             )
             return (
                 ReviewerRunRecord(
@@ -1812,6 +2677,41 @@ class AssuranceRunService:
                 self._artifact_store,
             )
             self._require_type(normalized, SingleReviewerResult, "reviewer normalization result")
+            if not normalized.findings:
+                receipt = self._failure_receipt(
+                    run_id=run_id,
+                    subject_digest=subject.subject_digest,
+                    status="failure",
+                    route=self._config.reviewer_route,
+                    started_at=started,
+                    completed_at=completed,
+                    actual_provider=actual_provider,
+                    actual_model_ref=actual_model_ref,
+                    input_tokens=self._usage_value(response, "input_tokens") or 0,
+                    output_tokens=self._usage_value(response, "output_tokens") or 0,
+                    cost_usd=self._usage_value(response, "cost_usd") or 0.0,
+                    fallback_reason="empty_findings",
+                )
+                return (
+                    ReviewerRunRecord(
+                        status="failure",
+                        planned_route=self._config.reviewer_route,
+                        rubric_version=self._config.rubric_version,
+                        prompt_id=prompt.prompt_id,
+                        prompt_digest=prompt.prompt_digest,
+                        actual_provider=actual_provider,
+                        actual_model_ref=actual_model_ref,
+                        schema_status="not_produced",
+                        usage_status=self._usage_status(response),
+                        input_tokens=self._usage_value(response, "input_tokens"),
+                        output_tokens=self._usage_value(response, "output_tokens"),
+                        cost_usd=self._usage_value(response, "cost_usd"),
+                        error_code="REVIEWER_PROVIDER_FAILURE",
+                    ),
+                    (),
+                    normalized.questions,
+                    receipt,
+                )
             receipt = self._bind_success_receipt_route(normalized.execution_receipt)
             return (
                 ReviewerRunRecord(
@@ -1949,8 +2849,14 @@ class AssuranceRunService:
         input_tokens: int = 0,
         output_tokens: int = 0,
         cost_usd: float = 0.0,
+        fallback_reason: str | None = None,
     ) -> ExecutionReceipt:
-        if status == "blocked_redaction":
+        if status in {"blocked_redaction", "blocked_evidence"}:
+            fallback_reason = fallback_reason or (
+                "redaction_unsafe"
+                if status == "blocked_redaction"
+                else "official_evidence_missing"
+            )
             steps = tuple(
                 ExecutionStep(
                     sequence=index,
@@ -1960,7 +2866,7 @@ class AssuranceRunService:
                     provider=None,
                     tool_grants=(),
                     routing_rule=route.routing_rule,
-                    fallback_reason="redaction_unsafe",
+                    fallback_reason=fallback_reason,
                     token_budget=route.token_budget,
                     timeout_seconds=route.timeout_seconds,
                     result="blocked",
@@ -1989,7 +2895,7 @@ class AssuranceRunService:
                     provider=actual_provider or route.provider,
                     tool_grants=(),
                     routing_rule=route.routing_rule,
-                    fallback_reason=None,
+                    fallback_reason=fallback_reason,
                     token_budget=route.token_budget,
                     timeout_seconds=route.timeout_seconds,
                     result=result,
@@ -2025,6 +2931,10 @@ class AssuranceRunService:
         initial_intake: IntakeResult,
         manifest: EvidenceManifestResult,
         collected_at: datetime,
+        official_imports: tuple[OfficialEvidenceImport, ...] = (),
+        api_result: ApiContractResult | None = None,
+        task_policy_evidence: Evidence | None = None,
+        acceptance_scope_digest: str | None = None,
     ) -> datetime:
         try:
             final_git = self._git_collector.collect(
@@ -2036,8 +2946,14 @@ class AssuranceRunService:
                 rubric_version=self._config.rubric_version,
                 artifact_store=self._artifact_store,
                 attachment_digests=(),
+                acceptance_scope_digest=acceptance_scope_digest,
                 collected_at=collected_at,
             )
+        except TypeError as exc:
+            raise AssuranceRunStaleError(
+                "final Git collector cannot bind acceptance scope"
+            ) from exc
+        try:
             final_intake = self._intake_collector.collect(
                 intent.repository_path,
                 subject_digest=subject_digest,
@@ -2050,12 +2966,79 @@ class AssuranceRunService:
             )
         except Exception as exc:
             raise AssuranceRunStaleError("final source freshness fence failed") from exc
-        if type(final_git) is not GitSnapshotResult or type(final_intake) is not IntakeResult:
-            raise AssuranceRunStaleError("final fence collector returned invalid result")
-        if _strip_datetimes(_jsonable(final_git)) != _strip_datetimes(_jsonable(initial_git)):
+        final_subject_digest = self._verify_scoped_git_result(
+            final_git,
+            task_digest=task_digest,
+            policy_version=self._config.policy_version,
+            rubric_version=self._config.rubric_version,
+            attachment_digests=(),
+            acceptance_scope_digest=acceptance_scope_digest,
+            phase="final",
+        )
+        if (
+            not initial_git.snapshot.complete
+            or not final_git.snapshot.complete
+            or final_subject_digest != subject_digest
+        ):
             raise AssuranceRunStaleError("Git changed during reviewer execution")
+        if type(final_intake) is not IntakeResult:
+            raise AssuranceRunStaleError("final fence collector returned invalid result")
         if _strip_datetimes(_jsonable(final_intake)) != _strip_datetimes(_jsonable(initial_intake)):
             raise AssuranceRunStaleError("intake documents changed during reviewer execution")
+        if task_policy_evidence is not None:
+            try:
+                final_task_policy_evidence = _build_task_policy_adr_evidence(
+                    final_intake,
+                    artifact_store=self._artifact_store,
+                )
+            except Exception as exc:
+                raise AssuranceRunStaleError(
+                    "task/policy/ADR Evidence changed during reviewer execution"
+                ) from exc
+            if _strip_datetimes(_jsonable(final_task_policy_evidence)) != _strip_datetimes(
+                _jsonable(task_policy_evidence)
+            ):
+                raise AssuranceRunStaleError(
+                    "task/policy/ADR Evidence changed during reviewer execution"
+                )
+        if api_result is not None:
+            try:
+                final_api = self._api_contract_collector.collect(
+                    intent.repository_path,
+                    subject_digest=subject_digest,
+                    head_revision=initial_git.snapshot.head_revision,
+                    artifact_store=self._artifact_store,
+                    collected_at=collected_at,
+                )
+            except Exception as exc:
+                raise AssuranceRunStaleError(
+                    "API contract changed during reviewer execution"
+                ) from exc
+            if type(final_api) is not ApiContractResult:
+                raise AssuranceRunStaleError(
+                    "final API contract collector returned invalid result"
+                )
+            if _strip_datetimes(_jsonable(final_api)) != _strip_datetimes(_jsonable(api_result)):
+                raise AssuranceRunStaleError(
+                    "API contract changed during reviewer execution"
+                )
+        if official_imports:
+            try:
+                importer = OfficialEvidenceImporter(
+                    workspace_root=self._config.workspace_root,
+                    repository_path=intent.repository_path,
+                    repository_identity=initial_git.snapshot.repository,
+                    head_revision=initial_git.snapshot.head_revision,
+                    subject_digest=subject_digest,
+                    artifact_store=self._artifact_store,
+                    collected_at=collected_at,
+                )
+                for imported in official_imports:
+                    importer.verify_import(imported)
+            except (OfficialEvidenceError, TypeError, ValueError) as exc:
+                raise AssuranceRunStaleError(
+                    "official evidence changed during reviewer execution"
+                ) from exc
         for entry in manifest.manifest.entries:
             try:
                 if self._artifact_store.verify(entry.artifact_digest) is not True:
@@ -2166,6 +3149,7 @@ __all__ = [
     "AssuranceRunBundle",
     "AssuranceRunConfig",
     "AssuranceRunIntent",
+    "AssuranceRunOfficialEvidenceError",
     "AssuranceRunPreconditionError",
     "AssuranceRunResult",
     "AssuranceRunService",

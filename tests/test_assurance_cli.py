@@ -1,10 +1,12 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from assurance import cli
 from assurance.case_publication import PublicationReceipt
+from assurance.entry import AssuranceTransportError
 import assurance.case_publication as case_publication
 import assurance.integrations.github_actions as github_actions
 import cli as root_cli
@@ -177,6 +179,302 @@ def test_live_run_command_prints_case_subject_gate_freshness_and_workbench(
     assert "FRESH" in result.stdout
     assert "http://127.0.0.1:3010/?view=assurance" in result.stdout
     assert str(tmp_path) not in result.stdout
+
+
+def test_live_run_timeout_stays_generic_and_emits_no_success_or_schema(
+    monkeypatch, tmp_path
+):
+    def timed_out(**_kwargs):
+        raise AssuranceTransportError("assurance service is unavailable")
+
+    monkeypatch.setattr(cli, "_perform_live_run", timed_out)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            "--repository",
+            str(tmp_path),
+            "--repository-identity",
+            "acme/widget",
+            "--base-ref",
+            "main",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "assurance run failed; no authoritative CaseView was accepted" in result.stderr
+    assert "schema" not in result.stdout.lower()
+    assert "run_id" not in result.stdout
+    assert "CaseView" not in result.stdout
+
+
+def test_live_run_serializes_single_official_run_id_for_http(monkeypatch, tmp_path):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            captured["client_kwargs"] = _kwargs
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def run_and_readback(self, request, *, idempotency_key):
+            captured["request"] = request
+            captured["idempotency_key"] = idempotency_key
+            return {"ok": True}
+
+    monkeypatch.setattr(cli, "AssuranceHttpClient", FakeClient)
+    cli._perform_live_run(
+        repository=tmp_path,
+        repository_identity="acme/widget",
+        author="tester",
+        base_ref="main",
+        task_path=task,
+        policy_paths=(),
+        adr_paths=(),
+        runbook_paths=(),
+        command_ids=("diff-check",),
+        official_evidence_run_id="123",
+        changed_lines_total=None,
+        external_side_effects="none_declared",
+        provider_boundary="within_declared_boundary",
+        idempotency_key="run-official-cli",
+        api_url="http://127.0.0.1:8010",
+    )
+
+    assert captured["request"]["official_evidence_run_id"] == "123"
+    assert "official_evidence" not in captured["request"]
+    assert captured["client_kwargs"] == {}
+
+
+def test_live_run_does_not_expose_run_create_timeout_option():
+    result = CliRunner().invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0
+    assert "--run-create-timeout" not in result.stdout
+
+
+def test_default_idempotency_key_distinguishes_clean_repository_heads(
+    monkeypatch, tmp_path
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    heads = {"value": b"a" * 40}
+
+    def fake_git(_repository, *arguments):
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ):
+            return b""
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return heads["value"]
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    request = {"repository_identity": "acme/widget"}
+    first = cli._idempotency_key(tmp_path, request, ("task.md",))
+
+    heads["value"] = b"b" * 40
+    second = cli._idempotency_key(tmp_path, request, ("task.md",))
+
+    assert first != second
+
+
+def test_default_idempotency_key_is_stable_for_same_clean_head(monkeypatch, tmp_path):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+
+    def fake_git(_repository, *arguments):
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ):
+            return b""
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return b"a" * 40 + b"\n"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    request = {"repository_identity": "acme/widget"}
+
+    assert cli._idempotency_key(tmp_path, request, ("task.md",)) == cli._idempotency_key(
+        tmp_path, request, ("task.md",)
+    )
+
+
+def test_default_idempotency_key_changes_when_worktree_is_dirty(
+    monkeypatch, tmp_path
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    status = {"value": b""}
+
+    def fake_git(_repository, *arguments):
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ):
+            return status["value"]
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return b"a" * 40
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    request = {"repository_identity": "acme/widget"}
+    clean = cli._idempotency_key(tmp_path, request, ("task.md",))
+
+    status["value"] = b" M task.md\0"
+    dirty = cli._idempotency_key(tmp_path, request, ("task.md",))
+
+    assert clean != dirty
+
+
+@pytest.mark.parametrize("head", [b"a" * 40, b"b" * 64], ids=["sha1", "sha256"])
+def test_repository_head_accepts_40_or_64_lowercase_hex(
+    monkeypatch, tmp_path, head
+):
+    calls = []
+
+    def fake_git(_repository, *arguments):
+        calls.append(arguments)
+        assert arguments == ("rev-parse", "--verify", "HEAD^{commit}")
+        return head + b"\n"
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+
+    assert cli._repository_head(tmp_path) == head.decode("ascii")
+    assert calls == [("rev-parse", "--verify", "HEAD^{commit}")]
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        None,
+        b"",
+        b"a" * 40 + b"\n" + b"b" * 40,
+        b" " + b"a" * 40,
+        b"a" * 40 + b" ",
+        b"A" * 40,
+        b"g" * 40,
+    ],
+    ids=["missing", "empty", "multiline", "leading-space", "trailing-space", "uppercase", "nonhex"],
+)
+def test_invalid_repository_head_fails_before_http_post(
+    monkeypatch, tmp_path, head
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    calls = []
+
+    def fake_git(_repository, *arguments):
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return head
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ):
+            return b""
+        raise AssertionError(arguments)
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("client")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def run_and_readback(self, *_args, **_kwargs):
+            calls.append("post")
+            raise AssertionError("HTTP POST must not run")
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    monkeypatch.setattr(cli, "AssuranceHttpClient", FakeClient)
+
+    with pytest.raises(ValueError, match="repository HEAD"):
+        cli._perform_live_run(
+            repository=tmp_path,
+            repository_identity="acme/widget",
+            author="tester",
+            base_ref="main",
+            task_path=task,
+            policy_paths=(),
+            adr_paths=(),
+            runbook_paths=(),
+            command_ids=("diff-check",),
+            official_evidence_run_id=None,
+            changed_lines_total=None,
+            external_side_effects="none_declared",
+            provider_boundary="within_declared_boundary",
+            idempotency_key=None,
+            api_url="http://127.0.0.1:8010",
+        )
+
+    assert calls == []
+
+
+def test_explicit_idempotency_key_bypasses_default_head_and_is_verbatim(
+    monkeypatch, tmp_path
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("default idempotency key path must not run")
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def run_and_readback(self, _request, *, idempotency_key):
+            assert idempotency_key == ""
+            return {"ok": True}
+
+    monkeypatch.setattr(cli, "_git_output", fail_if_called)
+    monkeypatch.setattr(cli, "_idempotency_key", fail_if_called)
+    monkeypatch.setattr(cli, "AssuranceHttpClient", FakeClient)
+
+    cli._perform_live_run(
+        repository=tmp_path,
+        repository_identity="acme/widget",
+        author="tester",
+        base_ref="main",
+        task_path=task,
+        policy_paths=(),
+        adr_paths=(),
+        runbook_paths=(),
+        command_ids=("diff-check",),
+        official_evidence_run_id=None,
+        changed_lines_total=None,
+        external_side_effects="none_declared",
+        provider_boundary="within_declared_boundary",
+        idempotency_key="",
+        api_url="http://127.0.0.1:8010",
+    )
 
 
 def test_publish_case_command_uses_one_deep_module_and_returns_safe_receipt(monkeypatch, tmp_path):
