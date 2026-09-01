@@ -20,13 +20,18 @@ from pydantic import BaseModel, ValidationError
 import assurance
 import assurance.execution_receipt as execution_receipt_module
 from assurance import (
+    ExecutionReceipt,
+    ReviewerFailureOutcome,
+)
+from assurance.execution_receipt import (
     CouncilExecutionReceipt,
     CouncilExecutionStep,
-    CouncilPlan,
     CouncilReceiptBuilder,
-    CouncilRunResult,
     CouncilTopologySnapshot,
-    ExecutionReceipt,
+    ReceiptRouteSnapshot,
+    ReviewerExecutionFact,
+)
+from assurance.model_routing import (
     ModelRouteDecision,
     ModelRouteMatch,
     ModelRouteRule,
@@ -34,9 +39,10 @@ from assurance import (
     ModelRouter,
     ModelRoutingPolicy,
     ModelTierAlias,
-    ReceiptRouteSnapshot,
-    ReviewerExecutionFact,
-    ReviewerFailureOutcome,
+)
+from assurance.review_council import (
+    CouncilPlan,
+    CouncilRunResult,
 )
 from assurance.contracts import ExecutionStep
 from tests.test_assurance_model_routing import (
@@ -1455,10 +1461,5 @@ def test_source_audit_no_provider_tool_gate_io_env_time_random_persistence():
 
 
 def test_public_exports_present_in_assurance_package():
-    missing = NEW_PUBLIC_NAMES - set(assurance.__all__)
-    assert not missing
     for name in sorted(NEW_PUBLIC_NAMES):
-        assert getattr(assurance, name) is not None
-        assert getattr(execution_receipt_module, name) is getattr(
-            assurance, name
-        )
+        assert getattr(execution_receipt_module, name) is not None

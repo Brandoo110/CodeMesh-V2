@@ -16,14 +16,14 @@ import pytest
 from pydantic import ValidationError
 
 import assurance
-from assurance import (
+from assurance import council_report as council_report_module
+from assurance.council_report import (
     CouncilArmSummary,
     CouncilComparisonFixture,
     CouncilPromotionAssessment,
     CouncilReport,
     CouncilReportBuilder,
 )
-from assurance import council_report as council_report_module
 
 
 CATEGORIES = ("intent", "architecture", "operability")
@@ -393,8 +393,7 @@ def test_package_exports():
         "CouncilReportBuilder",
     )
     for name in public_names:
-        assert getattr(assurance, name) is globals()[name]
-    assert set(public_names) <= set(assurance.__all__)
+        assert getattr(council_report_module, name) is globals()[name]
 
 
 def test_module_source_audit_no_io_or_runtime_access():

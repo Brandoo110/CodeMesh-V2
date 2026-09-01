@@ -624,6 +624,177 @@ def _validate_mapping_fields(
             raise GitHubActionsError(f"authoritative {label} {field} did not match Bundle")
 
 
+def _validate_materialized_import(
+    *,
+    document: Mapping[str, object],
+    case: object,
+    run: object,
+    passport: object,
+    lineage: object,
+    check: object,
+    workbench: object,
+    receipt: object,
+    publication: object,
+    transport_ref_commit: str,
+    ci_run_id: str,
+    ci_job_id: str,
+    run_attempt: int,
+    check_id: int,
+    check_url: str,
+    conclusion: str,
+) -> None:
+    projections = {
+        "Case": case,
+        "Run": run,
+        "Passport": passport,
+        "lineage": lineage,
+        "Check": check,
+        "Workbench": workbench,
+        "Bundle receipt": receipt,
+        "publication receipt": publication,
+    }
+    if not all(isinstance(value, Mapping) for value in projections.values()):
+        raise GitHubActionsError("CI materialized projections are invalid")
+    case = projections["Case"]
+    run = projections["Run"]
+    passport = projections["Passport"]
+    lineage = projections["lineage"]
+    check = projections["Check"]
+    workbench = projections["Workbench"]
+    receipt = projections["Bundle receipt"]
+    publication = projections["publication receipt"]
+    assert isinstance(case, Mapping)
+    assert isinstance(run, Mapping)
+    assert isinstance(passport, Mapping)
+    assert isinstance(lineage, Mapping)
+    assert isinstance(check, Mapping)
+    assert isinstance(workbench, Mapping)
+    assert isinstance(receipt, Mapping)
+    assert isinstance(publication, Mapping)
+
+    bindings = {
+        "origin": "local_authoritative_bundle",
+        "transport_id": document.get("transport_id"),
+        "bundle_digest": document.get("bundle_digest"),
+        "repository": document.get("repository"),
+        "target_pr": document.get("target_pr"),
+        "case_id": document.get("case_id"),
+        "run_id": document.get("run_id"),
+        "subject_digest": document.get("subject_digest"),
+        "passport_digest": document.get("passport_digest"),
+        "producer_head": document.get("producer_head"),
+        "transport_head": document.get("transport_head"),
+    }
+    for value, label in (
+        (workbench, "Workbench"),
+        (receipt, "Bundle receipt"),
+        (publication, "publication receipt"),
+        (check, "Check"),
+    ):
+        _validate_mapping_fields(value, bindings, label=label)
+    _validate_mapping_fields(
+        workbench,
+        {"transport_ref": document.get("transport_ref")},
+        label="Workbench",
+    )
+    runtime_bindings = {
+        "transport_ref_commit": transport_ref_commit,
+        "ci_run_id": ci_run_id,
+        "ci_job_id": ci_job_id,
+        "run_attempt": run_attempt,
+    }
+    for value, label in (
+        (workbench, "Workbench"),
+        (receipt, "Bundle receipt"),
+        (publication, "publication receipt"),
+    ):
+        _validate_mapping_fields(value, runtime_bindings, label=label)
+    _validate_mapping_fields(
+        lineage,
+        {
+            **(document.get("lineage") if isinstance(document.get("lineage"), Mapping) else {}),
+            "bundle_digest": document.get("bundle_digest"),
+            **runtime_bindings,
+            "check_id": check_id,
+            "check_url": check_url,
+            "check_conclusion": conclusion,
+        },
+        label="lineage",
+    )
+    for value, label in ((receipt, "Bundle receipt"), (publication, "publication receipt")):
+        _validate_mapping_fields(
+            value,
+            {
+                "transport_ref": document.get("transport_ref"),
+                "check_id": check_id,
+                "check_url": check_url,
+                "conclusion": conclusion,
+            },
+            label=label,
+        )
+    _validate_mapping_fields(
+        case,
+        {
+            "schema_version": "v1",
+            "case_id": document.get("case_id"),
+            "subject_digest": document.get("subject_digest"),
+        },
+        label="Case",
+    )
+    _validate_mapping_fields(
+        passport,
+        {
+            "schema": "codemesh.assurance.passport.v1",
+            "case_id": document.get("case_id"),
+            "subject_digest": document.get("subject_digest"),
+        },
+        label="Passport",
+    )
+    case_view = run.get("case_view")
+    run_receipt = run.get("receipt")
+    if not isinstance(case_view, Mapping) or not isinstance(run_receipt, Mapping):
+        raise GitHubActionsError("Run projection is missing case_view or receipt")
+    _validate_mapping_fields(
+        case_view,
+        {"case_id": document.get("case_id"), "subject_digest": document.get("subject_digest")},
+        label="Run case_view",
+    )
+    _validate_mapping_fields(run_receipt, {"run_id": document.get("run_id")}, label="Run receipt")
+    for field in ("case_id", "subject_digest"):
+        if field in run_receipt and run_receipt[field] != document.get(field):
+            raise GitHubActionsError(f"authoritative Run receipt {field} did not match Bundle")
+    _validate_mapping_fields(
+        check,
+        {
+            "schema_version": "v1",
+            "name": _IMPORTED_CHECK_NAME,
+            "target_pr": document.get("target_pr"),
+            "ci_run_id": ci_run_id,
+            "check_id": check_id,
+            "check_url": check_url,
+            "status": "completed",
+            "conclusion": conclusion,
+        },
+        label="Check",
+    )
+    if type(check_id) is not int or check_id <= 0 or _safe_url(check_url, field="check_url") != check_url:
+        raise GitHubActionsError("materialized Check identity is invalid")
+    if workbench.get("lineage") != lineage or workbench.get("check") != check:
+        raise GitHubActionsError("authoritative Workbench nested projections did not match")
+    if (
+        workbench.get("case") != case
+        or workbench.get("run") != run
+        or workbench.get("passport") != passport
+        or workbench.get("evidence") != document.get("evidence")
+        or workbench.get("object_closure") != document.get("object_closure")
+    ):
+        raise GitHubActionsError("authoritative Workbench Case/Passport projections did not match")
+    zero_fields = ("case_writes", "provider_calls", "assurance_run_invocations")
+    for value, label in ((receipt, "Bundle receipt"), (publication, "publication receipt")):
+        if any(value.get(field) != 0 for field in zero_fields):
+            raise GitHubActionsError(f"{label} contains a forbidden local/provider counter")
+
+
 def _materialize_import(
     verified: VerifiedEvidenceBundle,
     *,
@@ -759,6 +930,24 @@ def _materialize_import(
         "provider_calls": 0,
         "assurance_run_invocations": 0,
     }
+    _validate_materialized_import(
+        document=document,
+        case=case,
+        run=run,
+        passport=passport,
+        lineage=lineage,
+        check=check,
+        workbench=workbench,
+        receipt=receipt,
+        publication=publication,
+        transport_ref_commit=transport_ref_commit,
+        ci_run_id=ci_run_id,
+        ci_job_id=ci_job_id,
+        run_attempt=run_attempt,
+        check_id=check_id,
+        check_url=check_url,
+        conclusion=conclusion,
+    )
     _write_canonical(output / "case.json", case)
     _write_canonical(output / "run.json", run)
     _write_canonical(output / "passport.json", passport)

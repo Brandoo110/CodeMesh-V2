@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from dataclasses import replace
@@ -275,6 +276,77 @@ def test_local_source_reads_complete_export_before_publication(tmp_path: Path) -
 
     assert result.case_view["case_id"] == CASE_ID
     assert api.calls == ["case", "receipt", "passport", "markdown", "index", "artifact", "case"]
+
+
+def test_local_source_preserves_same_digest_stream_references_and_deduplicates_bytes(
+    tmp_path: Path,
+) -> None:
+    exported = _authoritative_export(tmp_path)
+    empty_digest = "sha256:" + hashlib.sha256(b"").hexdigest()
+    index = deepcopy(dict(exported.evidence[0].index))
+    index["artifacts"] = [
+        {
+            "schema_version": "v1",
+            "digest": empty_digest,
+            "kind": "stdout",
+            "label": "command:stdout",
+            "byte_size": 0,
+            "media_type": "text/plain",
+            "integrity_status": "SHA-256 integrity verified",
+            "role": "stdout",
+            "path": None,
+            "command_id": "command",
+            "stream": "stdout",
+        },
+        {
+            "schema_version": "v1",
+            "digest": empty_digest,
+            "kind": "stderr",
+            "label": "command:stderr",
+            "byte_size": 0,
+            "media_type": "text/plain",
+            "integrity_status": "SHA-256 integrity verified",
+            "role": "stderr",
+            "path": None,
+            "command_id": "command",
+            "stream": "stderr",
+        },
+    ]
+    case_view = deepcopy(dict(exported.case_view))
+    passport = deepcopy(dict(exported.passport))
+    case_view["evidence"][0]["artifact_digest"] = empty_digest
+    passport["evidence"][0]["artifact_digest"] = empty_digest
+    duplicate_export = replace(
+        exported,
+        case_view=case_view,
+        passport=passport,
+        evidence=(
+            AuthoritativeEvidenceExport(index=index, artifacts={empty_digest: b""}),
+        ),
+    )
+
+    class DigestAwareApi(_ExportApi):
+        def read_artifact(self, case_id: str, evidence_id: str, digest: str):
+            self.calls.append("artifact")
+            data = self.exported.evidence[0].artifacts[digest]
+            return AssuranceArtifactReadback(
+                case_id=case_id,
+                evidence_id=evidence_id,
+                digest=digest,
+                byte_size=len(data),
+                data=data,
+            )
+
+    result = LocalAuthoritativeCaseSource(
+        DigestAwareApi(duplicate_export)
+    ).export(CASE_ID)
+
+    references = result.evidence[0].index["artifacts"]
+    assert [(item["role"], item["stream"]) for item in references] == [
+        ("stdout", "stdout"),
+        ("stderr", "stderr"),
+    ]
+    assert result.evidence[0].artifacts == {empty_digest: b""}
 
 
 def test_case_drift_from_source_makes_zero_remote_calls(tmp_path: Path) -> None:

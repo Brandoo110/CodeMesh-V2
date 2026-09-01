@@ -335,6 +335,79 @@ def test_bundle_is_canonical_content_addressed_and_closes_objects(tmp_path: Path
         assert _digest(raw) == item["digest"]
 
 
+def test_bundle_preserves_shared_digest_references_and_deduplicates_object_closure(
+    tmp_path: Path,
+) -> None:
+    root, _, artifact_digest = _fixture(tmp_path)
+    index_path = root / "mvp-08f-remediation-post-fix-03-artifacts" / "ev_fixture-index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["artifacts"].append(
+        {
+            **index["artifacts"][0],
+            "kind": "stderr",
+            "label": "fixture:stderr",
+            "role": "stderr",
+            "stream": "stderr",
+        }
+    )
+    _write_json(index_path, index)
+
+    built = build_evidence_bundle(
+        root,
+        case_id=CASE_ID,
+        repository="acme/codemesh",
+        pr_number=2,
+        producer_head=PRODUCER_HEAD,
+        transport_head=TRANSPORT_HEAD,
+    )
+    verified = verify_evidence_bundle(built.bundle_bytes)
+    document = verified.document
+    index_object = next(
+        item
+        for item in document["objects"]
+        if item["name"] == "evidence-index/ev_fixture-index.json"
+    )
+    index_document = json.loads(base64.b64decode(index_object["data_base64"]))
+    assert [(item["role"], item["stream"]) for item in index_document["artifacts"]] == [
+        ("stdout", "stdout"),
+        ("stderr", "stderr"),
+    ]
+    artifact_objects = document["evidence"][0]["artifact_objects"]
+    assert len(artifact_objects) == 2
+    assert len(set(artifact_objects)) == 1
+    assert [
+        item
+        for item in document["objects"]
+        if item["name"] == f"evidence-artifact/{artifact_digest.removeprefix('sha256:')}"
+    ].__len__() == 1
+    assert document["object_closure"] == sorted(set(document["object_closure"]))
+
+
+def test_bundle_rejects_shared_digest_with_conflicting_content_metadata(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path)
+    index_path = root / "mvp-08f-remediation-post-fix-03-artifacts" / "ev_fixture-index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["artifacts"].append(
+        {
+            **index["artifacts"][0],
+            "role": "stderr",
+            "stream": "stderr",
+            "byte_size": index["artifacts"][0]["byte_size"] + 1,
+        }
+    )
+    _write_json(index_path, index)
+
+    with pytest.raises(BundleError, match="metadata"):
+        build_evidence_bundle(
+            root,
+            case_id=CASE_ID,
+            repository="acme/codemesh",
+            pr_number=2,
+            producer_head=PRODUCER_HEAD,
+            transport_head=TRANSPORT_HEAD,
+        )
+
+
 def test_bundle_rejects_legacy_single_segment_transport_ref(tmp_path: Path) -> None:
     built = _build(tmp_path)
     document = json.loads(built.bundle_bytes)

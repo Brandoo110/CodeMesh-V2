@@ -523,29 +523,23 @@ def _validate_index(index: Mapping[str, object], *, case_id: str, evidence_id: s
     if not isinstance(artifacts, list) or not artifacts:
         raise BundleError("Evidence index artifacts are missing")
     normalized: list[dict[str, object]] = []
-    seen: set[str] = set()
     for item in artifacts:
         if not isinstance(item, Mapping):
             raise BundleError("Evidence index artifact is invalid")
         digest = _require_digest(item.get("digest"), field="artifact digest")
-        if digest in seen:
-            raise BundleError("Evidence index artifact digests are not unique")
-        seen.add(digest)
         byte_size = item.get("byte_size")
         if type(byte_size) is not int or byte_size < 0:
             raise BundleError("Evidence artifact byte_size is invalid")
-        label = _require_text(item.get("label"), field="artifact label")
+        _require_text(item.get("label"), field="artifact label")
         media_type = _require_text(item.get("media_type"), field="artifact media_type")
-        role = _require_text(item.get("role"), field="artifact role")
+        _require_text(item.get("role"), field="artifact role")
+        # The raw index retains every reference descriptor.  Only content
+        # identity participates in CAS aggregation, so role/stream metadata
+        # may differ for references that share one digest.
         normalized.append({
             "digest": digest,
             "byte_size": byte_size,
             "media_type": media_type,
-            "role": role,
-            "label": label,
-            "path": item.get("path"),
-            "command_id": item.get("command_id"),
-            "stream": item.get("stream"),
         })
     return normalized
 

@@ -191,8 +191,6 @@ class LocalAuthoritativeCaseSource:
             for artifact in artifacts:
                 artifact_row = _source_mapping(artifact, "artifact reference")
                 digest = _source_digest(artifact_row.get("digest"), "artifact digest")
-                if digest in artifact_bytes:
-                    raise PublicationRemoteError("authoritative source artifact digests are not unique")
                 byte_size = artifact_row.get("byte_size")
                 if type(byte_size) is not int or byte_size < 0 or byte_size > _SOURCE_MAX_BYTES:
                     raise PublicationRemoteError("authoritative source artifact size is invalid")
@@ -208,6 +206,8 @@ class LocalAuthoritativeCaseSource:
                     or len(readback.data) != byte_size
                     or "sha256:" + hashlib.sha256(readback.data).hexdigest() != digest
                 ):
+                    raise PublicationRemoteError("authoritative source artifact readback did not match")
+                if digest in artifact_bytes and artifact_bytes[digest] != readback.data:
                     raise PublicationRemoteError("authoritative source artifact readback did not match")
                 artifact_bytes[digest] = readback.data
             if artifact_digest not in artifact_bytes:
