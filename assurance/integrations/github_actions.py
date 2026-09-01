@@ -692,6 +692,11 @@ def _validate_materialized_import(
         (check, "Check"),
     ):
         _validate_mapping_fields(value, bindings, label=label)
+    _validate_mapping_fields(
+        workbench,
+        {"transport_ref": document.get("transport_ref")},
+        label="Workbench",
+    )
     runtime_bindings = {
         "transport_ref_commit": transport_ref_commit,
         "ci_run_id": ci_run_id,
