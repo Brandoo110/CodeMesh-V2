@@ -8,6 +8,9 @@ authoritative CaseView readback before returning anything to a caller.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +18,15 @@ from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr, ValidationError
+
+from .contracts import ExecutionReceipt
+from .evidence_artifacts import ArtifactReference
+
+
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MAX_JSON_BYTES = 256 * 1024
+_MAX_ARTIFACT_INDEX_BYTES = 256 * 1024
+_MAX_ARTIFACT_BYTES = 256 * 1024
 
 
 class AssuranceEntryError(RuntimeError):
@@ -31,6 +43,17 @@ class AssuranceResponseError(AssuranceEntryError):
 
 class AssuranceReadbackError(AssuranceEntryError):
     """The authoritative CaseView did not match the run response."""
+
+
+@dataclass(frozen=True)
+class AssuranceArtifactReadback:
+    """One bounded, header- and digest-verified artifact response."""
+
+    case_id: str
+    evidence_id: str
+    digest: str
+    byte_size: int
+    data: bytes
 
 
 class _RunResponse(BaseModel):
@@ -63,6 +86,25 @@ def _require_nonblank(value: object, field_name: str) -> str:
     if "\x00" in value:
         raise ValueError(f"{field_name} contains NUL")
     return value
+
+
+def _require_sha256(value: object, field_name: str) -> str:
+    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
+        raise AssuranceResponseError(f"assurance service returned an invalid {field_name}")
+    return value
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"unsupported JSON constant {value}")
 
 
 def _validate_base_url(value: object) -> str:
@@ -144,6 +186,35 @@ class AssuranceHttpClient:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    @staticmethod
+    def _bounded_content(
+        response: httpx.Response,
+        *,
+        max_bytes: int,
+        expected_media_type: str | None = None,
+    ) -> bytes:
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        declared = response.headers.get("Content-Length")
+        declared_size: int | None = None
+        if declared is not None:
+            if re.fullmatch(r"[0-9]+", declared.strip()) is None:
+                raise AssuranceResponseError("assurance service returned invalid response headers")
+            declared_size = int(declared)
+            if declared_size > max_bytes:
+                raise AssuranceResponseError("assurance service response exceeded size limit")
+        content = response.content
+        if len(content) > max_bytes:
+            raise AssuranceResponseError("assurance service response exceeded size limit")
+        if declared_size is not None and declared_size != len(content):
+            raise AssuranceResponseError("assurance service response size did not match headers")
+        if expected_media_type is not None:
+            content_type = response.headers.get("Content-Type", "")
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if media_type != expected_media_type:
+                raise AssuranceResponseError("assurance service returned an invalid content type")
+        return content
+
     def _request(
         self,
         method: str,
@@ -169,8 +240,17 @@ class AssuranceHttpClient:
 
     @staticmethod
     def _json(response: httpx.Response) -> object:
+        data = AssuranceHttpClient._bounded_content(
+            response,
+            max_bytes=_MAX_JSON_BYTES,
+            expected_media_type="application/json",
+        )
         try:
-            return response.json()
+            return json.loads(
+                data.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_json_constant,
+            )
         except (ValueError, TypeError) as exc:
             raise AssuranceResponseError("assurance service returned invalid JSON") from exc
 
@@ -219,23 +299,149 @@ class AssuranceHttpClient:
         payload = self._json(response)
         if not isinstance(payload, dict):
             raise AssuranceResponseError("assurance service returned an invalid CaseView")
-        if payload.get("schema_version") != "v1" or payload.get("case_id") != case:
+        if (
+            payload.get("schema_version") != "v1"
+            or payload.get("case_id") != case
+            or _SHA256_RE.fullmatch(str(payload.get("subject_digest"))) is None
+        ):
             raise AssuranceResponseError("assurance service returned an invalid CaseView")
+        return dict(payload)
+
+    def get_receipt(self, case_id: str) -> dict[str, Any]:
+        case = _require_nonblank(case_id, "case_id")
+        response = self._request(
+            "GET",
+            f"/api/assurance/changes/{quote(case, safe='')}/receipt",
+        )
+        payload = self._json(response)
+        if not isinstance(payload, dict):
+            raise AssuranceResponseError("assurance service returned an invalid receipt")
+        try:
+            ExecutionReceipt.model_validate(payload)
+        except ValidationError as exc:
+            raise AssuranceResponseError("assurance service returned an invalid receipt") from exc
+        if _SHA256_RE.fullmatch(str(payload.get("subject_digest"))) is None:
+            raise AssuranceResponseError("assurance service returned an invalid receipt")
         return dict(payload)
 
     def get_passport(self, case_id: str) -> dict[str, Any]:
         case = _require_nonblank(case_id, "case_id")
         response = self._request(
             "GET",
-            f"/api/assurance/changes/{quote(case, safe='')}/passport",
+            f"/api/assurance/changes/{quote(case, safe='')}/passport?format=json",
             headers={"Accept": "application/json"},
         )
         payload = self._json(response)
-        if not isinstance(payload, dict):
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "codemesh.assurance.passport.v1"
+            or payload.get("case_id") != case
+            or _SHA256_RE.fullmatch(str(payload.get("subject_digest"))) is None
+            or not isinstance(payload.get("evidence"), list)
+        ):
             raise AssuranceResponseError("assurance service returned an invalid passport")
-        if payload.get("case_id") != case:
-            raise AssuranceResponseError("assurance service returned a mismatched passport")
         return dict(payload)
+
+    def get_passport_markdown(self, case_id: str) -> str:
+        case = _require_nonblank(case_id, "case_id")
+        response = self._request(
+            "GET",
+            f"/api/assurance/changes/{quote(case, safe='')}/passport?format=markdown",
+            headers={"Accept": "text/markdown"},
+        )
+        data = self._bounded_content(
+            response,
+            max_bytes=_MAX_JSON_BYTES,
+            expected_media_type="text/markdown",
+        )
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AssuranceResponseError(
+                "assurance service returned invalid Passport Markdown"
+            ) from exc
+
+    def list_artifacts(self, case_id: str, evidence_id: str) -> dict[str, Any]:
+        case = _require_nonblank(case_id, "case_id")
+        evidence = _require_nonblank(evidence_id, "evidence_id")
+        response = self._request(
+            "GET",
+            f"/api/assurance/changes/{quote(case, safe='')}/evidence/{quote(evidence, safe='')}/artifacts",
+        )
+        data = self._bounded_content(
+            response,
+            max_bytes=_MAX_ARTIFACT_INDEX_BYTES,
+            expected_media_type="application/json",
+        )
+        try:
+            payload = json.loads(
+                data.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_json_constant,
+            )
+        except (ValueError, TypeError, UnicodeDecodeError) as exc:
+            raise AssuranceResponseError(
+                "assurance service returned an invalid artifact index"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise AssuranceResponseError("assurance service returned an invalid artifact index")
+        if (
+            payload.get("schema_version") != "v1"
+            or payload.get("case_id") != case
+            or payload.get("evidence_id") != evidence
+            or type(payload.get("evidence_kind")) is not str
+            or not payload["evidence_kind"].strip()
+            or not isinstance(payload.get("artifacts"), list)
+            or not payload["artifacts"]
+            or len(payload["artifacts"]) > 256
+        ):
+            raise AssuranceResponseError("assurance service returned an invalid artifact index")
+        normalized: list[dict[str, Any]] = []
+        try:
+            for item in payload["artifacts"]:
+                normalized.append(
+                    ArtifactReference.model_validate(item).model_dump(mode="json")
+                )
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise AssuranceResponseError(
+                "assurance service returned an invalid artifact index"
+            ) from exc
+        return {**payload, "artifacts": normalized}
+
+    def read_artifact(
+        self, case_id: str, evidence_id: str, digest: str
+    ) -> AssuranceArtifactReadback:
+        case = _require_nonblank(case_id, "case_id")
+        evidence = _require_nonblank(evidence_id, "evidence_id")
+        requested_digest = _require_sha256(digest, "artifact digest")
+        response = self._request(
+            "GET",
+            f"/api/assurance/changes/{quote(case, safe='')}/evidence/{quote(evidence, safe='')}/artifacts/{quote(requested_digest, safe='')}",
+            headers={"Accept": "text/plain"},
+        )
+        data = self._bounded_content(
+            response,
+            max_bytes=_MAX_ARTIFACT_BYTES,
+            expected_media_type="text/plain",
+        )
+        if response.headers.get("X-Artifact-Digest") != requested_digest:
+            raise AssuranceResponseError("artifact digest header did not match request")
+        size_header = response.headers.get("X-Artifact-Size")
+        if size_header is None or re.fullmatch(r"[0-9]+", size_header.strip()) is None:
+            raise AssuranceResponseError("artifact size header was invalid")
+        byte_size = int(size_header)
+        if byte_size > _MAX_ARTIFACT_BYTES or byte_size != len(data):
+            raise AssuranceResponseError("artifact size did not match response bytes")
+        actual_digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        if actual_digest != requested_digest:
+            raise AssuranceResponseError("artifact bytes did not match requested digest")
+        return AssuranceArtifactReadback(
+            case_id=case,
+            evidence_id=evidence,
+            digest=requested_digest,
+            byte_size=byte_size,
+            data=data,
+        )
 
     def run_and_readback(
         self,
@@ -261,6 +467,7 @@ class AssuranceHttpClient:
 
 
 __all__ = [
+    "AssuranceArtifactReadback",
     "AssuranceEntryError",
     "AssuranceHttpClient",
     "AssuranceReadbackError",

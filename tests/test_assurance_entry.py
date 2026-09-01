@@ -1,14 +1,51 @@
 """Focused tests for the live local Assurance Run client."""
 
 import json
+import hashlib
 
 import httpx
 import pytest
 
-from assurance.entry import AssuranceReadbackError, AssuranceHttpClient
+from assurance.entry import (
+    AssuranceArtifactReadback,
+    AssuranceReadbackError,
+    AssuranceResponseError,
+    AssuranceHttpClient,
+)
 
 
 SUBJECT = "sha256:" + "1" * 64
+
+
+def _receipt_payload() -> dict[str, object]:
+    return {
+        "schema_version": "v1",
+        "receipt_id": "receipt-001",
+        "run_id": "run-001",
+        "subject_digest": SUBJECT,
+        "steps": [
+            {
+                "sequence": 0,
+                "planned_role": "operability",
+                "actual_role": "operability",
+                "model_ref": "fixture-model",
+                "provider": "fixture-provider",
+                "tool_grants": [],
+                "routing_rule": "fixture",
+                "fallback_reason": None,
+                "token_budget": 0,
+                "timeout_seconds": 1,
+                "result": "success",
+                "schema_status": "valid",
+            }
+        ],
+        "overall_result": "success",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "started_at": "2026-08-30T10:00:00Z",
+        "completed_at": "2026-08-30T10:00:01Z",
+    }
 
 
 def _case_view(*, checked_at: str) -> dict[str, object]:
@@ -145,3 +182,115 @@ def test_passport_readback_must_bind_to_requested_case():
 
     with pytest.raises(Exception):
         client.get_passport("case-001")
+
+
+def test_readonly_export_getters_validate_paths_and_artifact_headers():
+    artifact = b"authoritative artifact\n"
+    digest = "sha256:" + hashlib.sha256(artifact).hexdigest()
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/receipt"):
+            return httpx.Response(
+                200,
+                json=_receipt_payload(),
+            )
+        if request.url.path.endswith("/passport"):
+            if request.url.query == b"format=markdown":
+                return httpx.Response(
+                    200,
+                    content=b"# Passport\n",
+                    headers={"Content-Type": "text/markdown"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "schema": "codemesh.assurance.passport.v1",
+                    "case_id": "case-001",
+                    "subject_digest": SUBJECT,
+                    "evidence": [],
+                },
+            )
+        if request.url.path.endswith("/artifacts"):
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "v1",
+                    "case_id": "case-001",
+                    "evidence_id": "ev_001",
+                    "evidence_kind": "command_batch",
+                    "artifacts": [
+                        {
+                            "schema_version": "v1",
+                            "digest": digest,
+                            "kind": "stdout",
+                            "label": "fixture:stdout",
+                            "byte_size": len(artifact),
+                            "media_type": "text/plain",
+                            "integrity_status": "SHA-256 integrity verified",
+                            "role": "stdout",
+                            "path": None,
+                            "command_id": "fixture",
+                            "stream": "stdout",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            content=artifact,
+            headers={
+                "Content-Type": "text/plain",
+                "X-Artifact-Digest": digest,
+                "X-Artifact-Size": str(len(artifact)),
+            },
+        )
+
+    client = AssuranceHttpClient(
+        "http://127.0.0.1:8010",
+        transport=httpx.MockTransport(handler),
+    )
+
+    receipt = client.get_receipt("case-001")
+    passport = client.get_passport("case-001")
+    markdown = client.get_passport_markdown("case-001")
+    index = client.list_artifacts("case-001", "ev_001")
+    readback = client.read_artifact("case-001", "ev_001", digest)
+
+    assert receipt["run_id"] == "run-001"
+    assert passport["case_id"] == "case-001"
+    assert markdown == "# Passport\n"
+    assert index["evidence_id"] == "ev_001"
+    assert isinstance(readback, AssuranceArtifactReadback)
+    assert readback.data == artifact
+    assert [request.method for request in requests] == [
+        "GET",
+        "GET",
+        "GET",
+        "GET",
+        "GET",
+    ]
+
+
+def test_read_artifact_rejects_mismatched_digest_header():
+    digest = "sha256:" + "4" * 64
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"artifact",
+            headers={
+                "Content-Type": "text/plain",
+                "X-Artifact-Digest": "sha256:" + "5" * 64,
+                "X-Artifact-Size": "8",
+            },
+        )
+
+    client = AssuranceHttpClient(
+        "http://127.0.0.1:8010",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(AssuranceResponseError, match="digest"):
+        client.read_artifact("case-001", "ev-001", digest)
