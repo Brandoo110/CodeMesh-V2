@@ -1,5 +1,7 @@
 import json
 
+from typer.testing import CliRunner
+
 from assurance import cli
 
 
@@ -118,3 +120,55 @@ def test_cli_configuration_error_is_generic(monkeypatch, tmp_path, capsys):
     assert captured.out == ""
     assert captured.err.strip() == "assurance command failed"
     assert absolute not in captured.err
+
+
+def test_live_run_command_prints_case_subject_gate_freshness_and_workbench(
+    monkeypatch, tmp_path
+):
+    task = tmp_path / "task.md"
+    task.write_text("# Task\n", encoding="utf-8")
+    receipt = {
+        "run_id": "run-001",
+        "request_digest": "sha256:" + "2" * 64,
+        "cached": False,
+        "case_id": "case-001",
+        "case_view": {
+            "subject_digest": "sha256:" + "1" * 64,
+            "policy_gate": {"status": "PENDING"},
+            "acceptance_state": "EVIDENCE_COLLECTED",
+            "freshness": {"status": "FRESH"},
+            "allowed_actions": [],
+        },
+    }
+
+    def fake_run(**kwargs):
+        assert kwargs["repository_identity"] == "acme/widget"
+        return receipt
+
+    monkeypatch.setattr(cli, "_perform_live_run", fake_run)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            "--repository",
+            str(tmp_path),
+            "--repository-identity",
+            "acme/widget",
+            "--base-ref",
+            "main",
+            "--task-path",
+            str(task),
+            "--command-id",
+            "diff-check",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "run-001" in result.stdout
+    assert "case-001" in result.stdout
+    assert "sha256:" + "1" * 64 in result.stdout
+    assert "PENDING" in result.stdout
+    assert "EVIDENCE_COLLECTED" in result.stdout
+    assert "FRESH" in result.stdout
+    assert "http://127.0.0.1:3010/?view=assurance" in result.stdout
+    assert str(tmp_path) not in result.stdout
