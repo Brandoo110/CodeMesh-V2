@@ -23,7 +23,6 @@ import httpx
 from pydantic import SecretStr, ValidationError
 
 from assurance.artifacts import ArtifactStore
-from assurance.codex_cli_reviewer_invoker import CodexCliReviewerInvoker
 from assurance.commands import CommandSpec
 from assurance.contracts import Finding
 from assurance.digests import (
@@ -60,9 +59,6 @@ from assurance.snapshot import GitSnapshotResult
 from orchestration.adapters import (
     DashScopeAdapter,
     DeepSeekAdapter,
-    GeminiAdapter,
-    MiniMaxAdapter,
-    VolcEngineAdapter,
 )
 from orchestration.adapters.base import ModelAdapter
 from web.assurance_remediation import (
@@ -129,7 +125,7 @@ _EXPANSION_RE = re.compile(r"(?:[$~{}]|%[^%]+%)")
 
 RemediationAdapterFactory = Callable[[str, str, str], ModelAdapter]
 _REMEDIATION_PROVIDERS = frozenset(
-    {"qwen", "dashscope", "gemini", "volcengine", "doubao", "minimax", "deepseek"}
+    {"qwen", "deepseek"}
 )
 
 
@@ -300,11 +296,9 @@ def _command_specs(value: object) -> tuple[CommandSpec, ...]:
 def _reviewer_route(value: object) -> ReviewerRoute:
     reviewer = _mapping(value, keys=_REVIEWER_KEYS, label="reviewer")
     provider = _text(reviewer["provider"], label="reviewer.provider")
-    if provider not in {"deepseek", "openai-codex-desktop"}:
+    if provider != "deepseek":
         raise _InvalidRuntimeConfig("reviewer.provider is not supported")
     model_ref = _text(reviewer["model_ref"], label="reviewer.model_ref")
-    if provider == "openai-codex-desktop" and model_ref != "gpt-5.6-luna":
-        raise _InvalidRuntimeConfig("reviewer.model_ref is not supported")
     timeout_seconds = _positive_int(
         reviewer["timeout_seconds"], label="reviewer.timeout_seconds"
     )
@@ -485,14 +479,8 @@ def _default_remediation_adapter_factory(
 ) -> ModelAdapter:
     """Construct one explicitly configured existing adapter, without routing."""
 
-    if provider in {"qwen", "dashscope"}:
+    if provider == "qwen":
         adapter = DashScopeAdapter(api_key=api_key, model=model_ref)
-    elif provider == "gemini":
-        adapter = GeminiAdapter(api_key=api_key, model=model_ref)
-    elif provider in {"volcengine", "doubao"}:
-        adapter = VolcEngineAdapter(api_key=api_key, endpoint_id=model_ref)
-    elif provider == "minimax":
-        adapter = MiniMaxAdapter(api_key=api_key, model=model_ref)
     elif provider == "deepseek":
         adapter = DeepSeekAdapter(
             api_key=api_key,
@@ -882,20 +870,17 @@ def _build_runtime(
         repository.initialize()
         artifact_store = ArtifactStore(config.artifact_store_root)
         context_builder = SafeReviewerContextBuilder()
-        if config.reviewer.provider == "openai-codex-desktop":
-            reviewer_invoker = CodexCliReviewerInvoker()
-        else:
-            if reviewer_api_key is None:
-                raise ValueError("DeepSeek reviewer requires an API key")
-            endpoint = FixedReviewerEndpoint(
-                route=config.reviewer,
-                base_url=_FIXED_REVIEWER_BASE_URL,
-                api_key=SecretStr(reviewer_api_key),
-            )
-            reviewer_invoker = FixedOpenAICompatibleReviewerInvoker(
-                endpoint,
-                transport=reviewer_transport,
-            )
+        if reviewer_api_key is None:
+            raise ValueError("DeepSeek reviewer requires an API key")
+        endpoint = FixedReviewerEndpoint(
+            route=config.reviewer,
+            base_url=_FIXED_REVIEWER_BASE_URL,
+            api_key=SecretStr(reviewer_api_key),
+        )
+        reviewer_invoker = FixedOpenAICompatibleReviewerInvoker(
+            endpoint,
+            transport=reviewer_transport,
+        )
         service = AssuranceRunService(
             artifact_store=artifact_store,
             reviewer_invoker=reviewer_invoker,
@@ -954,7 +939,7 @@ def load_assurance_runtime_from_environment(
     config = _read_config(config_ref)
     if config is None:
         return None
-    if config.reviewer.provider == "deepseek" and reviewer_api_key is None:
+    if reviewer_api_key is None:
         return None
     try:
         config = _validate_paths(config)

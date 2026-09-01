@@ -366,6 +366,9 @@ def test_workflow_queries_only_current_evidence_v2_transport_ref():
 
     assert "refs/heads/codex/evidence-v2/*/" in workflow
     assert "refs/heads/codex/evidence/*/" not in workflow
+    assert "Verify CI-only import counters" not in workflow
+    assert "bundle-receipt.json" not in workflow
+    assert "workbench.json" not in workflow
     assert '--ci-job-id "${{ job.check_run_id }}"' in workflow
     assert '--ci-job-id "$GITHUB_JOB"' not in workflow
     assert document["permissions"] == {
@@ -541,6 +544,45 @@ def test_actions_import_materializes_ci_only_workbench_and_zero_counters(tmp_pat
         assert value["case_writes"] == 0
         assert value["provider_calls"] == 0
         assert value["assurance_run_invocations"] == 0
+
+
+def test_cli_materialization_rejects_lineage_mismatch(tmp_path, monkeypatch):
+    bundle, _result, output_dir = _import_fixture(tmp_path, monkeypatch)
+    verified = github_actions.verify_evidence_bundle(bundle.bundle_bytes)
+    documents = {
+        name: json.loads((output_dir / name).read_text(encoding="utf-8"))
+        for name in (
+            "case.json",
+            "run.json",
+            "passport.json",
+            "lineage.json",
+            "check.json",
+            "workbench.json",
+            "bundle-receipt.json",
+            "publication.json",
+        )
+    }
+    documents["workbench.json"]["check"]["case_id"] = "case_forged"
+
+    with pytest.raises(github_actions.GitHubActionsError, match="nested projections"):
+        github_actions._validate_materialized_import(
+            document=verified.document,
+            case=documents["case.json"],
+            run=documents["run.json"],
+            passport=documents["passport.json"],
+            lineage=documents["lineage.json"],
+            check=documents["check.json"],
+            workbench=documents["workbench.json"],
+            receipt=documents["bundle-receipt.json"],
+            publication=documents["publication.json"],
+            transport_ref_commit="c" * 40,
+            ci_run_id="9001",
+            ci_job_id="assurance",
+            run_attempt=1,
+            check_id=321,
+            check_url="https://github.com/acme/codemesh/runs/321",
+            conclusion="success",
+        )
 
 
 def test_actions_artifact_readback_rejects_tampered_or_extra_files(tmp_path, monkeypatch):

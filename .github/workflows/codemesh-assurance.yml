@@ -117,36 +117,6 @@ jobs:
             --ci-job-id "${{ job.check_run_id }}" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
 
-      - name: Verify CI-only import counters
-        env:
-          CODEMESH_OUTPUT_DIR: ${{ runner.temp }}/codemesh-authoritative-artifacts
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          root = Path(os.environ["CODEMESH_OUTPUT_DIR"])
-          receipt = json.loads((root / "bundle-receipt.json").read_text(encoding="utf-8"))
-          publication = json.loads((root / "publication.json").read_text(encoding="utf-8"))
-          zero_fields = (
-              "case_writes",
-              "provider_calls",
-              "assurance_run_invocations",
-          )
-          for value in (receipt, publication):
-              if any(value.get(field) != 0 for field in zero_fields):
-                  raise SystemExit("CI import executed a forbidden local/provider path")
-          print("case_writes=0")
-          print("provider_calls=0")
-          print("assurance_run_invocations=0")
-
-          workbench = json.loads((root / "workbench.json").read_text(encoding="utf-8"))
-          if workbench.get("origin") != "local_authoritative_bundle":
-              raise SystemExit("Workbench origin was not authoritative Bundle")
-          print("workbench_origin=local_authoritative_bundle")
-          PY
-
       - name: Upload authoritative Workbench artifact
         if: always()
         uses: actions/upload-artifact@v4

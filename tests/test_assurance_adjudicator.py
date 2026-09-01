@@ -22,7 +22,7 @@ from pydantic import BaseModel, ValidationError
 
 import assurance
 import assurance.adjudicator as adjudicator_module
-from assurance import (
+from assurance.adjudicator import (
     AdjudicationCluster,
     AdjudicationHumanQuestion,
     AdjudicationResult,
@@ -31,15 +31,19 @@ from assurance import (
     AdjudicatorNormalizationInput,
     AdjudicatorPrompt,
     AdjudicationTrigger,
-    CouncilExecutionReceipt,
-    CouncilEvidenceIndexEntry,
-    CouncilPlan,
-    CouncilRunResult,
+)
+from assurance.execution_receipt import CouncilExecutionReceipt
+from assurance.model_routing import (
     ModelRouteDecision,
     ModelRouteMatch,
     ModelRouter,
     ModelRoutingPolicy,
     ModelTierAlias,
+)
+from assurance.review_council import (
+    CouncilEvidenceIndexEntry,
+    CouncilPlan,
+    CouncilRunResult,
 )
 from assurance.contracts import Finding
 from assurance.single_reviewer import ReviewQuestion
@@ -1797,6 +1801,5 @@ def test_source_audit_no_forbidden_imports_io_or_authority():
 
 def test_package_exports_public_names():
     for name in NEW_PUBLIC_NAMES:
-        assert getattr(assurance, name) is not None
-    assert assurance.Adjudicator is Adjudicator
+        assert getattr(adjudicator_module, name) is not None
     assert Path(adjudicator_module.__file__).name == "adjudicator.py"

@@ -11,7 +11,6 @@ from fastapi.testclient import TestClient
 import web.assurance_runtime as runtime_module
 import orchestration.adapters.deepseek as deepseek_module
 from assurance.artifacts import ArtifactStore
-from assurance.codex_cli_reviewer_invoker import CodexCliReviewerInvoker
 from assurance.digests import (
     AcceptanceScopeDigestInput,
     SubjectDigestInput,
@@ -115,6 +114,31 @@ def _remediation_config(provider: str = "qwen"):
             "authoritative_check_id": "check",
         },
     }
+
+
+def test_codex_desktop_is_not_a_product_reviewer_provider(tmp_path):
+    config = _config(tmp_path)
+    config["reviewer"] = {
+        "provider": "openai-codex-desktop",
+        "model_ref": "gpt-5.6-luna",
+        "timeout_seconds": 5,
+        "token_budget": 4096,
+        "routing_rule": "single_general.v0:fixed",
+    }
+
+    with pytest.raises(runtime_module._InvalidRuntimeConfig):
+        runtime_module._parse_config(config)
+
+
+@pytest.mark.parametrize(
+    "provider", ["dashscope", "gemini", "volcengine", "doubao", "minimax"]
+)
+def test_v2_rejects_unverified_remediation_provider(tmp_path, provider):
+    config = _config(tmp_path, schema_version="v2")
+    config["remediation"] = _remediation_config(provider)
+
+    with pytest.raises(runtime_module._InvalidRuntimeConfig):
+        runtime_module._parse_config(config)
 
 
 class _FakeRemediationAdapter:
@@ -293,9 +317,7 @@ def test_v2_without_remediation_secret_starts_core_without_remediation_service(
     assert factory_calls == []
 
 
-def test_codex_reviewer_composes_without_reviewer_api_key_and_does_not_receive_one(
-    tmp_path, monkeypatch
-):
+def test_codex_reviewer_provider_is_disabled_before_initialization(tmp_path, monkeypatch):
     config = _config(tmp_path)
     config["reviewer"] = {
         "provider": "openai-codex-desktop",
@@ -307,25 +329,20 @@ def test_codex_reviewer_composes_without_reviewer_api_key_and_does_not_receive_o
     config_path = _write_config(tmp_path, config)
     calls = []
 
-    class _FakeCodexInvoker:
+    class _Forbidden:
         def __init__(self, *args, **kwargs):
             calls.append((args, kwargs))
+            raise AssertionError("unsupported reviewer provider must not initialize")
 
-        async def aclose(self):
-            return None
-
-    monkeypatch.setattr(runtime_module, "CodexCliReviewerInvoker", _FakeCodexInvoker)
+    monkeypatch.setattr(runtime_module, "AssuranceWebRepository", _Forbidden)
+    monkeypatch.setattr(runtime_module, "FixedOpenAICompatibleReviewerInvoker", _Forbidden)
     environment = {
         "CODEMESH_ASSURANCE_CONFIG": str(config_path),
         "CODEMESH_ASSURANCE_REVIEWER_API_KEY": "must-not-be-used",
     }
 
-    runtime = load_assurance_runtime_from_environment(environment)
-    assert isinstance(runtime, AssuranceRuntime)
-    assert isinstance(runtime.reviewer_invoker, _FakeCodexInvoker)
-    assert calls == [((), {})]
-    assert not isinstance(runtime.reviewer_invoker, CodexCliReviewerInvoker)
-    asyncio.run(runtime.aclose())
+    assert load_assurance_runtime_from_environment(environment) is None
+    assert calls == []
 
 
 def test_deepseek_reviewer_without_api_key_stays_disabled(tmp_path, monkeypatch):
@@ -345,7 +362,7 @@ def test_deepseek_reviewer_without_api_key_stays_disabled(tmp_path, monkeypatch)
     assert calls == []
 
 
-def test_codex_reviewer_without_remediation_key_keeps_remediation_disabled(
+def test_codex_reviewer_provider_is_rejected_even_with_v2_remediation(
     tmp_path, monkeypatch
 ):
     config = _config(tmp_path, schema_version="v2")
@@ -360,22 +377,16 @@ def test_codex_reviewer_without_remediation_key_keeps_remediation_disabled(
     config_path = _write_config(tmp_path, config)
     calls = []
 
-    class _FakeCodexInvoker:
+    class _Forbidden:
         def __init__(self, *args, **kwargs):
             calls.append((args, kwargs))
+            raise AssertionError("unsupported reviewer provider must not initialize")
 
-        async def aclose(self):
-            return None
-
-    monkeypatch.setattr(runtime_module, "CodexCliReviewerInvoker", _FakeCodexInvoker)
-    runtime = load_assurance_runtime_from_environment(
+    monkeypatch.setattr(runtime_module, "AssuranceWebRepository", _Forbidden)
+    assert load_assurance_runtime_from_environment(
         {"CODEMESH_ASSURANCE_CONFIG": str(config_path)}
-    )
-
-    assert isinstance(runtime, AssuranceRuntime)
-    assert runtime.remediation_service is None
-    assert calls == [((), {})]
-    asyncio.run(runtime.aclose())
+    ) is None
+    assert calls == []
 
 
 @pytest.mark.parametrize("provider", ["qwen", "deepseek"])

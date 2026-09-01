@@ -14,16 +14,11 @@ import assurance
 import assurance.review_council as council_module
 from assurance import (
     ChangeSubject,
-    CouncilCancellation,
-    CouncilEvidenceIndexEntry,
-    CouncilPlan,
-    CouncilRunResult,
     FindingOutput,
     ReviewerEvidenceContext,
     ReviewerFailureOutcome,
     ReviewerInput,
     ReviewQuestion,
-    ReviewCouncil,
     RiskClassificationResult,
 )
 from assurance.contracts import Finding as FindingModel
@@ -33,6 +28,13 @@ from assurance.risk import (
     RiskClassificationInput,
     RiskClassifier,
     RiskDeclarations,
+)
+from assurance.review_council import (
+    CouncilCancellation,
+    CouncilEvidenceIndexEntry,
+    CouncilPlan,
+    CouncilRunResult,
+    ReviewCouncil,
 )
 from assurance.snapshot import GitChange, GitSnapshot
 
@@ -1328,16 +1330,8 @@ async def test_clock_is_only_used_for_synthetic_failure_outputs():
 
 
 def test_package_exports_new_public_symbols():
-    assert PUBLIC_API_NAMES <= set(assurance.__all__)
     for name in PUBLIC_API_NAMES:
-        assert hasattr(assurance, name)
-    assert assurance.CouncilPlan is council_module.CouncilPlan
-    assert assurance.CouncilEvidenceIndexEntry is (
-        council_module.CouncilEvidenceIndexEntry
-    )
-    assert assurance.CouncilRunResult is council_module.CouncilRunResult
-    assert assurance.CouncilCancellation is council_module.CouncilCancellation
-    assert assurance.ReviewCouncil is council_module.ReviewCouncil
+        assert hasattr(council_module, name)
 
 
 def test_module_has_no_forbidden_fields_or_io():

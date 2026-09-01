@@ -18,6 +18,14 @@ from pydantic import ValidationError
 import assurance
 import assurance.model_routing as model_routing_module
 from assurance import (
+    RiskClassificationInput,
+    RiskClassificationResult,
+    RiskClassifier,
+    RiskDeclarations,
+)
+from assurance.intake import IntakeSnapshot
+from assurance.manifest import EvidenceManifest, EvidenceManifestEntry
+from assurance.model_routing import (
     ModelCandidate,
     ModelRouteAttempt,
     ModelRouteBudget,
@@ -29,13 +37,7 @@ from assurance import (
     ModelRouteTarget,
     ModelRouter,
     ModelTierAlias,
-    RiskClassificationInput,
-    RiskClassificationResult,
-    RiskClassifier,
-    RiskDeclarations,
 )
-from assurance.intake import IntakeSnapshot
-from assurance.manifest import EvidenceManifest, EvidenceManifestEntry
 from assurance.snapshot import GitChange, GitSnapshot
 
 
@@ -1752,7 +1754,5 @@ def test_selected_is_only_a_routing_outcome():
 
 
 def test_public_exports_present_in_assurance_package():
-    missing = NEW_PUBLIC_NAMES - set(assurance.__all__)
-    assert not missing
     for name in sorted(NEW_PUBLIC_NAMES):
-        assert getattr(assurance, name) is not None
+        assert getattr(model_routing_module, name) is not None

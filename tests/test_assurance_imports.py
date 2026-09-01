@@ -4,6 +4,10 @@ import ast
 import hashlib
 import inspect
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -114,6 +118,39 @@ NEW_PUBLIC_NAMES = {
     "GenericEvidenceSubjectMismatch",
     "GenericEvidenceArtifactError",
 }
+
+
+def test_default_import_does_not_load_experimental_graph():
+    probe = """
+import sys
+import assurance
+
+experimental_modules = {
+    "assurance.review_council",
+    "assurance.model_routing",
+    "assurance.execution_receipt",
+    "assurance.adjudicator",
+    "assurance.council_report",
+}
+loaded = sorted(experimental_modules & set(sys.modules))
+assert not loaded, loaded
+assert not {
+    "ReviewCouncil",
+    "ModelRouter",
+    "CouncilExecutionReceipt",
+    "Adjudicator",
+    "CouncilReport",
+} & set(assurance.__all__)
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", probe],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 ALL_MODELS = (
     SignatureMetadata,
