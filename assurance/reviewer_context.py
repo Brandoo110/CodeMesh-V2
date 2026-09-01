@@ -110,7 +110,7 @@ _LOCAL_PATH_RE = re.compile(
     r"Library|System|Applications|Developer|Network|Documents|Downloads|"
     r"Desktop|Shared|srv|mnt|usr|bin|sbin|lib|lib64|run|dev|proc|sys|boot|"
     r"media|snap|workspace|workspaces|app|data)/[^\s\"'`]+|"
-    r"(?<![A-Za-z0-9_])file://[^\s\"'`]+|"
+    r"(?<![A-Za-z0-9_])(?i:file://)[^\s\"'`]+|"
     r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/](?:Users[\\/]\s*)?[^\s\"'`]+|"
     r"(?<![A-Za-z0-9_])\\\\[^\\\s\"'`]+\\[^\\\s\"'`]+(?:\\[^\\\s\"'`]+)*|"
     r"(?<![A-Za-z0-9_:/])//[^/\s\"'`]+/[^\s\"'`]+(?:/[^\s\"'`]+)*"
@@ -1725,30 +1725,37 @@ def _dependency_audit_aggregate(
             for item in value:
                 reject_forbidden(item)
         elif type(value) is str:
-            _assert_no_real_secret(value)
+            _assert_final_safe_leaf(value)
 
     reject_forbidden(result)
     allowed_top = {
+        "actions",
         "advisories",
         "metadata",
+        "muted",
         "vulnerabilities",
         "auditReportVersion",
     }
     if set(result) - allowed_top:
         raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+    for key in ("actions", "muted"):
+        if key in result and (
+            type(result[key]) is not list or result[key]
+        ):
+            raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
     severities = ("critical", "high", "moderate", "low", "info")
     counts = {name: 0 for name in severities}
     counts["unknown"] = 0
     count_sources = []
     metadata = result.get("metadata")
-    if metadata is not None:
+    if "metadata" in result:
         if type(metadata) is not dict:
             raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
         vulnerability_counts = metadata.get("vulnerabilities")
-        if vulnerability_counts is not None:
+        if "vulnerabilities" in metadata:
             if type(vulnerability_counts) is not dict:
                 raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
-            if set(vulnerability_counts) - set(severities):
+            if set(vulnerability_counts) != set(severities):
                 raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
             metadata_counts = {name: 0 for name in severities}
             for name, value in vulnerability_counts.items():
@@ -1764,25 +1771,33 @@ def _dependency_audit_aggregate(
                 "devDependencies",
                 "optionalDependencies",
                 "total",
+                "totalDependencies",
             }:
                 raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
             if type(value) is not int or value < 0 or value > 1_000_000:
                 raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
-    advisories = result.get("advisories")
-    if advisories is not None:
-        if type(advisories) is not list or len(advisories) > 100_000:
+        if "total" in metadata and "totalDependencies" in metadata:
             raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
-        advisory_counts = {name: 0 for name in severities}
-        for advisory in advisories:
-            if type(advisory) is not dict or "severity" not in advisory:
+    advisories = result.get("advisories")
+    if "advisories" in result:
+        if type(advisories) is dict:
+            if advisories:
                 raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
-            severity = advisory["severity"]
-            if severity not in severities:
-                raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
-            advisory_counts[severity] += 1
-        count_sources.append(advisory_counts)
+            advisories = None
+        elif type(advisories) is not list or len(advisories) > 100_000:
+            raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+        if advisories is not None:
+            advisory_counts = {name: 0 for name in severities}
+            for advisory in advisories:
+                if type(advisory) is not dict or "severity" not in advisory:
+                    raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+                severity = advisory["severity"]
+                if severity not in severities:
+                    raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
+                advisory_counts[severity] += 1
+            count_sources.append(advisory_counts)
     vulnerability_map = result.get("vulnerabilities")
-    if vulnerability_map is not None and type(vulnerability_map) is not dict:
+    if "vulnerabilities" in result and type(vulnerability_map) is not dict:
         raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)
     if not count_sources:
         raise _UnsafeContent(RedactionDisposition.NOT_ASSESSED)

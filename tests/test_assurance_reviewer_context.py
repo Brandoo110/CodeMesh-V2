@@ -224,6 +224,27 @@ def _base_evidences(
     )
 
 
+def _real_dependency_audit_result() -> dict[str, object]:
+    return {
+        "actions": [],
+        "advisories": {},
+        "metadata": {
+            "dependencies": 100,
+            "devDependencies": 0,
+            "optionalDependencies": 0,
+            "totalDependencies": 100,
+            "vulnerabilities": {
+                "critical": 0,
+                "high": 0,
+                "moderate": 1,
+                "low": 1,
+                "info": 0,
+            },
+        },
+        "muted": [],
+    }
+
+
 def _task_policy_evidence(store: ArtifactStore, evidences):
     intake_evidence = evidences[1].model_copy(
         update={
@@ -1198,7 +1219,24 @@ def test_official_report_context_uses_dedicated_workflow_definition(
         digest="sha256:" + "4" * 64,
         byte_size=2,
     )
-    result = b'{"advisories":[]}\n'
+    result_payload = _real_dependency_audit_result()
+    assert list(result_payload) == ["actions", "advisories", "metadata", "muted"]
+    assert list(result_payload["metadata"]) == [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "totalDependencies",
+        "vulnerabilities",
+    ]
+    assert list(result_payload["metadata"]["vulnerabilities"]) == [
+        "critical",
+        "high",
+        "moderate",
+        "low",
+        "info",
+    ]
+    result = _json(result_payload)
+    assert len(result) == 214
     report = OfficialEvidenceReport(
         kind="dependency_audit",
         repository_identity="example/repository",
@@ -1248,7 +1286,7 @@ def test_official_report_context_uses_dedicated_workflow_definition(
         result_digest=report.result_digest,
         result_byte_size=report.result_byte_size,
         report=report,
-        result={"advisories": []},
+        result=result_payload,
     )
     receipt_bytes = _json(receipt.model_dump(mode="json"))
     evidence = _evidence(
@@ -1285,8 +1323,8 @@ def test_official_report_context_uses_dedicated_workflow_definition(
         "severity_counts": {
             "critical": 0,
             "high": 0,
-            "moderate": 0,
-            "low": 0,
+            "moderate": 1,
+            "low": 1,
             "info": 0,
             "unknown": 0,
         },
@@ -1334,6 +1372,8 @@ def test_official_report_context_uses_dedicated_workflow_definition(
         source["path"] != ".github/workflows/p-c-handover.yml"
         for source in payload["lineage"]["sources"]
     )
+    assert "actions" not in entry.content
+    assert "muted" not in entry.content
     assert "advisories" not in entry.content
 
     tampered_receipt = receipt.model_copy(
@@ -1375,6 +1415,251 @@ def test_official_report_context_uses_dedicated_workflow_definition(
     )
     with pytest.raises(reviewer_context_module._UnsafeContent):
         reviewer_context_module._official_payload(resolved, evidence)
+
+
+def test_dependency_aggregate_keeps_package_count_out_of_severity_source():
+    result = _real_dependency_audit_result()
+    metadata = dict(result["metadata"])
+    metadata.update(
+        {
+            "dependencies": 2,
+            "devDependencies": 0,
+            "optionalDependencies": 0,
+            "totalDependencies": 2,
+        }
+    )
+    result["metadata"] = metadata
+
+    aggregate = reviewer_context_module._dependency_audit_aggregate(
+        result, "pnpm audit --prod --audit-level=high --json"
+    )
+
+    assert aggregate["severity_counts"] == {
+        "critical": 0,
+        "high": 0,
+        "moderate": 1,
+        "low": 1,
+        "info": 0,
+        "unknown": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("unknown", 1),
+        ("actions", {}),
+        ("actions", [{"type": "install"}]),
+        ("muted", {}),
+        ("muted", [{"id": "advisory"}]),
+        ("advisories", {"advisory": {"severity": "low"}}),
+        ("advisories", "not-a-container"),
+        ("advisories", None),
+    ),
+)
+def test_dependency_aggregate_rejects_unknown_or_unprojected_shapes(
+    key, value
+):
+    result = _real_dependency_audit_result()
+    result[key] = value
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+def test_dependency_aggregate_rejects_unknown_metadata_key():
+    result = _real_dependency_audit_result()
+    metadata = dict(result["metadata"])
+    metadata["unexpected"] = 0
+    result["metadata"] = metadata
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+@pytest.mark.parametrize("value", (True, -1, 1_000_001))
+def test_dependency_aggregate_rejects_invalid_total_dependencies(value):
+    result = _real_dependency_audit_result()
+    metadata = dict(result["metadata"])
+    metadata["totalDependencies"] = value
+    result["metadata"] = metadata
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+def test_dependency_aggregate_rejects_legacy_and_real_count_keys_together():
+    result = _real_dependency_audit_result()
+    metadata = dict(result["metadata"])
+    metadata["total"] = 100
+    result["metadata"] = metadata
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+@pytest.mark.parametrize(
+    ("severity", "value"),
+    (
+        ("unknown", 0),
+        ("moderate", True),
+        ("low", -1),
+        ("high", 1_000_001),
+    ),
+)
+def test_dependency_aggregate_rejects_invalid_severity_counts(severity, value):
+    result = _real_dependency_audit_result()
+    metadata = dict(result["metadata"])
+    vulnerabilities = dict(metadata["vulnerabilities"])
+    vulnerabilities[severity] = value
+    metadata["vulnerabilities"] = vulnerabilities
+    result["metadata"] = metadata
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_severity", ("critical", "high", "moderate", "low", "info")
+)
+def test_dependency_aggregate_rejects_missing_severity_counts(missing_severity):
+    result = _real_dependency_audit_result()
+    metadata = dict(result["metadata"])
+    vulnerabilities = dict(metadata["vulnerabilities"])
+    del vulnerabilities[missing_severity]
+    metadata["vulnerabilities"] = vulnerabilities
+    result["metadata"] = metadata
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    (
+        "/Users/alice/result.json",
+        r"\\server\share\result.json",
+        "FILE:///Users/alice/result.json",
+    ),
+)
+def test_dependency_aggregate_rejects_path_leaves_in_ignored_fields(raw_value):
+    result = _real_dependency_audit_result()
+    result["auditReportVersion"] = raw_value
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+def test_dependency_aggregate_allows_normal_version_string():
+    result = _real_dependency_audit_result()
+    result["auditReportVersion"] = "2"
+
+    aggregate = reviewer_context_module._dependency_audit_aggregate(
+        result, "pnpm audit --prod --audit-level=high --json"
+    )
+
+    assert aggregate["status"] == "safe_assessed"
+    assert aggregate["severity_counts"]["moderate"] == 1
+    assert aggregate["severity_counts"]["low"] == 1
+
+
+def test_dependency_aggregate_rejects_count_source_drift():
+    result = _real_dependency_audit_result()
+    result["advisories"] = [{"severity": "moderate"}]
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+@pytest.mark.parametrize("severity", ("critical", "high"))
+def test_dependency_aggregate_rejects_high_risk_severity(severity):
+    result = _real_dependency_audit_result()
+    metadata = dict(result["metadata"])
+    vulnerabilities = dict(metadata["vulnerabilities"])
+    vulnerabilities[severity] = 1
+    metadata["vulnerabilities"] = vulnerabilities
+    result["metadata"] = metadata
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+def test_dependency_aggregate_rejects_oversized_result():
+    result = _real_dependency_audit_result()
+    result["auditReportVersion"] = "x" * reviewer_context_module._ENTRY_BYTES
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    (
+        ("path", "/Users/alice/private/result.json"),
+        ("path", r"\\server\share\result.json"),
+        ("path", "file:///Users/alice/result.json"),
+        ("token", "SENTINEL_DEPENDENCY_TOKEN"),
+    ),
+)
+def test_dependency_aggregate_rejects_forbidden_result_data(forbidden):
+    result = _real_dependency_audit_result()
+    result["auditReportVersion"] = {forbidden[0]: forbidden[1]}
+
+    with pytest.raises(reviewer_context_module._UnsafeContent):
+        reviewer_context_module._dependency_audit_aggregate(
+            result, "pnpm audit --prod --audit-level=high --json"
+        )
+
+
+def test_dependency_aggregate_keeps_legacy_advisories_and_total_support():
+    result = {
+        "auditReportVersion": 2,
+        "advisories": [{"severity": "low"}],
+        "metadata": {
+            "total": 100,
+            "vulnerabilities": {
+                "critical": 0,
+                "high": 0,
+                "moderate": 0,
+                "low": 1,
+                "info": 0,
+            },
+        },
+        "vulnerabilities": {},
+    }
+
+    aggregate = reviewer_context_module._dependency_audit_aggregate(
+        result, "pnpm audit --prod --audit-level=high --json"
+    )
+
+    assert aggregate["severity_counts"] == {
+        "critical": 0,
+        "high": 0,
+        "moderate": 0,
+        "low": 1,
+        "info": 0,
+        "unknown": 0,
+    }
 
 
 def test_manifest_projection_rejects_current_evidence_set_drift(tmp_path):
